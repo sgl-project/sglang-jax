@@ -646,7 +646,7 @@ def test_row_groups_two_bit_identical(monkeypatch):
     result equals the single-group schedule (interpret), head-major and token-major, VMEM
     flash state on and off. Bit-identical on the CPU backend; on a TPU host the interpreter
     accumulates the 8-page units of the two groups in a different f32 order and the results
-    differ by one ulp (max rel 2.4e-7 on v7x, T1 arms gp1048b/c), so there the comparison is
+    differ by one ulp (max rel 2.4e-7 on v7x, the TPU test pod), so there the comparison is
     a 1-ulp allclose."""
     c = _make_case(B=1, S=200, H=4, K=3, pages=8, seed=17, empty_rows=(3, 150))
     common = dict(

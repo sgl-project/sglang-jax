@@ -71,7 +71,7 @@ _PAGE_TOPK_BUDGET = int(os.environ.get("DSA_PAGE_TOPK", "0"))
 # order change only -> paired accuracy gate, not bitwise). cc64 1k/1k census 10-04: the
 # reference path is 4.9 ms/step (ref.py:447 scoring 2.8 + ref.py:433 page gather 1.75).
 # DSA_PAGE_TOPK_IDENTITY_MAX_PAGES=<n> (default 32): only take the identity shortcut when the bucket
-# has <= n pages (10-04 gp380: at the 32-page bucket (4096/128 cc8) v22 lost 15 % throughput while
+# has <= n pages (at the 32-page bucket (4096/128 cc8) v22 lost 15 % throughput while
 # 16-page buckets gained; the attend kernel's x1.7 under identity grows with pages). 0 = no cap,
 # -1 = never.
 _PAGE_TOPK_IDENTITY_MAX_PAGES = envs.DSA_PAGE_TOPK_IDENTITY_MAX_PAGES.get()
@@ -154,9 +154,9 @@ _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
 # Decode page-topk vectorized over sequences (one big idx-cache gather + batched
 # head-chunked scoring with static head-chunk unroll + batched top_k) instead of
 # the per-seq fori_loop reference, from this decode batch size up: at bs1 the
-# head-chunked path costs more than the single per-seq einsum (nap dpb9: bs1
+# head-chunked path costs more than the single per-seq einsum (measured: bs1
 # TPOT 12.07 -> 12.21), while at T=64 it takes the indexer path 21 -> ~8 ms/step
-# (09-21 trace: while 12.65 + 64x 1 MiB gathers 5.14 + dynamic_slice 3.35 ms).
+# (trace: while 12.65 + 64x 1 MiB gathers 5.14 + dynamic_slice 3.35 ms).
 _IDX_DECODE_BATCHED_MIN_BS = 8
 # a2a-DP attend (DSA_DP_DECODE_BS, default 64): decode buckets with bs >= this threshold reshard
 # queries from head-TP ([T, H/tp]) to request-sharded ([T/tp, H]) via
@@ -227,14 +227,14 @@ _PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
 _TSA_PREFILL = os.environ.get("DSA_TSA_PREFILL", "0") == "1"
 # Opt-in: prefill indexer-key cache write through the 4D-native run-table
 # write-back kernel (the one the KV write uses) instead of reshape-to-3D +
-# XLA scatter + reshape-back. gp101 4k trace (10-02): the 3D round trip costs a
+# XLA scatter + reshape-back. 4k trace: the 3D round trip costs a
 # full relayout of the [P, page, D] indexer cache per full layer, 12.2 ms per
 # 4k chunk (scatter_fusion bf16[267648,128] x 45), plus the kernel path
 # reshapes the 3D view back to 4D. Bitwise-identical writes (paged_write_back
 # contract + test_idx_prefill_inplace.py). Indexer-cache writes of <= SCATTER_ROWS_MAX rows (decode /
 # verify steps) take the 4D-native XLA scatter instead of the run-table kernel (bit-identical). The
 # exact-dense arm writes its keys per page (``_dense_arm_idx_write_pages``: whole-page gather /
-# overlay / scatter, no 3D view -- gp794e 8k two-window trace 2026-10-10: the 3D-view scatter was a
+# overlay / scatter, no 3D view -- 8k two-window trace: the 3D-view scatter was a
 # full relayout of the pool, 21.5 ms per 395 ms module).
 _TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
 # Block-strided (zigzag) query assignment inside TSA. The
@@ -258,7 +258,7 @@ _TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
 # Head-major (with the absorb path): run the attend
 # kernel with head-major q/o so the W_UK dot output ([H, T/tp, R], batch-major)
 # feeds the kernel and the kernel output feeds the W_UV dot without the two
-# tile-level relayouts XLA otherwise inserts around the custom call (gp246 4k
+# tile-level relayouts XLA otherwise inserts around the custom call (4k
 # trace: 7.95 ms q-side copy + 1.56 ms convert, 4.55 ms o-side). The kernel
 # rows are a permutation of the token-major order (bit-identical, see
 # test_qblock_kernel_parity::test_head_major_*). The return a2a then carries
@@ -1063,7 +1063,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             # explicit run capacity like the KV write: the default
             # 2*(T//ps)+130 grows the SMEM run table to [3*r_cap, 4] int32,
             # which Mosaic pads to 512 B per row -> 1.5 MiB at r_cap=1024
-            # (gp112 10-02, super-computers §20.62); tokens here are
+            # tokens here are
             # contiguous per sequence so runs <= pages touched + seqs
             cache4d = paged_write_back(
                 cache_,
@@ -1529,7 +1529,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             # (matching the contiguous head-block sharding of q_b_proj).
             # one all_to_all for q_nope ++ q_rope (same permutation, pure data movement ->
             # bit-identical): one SparseCore a2a fewer per layer-window than two separate
-            # a2a (gp316 4k trace: the second q a2a waited ~65 us median at its done, 12.8 ms
+            # a2a (4k trace: the second q a2a waited ~65 us median at its done, 12.8 ms
             # per window); the lane split on the token-sharded side touches 1/tp of the tokens
             nope_w = ql_.shape[-1]
             q_cat_t = jax.lax.all_to_all(
@@ -1582,7 +1582,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 query_block=qb,
                 # the first consumer casts o_t to bf16 (W_UV dot operand / a2a payload), so
                 # let the kernel store bf16 directly: same rounding point, no f32 pass
-                # (gp217 4k trace: convert fusions on the attend output 4.6 + 2.6 ms)
+                # (4k trace: convert fusions on the attend output 4.6 + 2.6 ms)
                 out_dtype=qn_.dtype if absorb_ else ql_.dtype,
                 head_major=head_major,
                 **off_kw,
@@ -1955,7 +1955,7 @@ def dense_arm_metadata(md):
     exist only in prefill micro-batch windows (``window_forward_metadata``: a request whose rows all
     lie *before* the window keeps ``kv_len`` = its prefix with ``q_len == 0``); the single-window
     batch only has ``q_len == kv_len == 0`` padding. Zero ``kv_len`` for every ``q_len == 0``
-    sequence: the kernel then skips it, and it has no rows to attend or write anyway. (knife 1 V2,
+    sequence: the kernel then skips it, and it has no rows to attend or write anyway. (exact-dense arm,
     2026-10-07: the 8 x 1k two-window exact-dense program hung at the first batch on three arms.)
     """
     cuq = getattr(md, "cu_q_lens", None)
@@ -1970,7 +1970,7 @@ def dense_arm_metadata(md):
     # The MIXED case iterates sequences [distribution[1], distribution[2]); sequences[distribution[0]:distribution[1]]
     # ("chunked-prefill-only" slot) are never launched. A window's sequences with rows are contiguous, so hand the
     # kernel exactly that range: it then never sees a q_len == 0 sequence at all (leading ones in window B, trailing
-    # ones in window A, bs padding). Masking kv_len alone was not enough: 8 x 1k two-window still hung (gp785 2026-10-08,
+    # ones in window A, bs padding). Masking kv_len alone was not enough: 8 x 1k two-window still hung (
     # py-spy: scheduler waiting on the fused-prefill output) while 4 x 1k passed.
     has_q = q_lens > 0
     any_q = jnp.any(has_q)
@@ -1979,7 +1979,7 @@ def dense_arm_metadata(md):
     dist = getattr(md, "distribution", None)
     if dist is not None and dist.shape == (3,):
         # arithmetic on the original array keeps its (Explicit-mesh, P(data)) sharding; a freshly stacked array is
-        # replicated and fails _run_dense's shard_map in_specs=P(data) (gp786 2026-10-08), and .at[].set needs an
+        # replicated and fails _run_dense's shard_map in_specs=P(data), and .at[].set needs an
         # explicit out_sharding under Explicit axes
         idx = jnp.arange(3, dtype=dist.dtype)
         vals = jnp.where(idx == 1, first, jnp.where(idx == 2, last + 1, 0)).astype(dist.dtype)
@@ -2103,7 +2103,7 @@ def _dense_arm_idx_write_pages(
     Units = the pages the window's T new rows can touch: at most ``T // page_size + 2 * S`` (each sequence
     adds at most one partial page at each end), enumerated by the prefix sum of per-sequence touched-page
     counts -- NOT ``S x pages_per_seq`` (pages_per_seq is the max-context page count, 1056 at 135k: the
-    first form reserved 17.6 GB of temporaries in the 8192-token program, gp811 2026-10-10). Per unit:
+    first form reserved 17.6 GB of temporaries in the 8192-token program). Per unit:
     gather its page, overlay the new rows that land in it (rows [q_start, q_end) of the sequence at
     absolute positions kv_len - q_len + r), scatter it back by physical page index (unique per live unit,
     dead units dropped). Same slot semantics as ``_scatter_paged`` / ``_paged_landing``; bit-identical on

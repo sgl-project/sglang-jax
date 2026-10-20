@@ -45,7 +45,7 @@ def _attend_sched_tagged(fn):
     ``set_xla_metadata(_scheduling_group_id=...)`` when the model set a group for this window
     (``dsa_sparse_backend.PREFILL_SCHED_GROUP``). Only the attend is tagged -- tagging the
     paged write-back too made the group span write-back -> (copies) -> attend and the TPU
-    scheduler rejects groups with such gaps (gp213, 10-03)."""
+    scheduler rejects groups with such gaps."""
 
     def _call(*a, **k):
         from sgl_jax.srt.layers.attention import dsa_sparse_backend as _b
@@ -388,7 +388,7 @@ def sparse_mla_attention_qblock(
     ``head_major``: the TSA absorb path produces q with a batched dot whose natural
     output is batch(head)-major, and consumes the output with another batched dot
     that wants the same; with token-major kernel I/O XLA inserts a tile-level relayout
-    on each side (gp246 4k trace: 7.95 ms + 4.55 ms per chunk). In head-major mode the
+    on each side (4k trace: 7.95 ms + 4.55 ms per chunk). In head-major mode the
     kernel block for query block ``n`` is the ``[H, QB, Dk_pad]`` slab gathered from
     ``[B, H, nQB, QB, Dk_pad]`` (a bitcast view of ``[B, H, S, Dk_pad]`` when QB % 8 == 0),
     rows are ordered ``h*QB + q`` instead of ``q*H + h`` (the kernel is per-row
@@ -1003,7 +1003,7 @@ def paged_write_back(
         return _scatter(cache, row_w, table, n_ent)
     # No lax.cond on n_raw <= r_cap: both branches hand back a whole pool, XLA cannot alias
     # the pool in place across the conditional (spec verify: 2 x ~0.02 ms per layer; 10-03
-    # gp157 4k trace: ~20 whole-pool copies per 4k prefill window, 6-9 ms). The run table
+    # 4k trace: ~20 whole-pool copies per 4k prefill window, 6-9 ms). The run table
     # cannot overflow r_cap for extend-form slot layouts (page-contiguous new slots per
     # sequence; test_write_back_run_bound.py) nor for the static ``pallas_always_fits``
     # shapes, so the kernel is taken unconditionally.

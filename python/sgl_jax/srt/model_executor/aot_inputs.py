@@ -206,7 +206,7 @@ def apply_aot_dense_exact(batch, num_tokens) -> bool:
     ``DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT`` as exact-dense in ``ForwardBatch.init_new``;
     the AOT input builders construct ``ForwardBatch`` directly, so AOT programs always
     compile the qblock arm and a CPU AOT gate cannot reproduce the <=2048-token program
-    (gp277, 10-03: 1k two-window program failed on TPU with a scheduling-group gap that
+    (1k two-window program failed on TPU with a scheduling-group gap that
     the gate never saw). With the knob on, an EXTEND shape whose token count fits the
     exact-dense bound (single-sequence view) gets the same flag. Returns whether it fired.
     """
@@ -218,7 +218,7 @@ def apply_aot_dense_exact(batch, num_tokens) -> bool:
     # SGL_JAX_AOT_DENSE_EXACT_FORCE=1 (gate-only, 2026-10-07): the AOT builder sees one sequence of
     # ``num_tokens``, but production's batched prefill is N sequences of <= exact_max tokens each
     # (8 x 1k -> 8192-token two-window program with the exact-dense arm); force the flag so a CPU
-    # gate can compile that program (gp277 annotation-gap replica for the V2 fix).
+    # gate can compile that program (annotation-gap replica for the V2 fix).
     force = os.environ.get("SGL_JAX_AOT_DENSE_EXACT_FORCE", "0") == "1"
     if (
         exact_max <= 0

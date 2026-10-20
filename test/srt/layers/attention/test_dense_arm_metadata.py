@@ -1,5 +1,5 @@
 """dense_arm_metadata: sequences with no query rows in a prefill window must not reach the dense MLA kernel with
-kv_len > 0 (mixed-kernel hang pattern, knife 1 V2 2026-10-07)."""
+kv_len > 0 (mixed-kernel hang pattern, exact-dense arm)."""
 
 import os
 
@@ -65,7 +65,7 @@ def test_window_without_rows_gets_empty_range():
 
 def test_explicit_mesh_sharding_preserved():
     """Under the production Explicit (data, tensor) mesh every metadata field must keep its P('data') sharding:
-    _run_dense's shard_map declares in_specs=P(data) for distribution (gp786: a replicated distribution crashed).
+    _run_dense's shard_map declares in_specs=P(data) for distribution (a replicated distribution crashed).
     Production builds the window metadata and the dense-arm metadata inside the model jit, so do the same here.
     """
     import jax

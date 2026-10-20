@@ -1,5 +1,5 @@
 """prepare_for_extend_after_verify must not route a speculative decode batch (return_logprob set,
-per-request logprob lists None) through LogitsMetadata.from_model_worker_batch: gp224/gp225 crashed
+per-request logprob lists None) through LogitsMetadata.from_model_worker_batch: two batches crashed
 with "'NoneType' object is not iterable" at logits_processor.from_model_worker_batch on the first
 MTP + return_logprob request."""
 

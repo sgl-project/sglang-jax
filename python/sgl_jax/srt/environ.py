@@ -79,7 +79,7 @@ class Envs:
     # DSA decode page top-k identity shortcut: when the page budget covers the
     # whole KV bucket the top-k selects every valid page anyway, so skip the
     # gather + scoring + top_k and return the pages in position order -- but
-    # only for buckets of at most this many pages (10-04 gp380: the attend
+    # only for buckets of at most this many pages (the attend
     # kernel's cost under identity grows with pages; the 32-page bucket lost
     # 15 % throughput while 16-page buckets gained). 0 = no cap, -1 = never.
     DSA_PAGE_TOPK_IDENTITY_MAX_PAGES = EnvInt(32)

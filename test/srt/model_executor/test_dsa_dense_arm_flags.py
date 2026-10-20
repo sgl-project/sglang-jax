@@ -1,5 +1,5 @@
 """dsa_dense_arm_flags: the host-side dense-arm rule shared by ForwardBatch.init_new and the fused-prefill
-target batch (knife 1, 2026-10-07): pure EXTEND only, per-sequence max_seq <= DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT
+target batch (exact-dense arm): pure EXTEND only, per-sequence max_seq <= DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT
 (default 2048), bound clamped to the model's index_topk when given."""
 
 import os

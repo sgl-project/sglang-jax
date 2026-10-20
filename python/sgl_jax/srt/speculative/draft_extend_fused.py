@@ -2305,13 +2305,13 @@ def _make_forward_batch(batch, model_runner):
 
     # The fused-prefill target batch gets the same host-side dense-arm flag as ForwardBatch.init_new, so
     # the main model's EXTEND chunk takes the exact-dense arm (plain dense MLA, no page scoring / top-k)
-    # instead of the qblock arm when every sequence fits the bound (knife 1, 2026-10-07; two-window chunks
-    # such as 8 x 1k included -- the dense attend kernel stays outside the PIN=7 scheduling group, inside
-    # it the two-window program does not compile: "annotation groups with gaps", gp277).
+    # instead of the qblock arm when every sequence fits the bound (two-window chunks
+    # such as 8 x 1k included -- the dense attend kernel stays outside the micro-batch scheduling group, inside
+    # it the two-window program does not compile: "annotation groups with gaps").
     dsa_dense_exact = False
     # Only the pure-EXTEND (prefill) batch is inspected: verify / draft-extend batches carry device-resident
     # seq_lens (device_seq_lens_for_draft_extend) and reading them here would be a per-step D2H sync
-    # (+1 ms per step at bs1, measured 2026-10-07 gp749/gp752 vs gp742).
+    # (+1 ms per step at bs1, measured over two launches).
     if batch.forward_mode == ForwardMode.EXTEND and not isinstance(batch.seq_lens, jax.Array):
         dsa_dense_exact = dsa_dense_arm_flags(
             batch.forward_mode,
@@ -2844,7 +2844,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     # Placeholder only: fused_prefill replaces spec_info.hidden_states with the target's
     # hidden before any use, but EagleDraftInput's device_fields moves it to the device, so
     # a [tokens, hidden] f32 zeros buffer cost ~3 ms of np.zeros + ~1.8 ms of H2D per prefill
-    # call (gp251 1k host trace: 25 MB at 1024 tokens). One row keeps the pytree structure.
+    # call (1k host trace: 25 MB at 1024 tokens). One row keeps the pytree structure.
     model_worker_batch.spec_info_padded = EagleDraftInput(
         hidden_states=np.zeros((1, hidden_size), dtype=np.float32),
         verified_id=np.zeros((len(model_worker_batch.seq_lens),), dtype=np.int32),

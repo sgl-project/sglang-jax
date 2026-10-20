@@ -1,4 +1,4 @@
-"""Knife 10: head-major q/o contract of the MLA v2 kernel must be bit-exact
+"""head-major q/o contract of the MLA v2 kernel must be bit-exact
 with the packed token-major contract (CPU emulation of the Pallas kernel,
 same harness as test_mla_v2_bitexact.py)."""
 

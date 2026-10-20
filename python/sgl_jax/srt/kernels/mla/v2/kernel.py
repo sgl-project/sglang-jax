@@ -307,7 +307,7 @@ def _mla_ragged_paged_attention_kernel(
     bq_sz,
     batch_size: int = 1,
     debug_mode: bool = False,
-    # Knife 10: q/o HBM contract is head-major [num_q_heads, max_num_tokens, d]
+    # q/o HBM contract is head-major [num_q_heads, max_num_tokens, d]
     # (the producer dot_general(batch=head) layout) instead of the packed
     # token-major [max_num_tokens, h // p, p, d]. Rows inside a block are
     # (head, query) instead of (query, head); the DMA is one strided copy per
@@ -1617,7 +1617,7 @@ def mla_ragged_paged_attention(
     # Ignored (tuned block kept) when the resulting block is not in the
     # validated sub-tile family for the shard's head count.
     mixed_static_q_len: int | None = None,
-    # Knife 10: head-major q/o HBM contract (see _mla_ragged_paged_attention_kernel).
+    # head-major q/o HBM contract (see _mla_ragged_paged_attention_kernel).
     # Requires skip_decode_cases (the decode blocks do not fill a sublane tile).
     q_head_major: bool = False,
     # Caller guarantees distribution[0] == 0 (no decode sequences, e.g. grouped
