@@ -6,7 +6,7 @@ For every ``QuantizedLinear`` whose scale is the kernel-ready block layout ``[in
 dequantize the 128x128-block fp8 weight, requantize each output row with one e4m3fn scale,
 and switch the layer to the per-channel path of ``xla_quantized_matmul_local`` (plain
 fp8 x fp8 ``dot_general`` on the MXU when ``a8``; bf16 x bf16 with the fp8 weight converted
-in the dot's operand read when ``a16``). Motivation (10-02 probe-w8a8b, v7x): the blockwise
+in the dot's operand read when ``a16``). Motivation (measured on v7x): the blockwise
 Pallas kernel pops and rescales its accumulator once per 128-wide K block and runs at
 1.8-2.4x the bf16 dot floor and 2.5-3.9x the e4m3fn dot floor at M=4096; per-channel
 scales need one pop and one scale pass.

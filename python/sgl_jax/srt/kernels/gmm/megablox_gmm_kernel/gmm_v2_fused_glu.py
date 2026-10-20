@@ -306,7 +306,7 @@ def gmm_v2_fused_glu(
     vmem_limit_bytes: int | None = None,
     skip_prefix_groups: (
         bool | None
-    ) = None,  # None -> gmm_v2's SGLANG_JAX_GMM_V2_SKIP_PREFIX default
+    ) = None,  # None -> gmm_v2's default (start the metadata scan at the shard's first expert)
     name: str | None = None,
     tile_m: int | None = None,  # override gmm_v2's tile_m (tile_k / tile_n stay full-K / full-N)
 ) -> jax.Array | None:

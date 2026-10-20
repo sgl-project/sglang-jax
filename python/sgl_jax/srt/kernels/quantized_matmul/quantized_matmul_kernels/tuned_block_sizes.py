@@ -709,7 +709,7 @@ TUNED_BLOCK_SIZES_RAW = {
     (7, 8192, 6144, 128, "bfloat16", "float8_e4m3fn"): (2048, 2048, 128),
     # GLM-5.2 v7x tp8/ep8 per-shard prefill shapes (m=8192 chunk, m=1024 short
     # prompt), swept 2026-09-29 on tpu7x-8 (jax 0.11.1 / libtpu 0.0.46.1, sglang-jax
-    # glm-prod-v3 3154ec96e) with 32 rotating weight copies, min-of-3; kernel-time
+    # GLM-5.2 production tree) with 32 rotating weight copies, min-of-3; kernel-time
     # regime (50-650 us). Borrowed nearest-shape values were 19-84% slower
     # (dense_down 8192: 653 -> 354 us; shared_down 1024: 171 -> 51 us). Out blocks
     # 1536 rely on the exact-divisor rule in blockwise_utils.get_safe_blockwise_tuned_value.

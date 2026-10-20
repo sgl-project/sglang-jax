@@ -50,16 +50,16 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 # with TC attend(i) the same way). The model sets PREFILL_SCHED_GROUP around window A's
 # attention call; the attend kernel custom-call is traced inside set_xla_metadata with that
 # id, and the model tags B's all-reduce of the previous layer with the same id.
-# 10-03 gp213: only the attend pallas_call carries the tag (kernels/dsa/sparse_mla_prefill_qblock
+# Only the attend pallas_call carries the tag (kernels/dsa/sparse_mla_prefill_qblock
 # _attend_sched_tagged); tagging the paged write-back as well created a write-back -> copies ->
 # attend chain inside one group, which the TPU scheduler rejects ('annotation groups with gaps').
 PREFILL_SCHED_GROUP: int | None = None
 # The exact-dense attend kernel stays OUT of the PIN=7 scheduling group (the pin edges stay):
 # the dense wrapper issues three chained pallas_calls with the cache threaded through, and the
 # TPU scheduler rejects the group ("annotation groups with gaps") on the second one even with
-# every traced op tagged (CPU replicas mb1k-dense-pin7 / pin8 / pin7q, 10-03; gp277), so the
+# every traced op tagged (CPU AOT replicas of the 1k two-window program), so the
 # untagged variant is the only way to run two windows at 1k with pins.
-# Knife 10 (super-computers#11): head-major q/o contract for the exact-dense
+# Head-major q/o contract for the exact-dense
 # MLA v2 attend on EXTEND batches (distribution[0] == 0 there, so the two empty
 # decode kernels are skipped). Decode / verify keep the token-major path.
 
@@ -1528,7 +1528,7 @@ def dense_arm_metadata(md):
     dist = getattr(md, "distribution", None)
     if dist is not None and dist.shape == (3,):
         # arithmetic on the original array keeps its (Explicit-mesh, P(data)) sharding; a freshly stacked array is
-        # replicated and fails _run_dense's shard_map in_specs=P(data) (gp786 2026-10-08), and .at[].set needs an
+        # replicated and fails _run_dense's shard_map in_specs=P(data) (seen on the 8 x 1k two-window shape8), and .at[].set needs an
         # explicit out_sharding under Explicit axes
         idx = jnp.arange(3, dtype=dist.dtype)
         vals = jnp.where(idx == 1, first, jnp.where(idx == 2, last + 1, 0)).astype(dist.dtype)

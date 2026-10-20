@@ -83,8 +83,10 @@ class Envs:
     # GLM-5 prefill micro-batching: an EXTEND chunk of at least
     # DSA_PREFILL_MICROBATCH_MIN_TOKENS (padded) tokens runs as this many
     # consecutive token windows on the block-interleaved schedule so each
-    # window's MoE all-reduce overlaps the other window's compute. 1 = off.
-    DSA_PREFILL_MICROBATCH = EnvInt(2)
+    # window's MoE all-reduce overlaps the other window's compute. 1 = off
+    # (default; GLM-5.2 serving on v7x sets 2, together with the prefill XLA
+    # options the tagged windows need).
+    DSA_PREFILL_MICROBATCH = EnvInt(1)
     DSA_PREFILL_MICROBATCH_MIN_TOKENS = EnvInt(2048)
 
     # One-shot (Pallas) all-reduce for small tensor-parallel psums: operands of
@@ -93,7 +95,8 @@ class Envs:
     # at the model level, "qmm" = the quantized-matmul wrapper reduce (o_proj,
     # dense MLP), "moe" = the EPMoE-internal psum) go to the split_flat kernel
     # instead of XLA's all-reduce. MIN_BYTES=0 turns the kernel off.
-    SGLANG_JAX_ONESHOT_AR_MIN_BYTES = EnvInt(4096)
+    # 0 = off (default; GLM-5.2 serving on v7x sets 4096).
+    SGLANG_JAX_ONESHOT_AR_MIN_BYTES = EnvInt(0)
     SGLANG_JAX_ONESHOT_AR_MAX_BYTES = EnvInt(512 << 10)
     SGLANG_JAX_ONESHOT_AR_SITES = EnvStr("fused,qmm")
 

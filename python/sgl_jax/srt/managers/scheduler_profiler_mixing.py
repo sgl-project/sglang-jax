@@ -135,12 +135,6 @@ class _ProfileManager:
             profiler_options.host_tracer_level = self._host_tracer_level
         if self._python_tracer_level is not None:
             profiler_options.python_tracer_level = self._python_tracer_level
-        # SGLANG_JAX_PROFILE_TPU_TRACE_MODE=TRACE_COMPUTE_AND_SYNC (or TRACE_ALL): record
-        # libtpu compute/sync events (kernel-internal named_scope trace points,
-        # --xla_tpu_profile_traceme_level) instead of the default XLA-op-only mode.
-        tpu_trace_mode = os.environ.get("SGLANG_JAX_PROFILE_TPU_TRACE_MODE")
-        if tpu_trace_mode:
-            profiler_options.advanced_configuration = {"tpu_trace_mode": tpu_trace_mode}
 
         jax.profiler.start_trace(stage_dir, profiler_options=profiler_options)
         self._trace_active = True

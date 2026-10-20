@@ -62,7 +62,7 @@ def _log_once(msg: str) -> None:
 _INDEXER_ROPE_CONCAT = envs.SGLANG_JAX_INDEXER_ROPE_CONCAT.get()
 
 
-# Opt-in: fuse q_a_proj + kv_a_proj_with_mqa + indexer.wk (all replicated, same
+# Fuse q_a_proj + kv_a_proj_with_mqa + indexer.wk (all replicated, same
 # hidden_states input) into one fp8 blockwise matmul per layer after weight
 # load. 3 -> 1 launches/layer; outputs are byte-identical slices.
 @partial(jax.jit, static_argnames=("quantized_dtype",))
@@ -1190,7 +1190,7 @@ _PREFILL_MICROBATCH_MIN_TOKENS = envs.DSA_PREFILL_MICROBATCH_MIN_TOKENS.get()
 # before the consumer, so where the consumer sits decides what the all-reduce overlaps). Two windows add
 # SparseCore-stream ordering for the MoE all-reduces (A.dispatch -> A.experts -> B.dispatch ->
 # A.all-reduce (operand pinned behind B's dispatch gather) -> B.experts (combine pinned behind A's
-# post-all-reduce value) -> B.all-reduce; gp150: the SC stream completes in start order) and one XLA
+# post-all-reduce value) -> B.all-reduce; the SC stream completes in start order) and one XLA
 # scheduling group per layer holding window B's MoE all-reduce of layer L and window A's attend
 # kernel of layer L+1 (dsa_sparse_backend.PREFILL_SCHED_GROUP), see _microbatch_pinned_layers.
 # Needs xla_jf_enable_producer_consumer_multi_output_fusion=false in SGLANG_JAX_PREFILL_XLA_OPTIONS.
@@ -1436,7 +1436,7 @@ def _microbatch_pinned_layers(
     two_stage = n == 2  # SparseCore-stream ordering pins + scheduling groups
     # window B's MoE all-reduce of layer L and window A's attend kernel of layer L+1 share one
     # _scheduling_group_id, so the scheduler overlaps them without any program-order / data-edge
-    # trick (gp194 HLO: edges only move the done; the start follows the scheduler's own SC-AR
+    # trick (in the HLO the edges only move the done; the start follows the scheduler's own SC-AR
     # latency estimate).
     sched_groups = two_stage
     if sched_groups:
@@ -1487,7 +1487,7 @@ def _microbatch_pinned_layers(
         mlp_anchor = [None] * n
         topk_ids_parts = []
         if two_stage and getattr(layer, "is_moe_layer", False):
-            # (10-03, gp150 k2/k3 + AOT replica): with SparseCore permute kernels in the
+            # (AOT replica): with SparseCore permute kernels in the
             # MoE block, XLA hoists window B's combine call-start ahead of window A's MoE
             # all-reduce; the SparseCore stream completes in start order, so A's all-reduce
             # data phase waits behind B's gmm and its done is exposed (50 ms per 4k window).
@@ -1668,7 +1668,7 @@ class Glm5ForCausalLM(nnx.Module):
         mappings = {
             "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
-                sharding=_EMBED_KERNEL_AXES,  # follows SGLANG_JAX_EMBED_REPLICATED (gp910: hardcoded shard left the table split while the module declared it replicated)
+                sharding=_EMBED_KERNEL_AXES,  # follows SGLANG_JAX_EMBED_REPLICATED (a hardcoded shard left the table split while the module declared it replicated)
                 transpose=False,
             ),
             "model.norm.weight": WeightSpec(

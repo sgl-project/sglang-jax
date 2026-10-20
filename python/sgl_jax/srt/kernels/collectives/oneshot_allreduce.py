@@ -2,7 +2,7 @@
 
 Replaces ``jax.lax.psum(x, axis)`` for small decode-shaped messages (<= 64 KiB) on a single v7x
 host where the XLA emitter is latency-bound. The kernel form is :func:`split_flat_all_reduce`
-(probe24 ``lat_hbm``): every device pushes its operand into its own slot of an HBM receive slab
+(the HBM-latency form): every device pushes its operand into its own slot of an HBM receive slab
 on every peer, and the N-slot sum is left to XLA (f32).
 
 Constraints: axis size >= 2; ``x`` 2-D; f32 accumulation then cast back to ``x.dtype``.  Not
@@ -21,6 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.environ import envs
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 _MESH = pl.DeviceIdType.MESH
 
@@ -31,7 +32,7 @@ def _mesh_device_id(mesh_axis_names, reduce_axis, j):
 
 
 # ---------------------------------------------------------------------------
-# Split-barrier protocol (super-computers handoff 20261001-to-glm-split-ar §2/§5, probe24 §20.44-20.48;
+# Split-barrier protocol (
 # design: internal "latency_psum"). Every all-reduce is TWO pallas_calls that share a collective_id:
 #   (1) ``barrier_alloc``: zero inputs; outputs = the receive slab (HBM) + the receive-side DMA
 #       semaphore, XLA-allocated; the body only signals the runtime barrier semaphore to every peer.
@@ -112,7 +113,7 @@ def _barrier_alloc(to_alloc, cid, n, dev, interpret, anchor=None):
     """Call (1): allocate the receive slab / semaphore as outputs and signal the barrier.
 
     ``anchor`` (optional, never read) is a data input that pins the call's earliest position:
-    a zero-input custom call floats to the top of a straight-line program (10-04 gp353: all 157
+    a zero-input custom call floats to the top of a straight-line program (observed: all 157
     per-step instances hoisted together -> 157 live VMEM receive sets -> MSA failure). The
     caller passes the upstream matmul's input so the start lands after the previous layer and
     before this layer's matmul."""
@@ -136,7 +137,7 @@ def _barrier_alloc(to_alloc, cid, n, dev, interpret, anchor=None):
     with _async_meta("collective-start", interpret):
         outs = list(call(*args))
     if not interpret:
-        # probe24 ``pin``: constrain the allocated slab to HBM, the space it was declared in
+        # Constrain the allocated slab to HBM, the space it was declared in
         outs = [
             o if _is_sem(a) else pltpu.with_memory_space_constraint(o, pltpu.MemorySpace.HBM)
             for o, a in zip(outs, to_alloc)
@@ -180,12 +181,12 @@ def split_flat_all_reduce(
     collective_id: int = 5,
     anchor: jax.Array | None = None,
 ) -> jax.Array:
-    """Flat one-shot all-reduce on the split protocol with the receive slab in HBM (probe24
+    """Flat one-shot all-reduce on the split protocol with the receive slab in HBM (the measured form
     ``lat_hbm``): call (1) allocates ``recv[N, rows, cols]`` in HBM (no VMEM memory-space output,
     so no MSA colouring -- the VMEM forms fail to compile beyond a handful of straight-line
     instances, 10-04); call (2) pushes ``x`` into slot ``me`` of every peer (N-1 remote DMAs)
     plus a local copy, waits, no ack. The N-slot sum is left to XLA (f32). Costs ~+1 us per
-    call vs a VMEM receive form (probe24 §20.44) and (N-1)x the bytes of a two-level form,
+    call vs a VMEM receive form (measured) and (N-1)x the bytes of a two-level form,
     so it is routed only for small operands (bs1 48 KB)."""
     if x.ndim != 2:
         raise ValueError(f"split_flat_all_reduce expects a 2-D operand, got {x.shape}")
@@ -355,7 +356,7 @@ def maybe_oneshot_psum(
     """``lax.psum`` unless the opt-in one-shot kernel applies to this operand and call site."""
     if site in ("moe", "qmm") and reduce_deferred() and fused_moe_enabled():
         return x  # partial sum; the model reduces routed+shared with one fused_all_reduce
-    if not _MIN_BYTES or site not in _SITES:
+    if not _MIN_BYTES or site not in _SITES or not is_tpu_runtime():
         return lax.psum(x, reduce_axis)
     if mesh_axis_names is None:
         try:

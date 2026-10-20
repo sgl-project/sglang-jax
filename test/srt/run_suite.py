@@ -565,6 +565,103 @@ suites = {
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
         TestFile("test/srt/test_native_attention_paged_decode.py", 1),
+        # GLM-5.2 int4 / MoE path (CPU parts)
+        TestFile(
+            "test/srt/models/test_glm5_nextn_ignored_layers.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/models/test_glm5_nextn_static_quant_dummy_load.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/models/test_glm5_nextn_weight_mappings.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/models/test_glm5_prefill_microbatch_helpers.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/model_executor/test_prefill_options_threshold_guard.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/model_executor/test_prefill_xla_options.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/model_executor/test_sc_allreduce_compile_option.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_int4_experts.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/kernels/gmm/test_glu_epilogue_layout.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/kernels/quantized_matmul/test_blockwise_exact_divisor_tiles.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/layers/attention/test_prefill_microbatch_metadata.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/layers/test_epmoe_two_stage.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/layers/test_moe_inv_sort_unpermute.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/layers/test_moe_permute_small.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/layers/test_fuse_quantized_linears.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/layers/test_linear_per_channel_requant.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(

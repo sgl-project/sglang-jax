@@ -76,8 +76,8 @@ def interleave_gate_up(w0: jax.Array, w1: jax.Array, chunk: int) -> jax.Array:
 # ragged_gather_reduce, which gathers only valid rows (SC kernel: stable partition of valid rows;
 # TC fallback: jnp.where after the multiply), so the unvisited 7/8 of out[M_total, K] is never
 # read. The XLA combine (small batches, no SparseCore) keeps the memset: its einsum multiplies
-# every gathered row by its weight and a stale NaN row would poison the sum (gp153, 2026-10-02).
-# kbench gp800 (2026-10-10, v7x, 8k two-window shape m_32768): down gmm 198.1 -> 152.4 us (-23 %),
+# every gathered row by its weight and a stale NaN row would poison the sum.
+# Kernel benchmark (v7x, 8k two-window shape m_32768): down gmm 198.1 -> 152.4 us (-23 %),
 # visited rows bitwise identical. Two-call (prefill) path only; the fused GLU+down path is untouched.
 _MOE_DOWN_ZERO_INIT_SKIP_LOGGED = False
 # Fused GLU+down: gate_up -> SwiGLU -> down as ONE pallas_call
@@ -509,8 +509,8 @@ class EPMoE(nnx.Module):
                 # Per-channel / block scales stay f32 regardless of the weight dtype: the
                 # gmm kernels consume f32 scales, so a bf16 scale parameter costs one
                 # convert + copy per expert layer per step (3 per MoE layer in the AOT
-                # programs) and rounds the loaded scale. (Upstream #1637 tied the dtype to
-                # the model dtype for int4 checkpoints; the fork keeps the v34 behaviour.)
+                # programs) and rounds the loaded scale. This also applies to int4
+                # checkpoints, whose placeholders #1637 created in the model dtype.
                 scale_dtype = jnp.float32
 
                 def _make_param(shape, dtype, sharding_spec):
@@ -892,7 +892,7 @@ class EPMoE(nnx.Module):
             # The zero-valued edge goes on the routing weights ([tokens, top_k], a direct operand
             # of the SparseCore combine), not on intermediate_output ([tokens*top_k, hidden]):
             # that add could not fuse into the combine custom call and ran as its own pass
-            # (gp217 4k trace: moe.py:790 broadcast_add_fusion bf16[16384,6144], 9.6 ms/chunk).
+            # (4k trace: a broadcast_add_fusion bf16[16384,6144] cost 9.6 ms/chunk).
             topk_weights = topk_weights + zero.astype(topk_weights.dtype)
 
         output = self._unpermute(
@@ -1282,17 +1282,18 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            zero_initialize=self._down_zero_initialize(local_range),
+            zero_initialize=self._down_zero_initialize(local_range, intermediate_layer.dtype),
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
 
     @staticmethod
-    def _down_zero_initialize(local_range) -> bool:
+    def _down_zero_initialize(local_range, dtype) -> bool:
         """zero_initialize for the two-call down gmm: False on the SparseCore-combine path
-        (see the note above)."""
+        (see the note above). The TensorCore fallback of ``sc_combine`` (non-bf16
+        intermediates) masks the weights, not the products, so it keeps the memset."""
         global _MOE_DOWN_ZERO_INIT_SKIP_LOGGED
-        if local_range is not None:
+        if local_range is not None and dtype == jnp.bfloat16:
             if not _MOE_DOWN_ZERO_INIT_SKIP_LOGGED:
                 _MOE_DOWN_ZERO_INIT_SKIP_LOGGED = True
                 logger.info(

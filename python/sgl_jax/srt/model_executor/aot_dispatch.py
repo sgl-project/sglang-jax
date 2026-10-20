@@ -69,7 +69,7 @@ _SC_ALL_REDUCE_MIN_BYTES_ENV = "SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES"
 
 def sc_all_reduce_min_bytes_compiler_options():
     """Per-executable XLA option that keeps all-reduces smaller than
-    ``SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES`` bytes on the TensorCore (default 32 MiB).
+    ``SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES`` bytes on the TensorCore (0 = off, the default).
 
     On TPU v7x XLA hands every all-reduce of roughly 96 KB and above to the
     SparseCore. For the [bs, hidden] bf16 all-reduces of a tensor-parallel
@@ -174,7 +174,8 @@ def prefill_xla_options_min_tokens() -> int:
     """SGLANG_JAX_PREFILL_XLA_OPTIONS only applies to prefill executables whose (padded)
     token count is at least this (0 = every prefill executable). Lets an option that only
     pays off on the micro-batched buckets (e.g. splitting multi-output fusions) stay off
-    the small buckets where it is pure cost (gp101: 1k +3% with it on everywhere). Default 2048."""
+    the small buckets where it is pure cost (measured +3% on the 1k bucket with it on everywhere). Default 2048.
+    """
     try:
         min_tokens = max(0, envs.SGLANG_JAX_PREFILL_XLA_OPTIONS_MIN_TOKENS.get())
     except ValueError:
@@ -191,7 +192,7 @@ def _clamp_to_microbatch_threshold(min_tokens: int) -> int:
     (DSA_PREFILL_MICROBATCH >= 2) must be compiled with the prefill XLA options
     (producer_consumer_multi_output_fusion=false, crs combiner threshold); without them
     XLA merges fusions across the two windows and the compile fails with 'annotation
-    groups with gaps' (gp286/gp308, 10-03/04: option threshold 2048 left the 1024-token
+    groups with gaps' (seen when an option threshold of 2048 left the 1024-token
     executable without the options). Clamp the option threshold down to the micro-batch
     threshold so both always travel together."""
     try:
