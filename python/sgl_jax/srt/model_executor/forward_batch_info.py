@@ -171,7 +171,7 @@ def dsa_dense_arm_flags(forward_mode, seq_lens, num_tokens, *, who="ForwardBatch
     dsa_dense_exact = bool(exact_max > 0 and is_pure_extend and 0 <= max_seq <= exact_max)
     if exact_max > 0 and is_pure_extend:
         global _DENSE_OK_LOGS
-        if _DENSE_OK_LOGS < 8:
+        if index_topk and _DENSE_OK_LOGS < 8:
             _DENSE_OK_LOGS += 1
             logger.info(
                 "%s: EXTEND max_seq=%d tokens=%d -> dsa_dense_exact=%s",

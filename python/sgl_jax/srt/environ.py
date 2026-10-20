@@ -65,14 +65,16 @@ class Envs:
     # attend (the top-k would select every page anyway, so it is the same
     # function without the scoring). Clamped to the model's index_topk by the
     # backend. 0 = always sparse. GLM-5.2 production: 2048.
-    DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT = EnvInt(2048)
+    # 0 = always the sparse arm (default); GLM-5.2 serving on v7x sets 2048.
+    DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT = EnvInt(0)
 
     # DSA decode: batches with at least this many requests reshard queries
     # head-TP -> request-sharded (all_to_all inside the shard_map), attend only
     # the local request slice and a2a back (a2a-DP attend; the decode twin of
     # the prefill TSA sandwich). Below it the head-TP per-request attend stays
     # (two a2a are pure latency at bs1). 0 = never. GLM-5.2 production: 64.
-    DSA_DP_DECODE_BS = EnvInt(64)
+    # 0 = never (default); GLM-5.2 serving on v7x sets 64.
+    DSA_DP_DECODE_BS = EnvInt(0)
 
     # DSA decode page top-k identity shortcut: when the page budget covers the
     # whole KV bucket the top-k selects every valid page anyway, so skip the
@@ -87,7 +89,9 @@ class Envs:
     # output feeds the kernel and the kernel output feeds the W_UV dot without
     # the two tile-level relayouts XLA otherwise inserts around the custom call.
     # Decode / verify keep the token-major path. Escape hatch only.
-    SGLANG_JAX_MLA_Q_HEAD_MAJOR = EnvBool(True)
+    # Opt-in (default off): the head-major form needs max_num_tokens and the tuned
+    # bq to be multiples of 16 and raises otherwise. GLM-5.2 serving on v7x sets 1.
+    SGLANG_JAX_MLA_Q_HEAD_MAJOR = EnvBool(False)
 
     # Decode KV capacity ladder (non-speculative decode): per-request cache_loc
     # capacity steps (tokens, page-aligned) so short-context decode batches run

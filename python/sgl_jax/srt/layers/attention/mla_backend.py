@@ -35,7 +35,7 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 # Knife 10 (issue super-computers#11): head-major q/o contract for the MLA v2
 # kernel on EXTEND batches (distribution is statically [0, 0, N] there, so the
 # two decode kernels are skipped). Decode / verify keep the packed token-major
-# path. SGLANG_JAX_MLA_Q_HEAD_MAJOR (default on).
+# path. SGLANG_JAX_MLA_Q_HEAD_MAJOR (opt-in, default off).
 _MLA_Q_HEAD_MAJOR = envs.SGLANG_JAX_MLA_Q_HEAD_MAJOR.get()
 
 if TYPE_CHECKING:

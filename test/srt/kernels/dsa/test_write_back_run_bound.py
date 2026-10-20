@@ -1,4 +1,4 @@
-"""The paged_write_back run table never overflows r_cap = T//ps + S + 34 for extend-form slot
+"""The paged_write_back run table never overflows r_cap = T//ps + 2*S + 2 for extend-form slot
 layouts (new slots of every sequence are page-contiguous: chunked prefill, radix prefix on page
 boundaries, MIXED 1-query extends) -- the premise of DSA_WRITEBACK_NOCOND."""
 
@@ -35,6 +35,8 @@ def test_runs_within_bound_extend_forms():
         ([3504], [106496]),  # last 110k chunk with a long prefix
         ([1] * 64, list(rng.integers(0, 5000, 64))),  # MIXED: 64 one-token extends
         ([700, 1, 1300, 5, 2000], [0, 777, 128, 4096, 33]),  # mixed lengths, odd prefixes
+        ([2] * 64, [PS - 1] * 64),  # 64 two-token extends, every one straddling a page boundary
+        ([3] * 40, [PS - 2] * 40),  # 40 straddling three-token extends
     ]
     for q_lens, prefix_lens in cases:
         loc = _layout(rng, q_lens, prefix_lens)
@@ -42,6 +44,6 @@ def test_runs_within_bound_extend_forms():
         pad = (-T) % 256
         loc = np.concatenate([loc, -np.ones(pad, np.int32)])  # token padding (loc == -1)
         Tp = loc.shape[0]
-        bound = Tp // PS + S + 34
+        bound = Tp // PS + 2 * S + 2
         _, n_raw = _build_write_runs(jnp.asarray(loc), kv_packing=2, r_cap=4 * Tp)
         assert int(n_raw) <= bound, (q_lens, prefix_lens, int(n_raw), bound)

@@ -102,10 +102,14 @@ def test_dense_arm_write_parity_pages():
         ),
         (6, [PAGE_SIZE * 2 + 5, PAGE_SIZE * 4, 7, 0], [PAGE_SIZE + 2, PAGE_SIZE * 4, 7, 0]),
         (7, [PAGE_SIZE * 4, PAGE_SIZE * 4, PAGE_SIZE * 4, PAGE_SIZE * 4], [PAGE_SIZE * 4] * 4),
+        # every sequence straddles a page boundary with a 2-token extend: 2 pages per sequence,
+        # 8 pages for 8 tokens (the page-unit budget must be T // page_size + 2 * S, not + S)
+        (8, [PAGE_SIZE + 1] * 4, [2] * 4),
+        (9, [PAGE_SIZE * 2 + 5] * 4, [6] * 4),
     ]:
         rng = np.random.default_rng(seed)
         cache4d = _cache(rng)
-        T_pad = sum(q_lens) + 6
+        T_pad = sum(q_lens) + (6 if seed < 8 else 0)
         new_tokens, sl, pi, cu_q, cu_kv = _mk_batch(rng, seq_lens, q_lens, T_pad)
         cache3d = cache4d.reshape(NUM_PAGES, PAGE_SIZE, D)
         ref = np.asarray(_scatter_paged(cache3d, new_tokens, sl, pi, cu_q, cu_kv, PPS)).reshape(

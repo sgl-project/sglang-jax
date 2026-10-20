@@ -110,15 +110,18 @@ def _decode_kv_ladder_min_bs() -> int:
     return envs.SGLANG_JAX_DECODE_KV_LADDER_MIN_BS.get()
 
 
+@functools.cache
 def _decode_kv_ladder_smallbs_floor() -> int:
     """Smallest ladder step (tokens) allowed for batches below the min bs."""
     return envs.SGLANG_JAX_DECODE_KV_LADDER_SMALLBS_FLOOR.get()
 
 
-def _decode_kv_ladder_steps(page_size: int) -> tuple[int, ...]:
+@functools.cache
+def decode_kv_ladder_steps(page_size: int) -> tuple[int, ...]:
     """Per-request KV capacity ladder for decode cache_loc sizing.
 
-    SGLANG_JAX_DECODE_KV_LADDER (default "2048,4096,8192,16384,65536") lets
+    SGLANG_JAX_DECODE_KV_LADDER (opt-in; empty by default, GLM-5.2 serving on
+    v7x uses "2048,4096,8192,16384,65536") lets
     short-context decode batches run on smaller cache_loc shapes (and therefore
     smaller attention / indexer buffers) instead of always padding every request
     to max_req_len. Each step is page-aligned; the max-capacity bucket remains
@@ -128,14 +131,12 @@ def _decode_kv_ladder_steps(page_size: int) -> tuple[int, ...]:
     if not raw:
         return ()
     steps = {(int(s) + page_size - 1) // page_size * page_size for s in raw.split(",") if s.strip()}
-    if not getattr(_decode_kv_ladder_steps, "_logged", False):
-        _decode_kv_ladder_steps._logged = True
-        logger.info(
-            "decode KV ladder enabled: steps=%s min_bs=%s smallbs_floor=%s",
-            sorted(steps),
-            _decode_kv_ladder_min_bs(),
-            _decode_kv_ladder_smallbs_floor(),
-        )
+    logger.info(
+        "decode KV ladder enabled: steps=%s min_bs=%s smallbs_floor=%s",
+        sorted(steps),
+        _decode_kv_ladder_min_bs(),
+        _decode_kv_ladder_smallbs_floor(),
+    )
     return tuple(sorted(steps))
 
 
@@ -2592,7 +2593,7 @@ class ScheduleBatch:
                     ),
                 )
             else:
-                ladder = _decode_kv_ladder_steps(page_size)
+                ladder = decode_kv_ladder_steps(page_size)
                 if ladder:
                     # Pick the smallest per-request KV capacity step that holds the
                     # longest sequence in the batch; fall back to the bs bucket's

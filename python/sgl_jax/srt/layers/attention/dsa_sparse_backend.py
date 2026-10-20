@@ -924,8 +924,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, tpages_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            kpm = min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
-            k_pages_max = kpm
+            k_pages_max = (
+                min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
+            )
             if has_pages:
                 # Page lists from the prefill-form indexer (spec decode-form path)
                 # are index_topk/page_size wide; the page-level wrapper expects
@@ -973,7 +974,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 page_size=page_size,
                 pages_per_seq=pages_per_seq,
                 kv_lora_rank=self.kv_lora_rank,
-                k_pages_max=kpm,
+                k_pages_max=k_pages_max,
                 vmem_limit_bytes=self.vmem_limit_bytes,
                 page_share_group=page_share_group,
                 group_queries=group_queries,
@@ -1051,7 +1052,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            cache4d = None
             # 4D-native in-place write with the run-table DMA kernel the KV write
             # uses (bit-identical to the flat scatter, handles consecutive tokens
             # in one slab); no 3D view (every reshape of the paged cache is a
@@ -1079,8 +1079,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 # the KV write uses; prefill chunks (> SCATTER_ROWS_MAX rows) keep the kernel.
                 small_rows_scatter=True,
             )
-            cache3d = None
-            cache_out = cache4d if cache4d is not None else cache3d.reshape(cache_.shape)
+            cache_out = cache4d
             if not compute_pages:
                 return cache_out, jnp.full((q_.shape[0], k_pages), -1, jnp.int32)
             if tshard:
@@ -1101,7 +1100,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages = _prefill_page_topk(
                 q_,
                 w_,
-                cache3d,
+                None,  # no 3-D cache view on this path
                 seq_lens_,
                 pi_,
                 cuq_,
@@ -2101,7 +2100,7 @@ def _dense_arm_idx_write_pages(
 ):
     """Indexer-key write of the dense prefill arms as whole-page gather / overlay / scatter.
 
-    Units = the pages the window's T new rows can touch: at most ``T // page_size + S`` (each sequence
+    Units = the pages the window's T new rows can touch: at most ``T // page_size + 2 * S`` (each sequence
     adds at most one partial page at each end), enumerated by the prefix sum of per-sequence touched-page
     counts -- NOT ``S x pages_per_seq`` (pages_per_seq is the max-context page count, 1056 at 135k: the
     first form reserved 17.6 GB of temporaries in the 8192-token program, gp811 2026-10-10). Per unit:
@@ -2113,7 +2112,7 @@ def _dense_arm_idx_write_pages(
     assert pspk * pk == page_size, (cache4d.shape, page_size)
     S = seq_lens.shape[0]
     T = new_tokens.shape[0]
-    U = T // page_size + S
+    U = T // page_size + 2 * S  # ceil(q / page_size) + 1 pages per sequence, summed
     rows = new_tokens.astype(cache4d.dtype)
     rows_pad = jnp.concatenate([rows, jnp.zeros((1, D), rows.dtype)], axis=0)  # index T = zero row
     q_len_s = cu_q_lens[1:] - cu_q_lens[:-1]  # [S]

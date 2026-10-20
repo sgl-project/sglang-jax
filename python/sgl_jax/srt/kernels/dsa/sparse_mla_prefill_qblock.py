@@ -641,7 +641,7 @@ def prefill_write_and_attend_ragged_qblock(
         row,
         loc.astype(jnp.int32),
         page_size=ps,
-        r_cap=T // ps + S + 34,
+        r_cap=T // ps + 2 * S + 2,  # <= ceil(q / ps) + 1 runs per sequence
         interpret=interpret,
     )
 
@@ -726,7 +726,7 @@ def prefill_write_and_attend_ragged_qblock_tsa(
         row,
         loc.astype(jnp.int32),
         page_size=ps,
-        r_cap=Tkv // ps + S + 34,
+        r_cap=Tkv // ps + 2 * S + 2,
         interpret=interpret,
     )
 

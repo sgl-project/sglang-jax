@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Any
 
@@ -378,22 +379,29 @@ class Glm5Attention(nnx.Module):
                     out_sharding=P(*uk_axes),
                 )
             )
-            # Replicated full-head copies for the TSA absorb-after-a2a path: filled by
-            # prepare_absorbed_mla.
-            self.w_uk_all = nnx.Param(
-                jnp.zeros(
-                    (self.kv_lora_rank, num_heads, self.qk_nope_head_dim),
-                    dtype=dtype,
-                    out_sharding=P(None, None, None),
+            # Replicated full-head copies for the TSA absorb-after-a2a path (DSA_TSA_PREFILL=1),
+            # filled by prepare_absorbed_mla; ~2 x lkv x heads x d per layer per device, so only
+            # allocated when that path is on.
+            if (
+                os.environ.get("DSA_TSA_PREFILL", "0") == "1"
+            ):  # same read as dsa_sparse_backend._TSA_PREFILL
+                self.w_uk_all = nnx.Param(
+                    jnp.zeros(
+                        (self.kv_lora_rank, num_heads, self.qk_nope_head_dim),
+                        dtype=dtype,
+                        out_sharding=P(None, None, None),
+                    )
                 )
-            )
-            self.w_uv_all = nnx.Param(
-                jnp.zeros(
-                    (self.kv_lora_rank, num_heads, self.v_head_dim),
-                    dtype=dtype,
-                    out_sharding=P(None, None, None),
+                self.w_uv_all = nnx.Param(
+                    jnp.zeros(
+                        (self.kv_lora_rank, num_heads, self.v_head_dim),
+                        dtype=dtype,
+                        out_sharding=P(None, None, None),
+                    )
                 )
-            )
+            else:
+                self.w_uk_all = None
+                self.w_uv_all = None
             self.attn_mqa = RadixAttention(
                 num_heads=num_heads,
                 head_dim=self.kv_lora_rank + self.qk_rope_head_dim,

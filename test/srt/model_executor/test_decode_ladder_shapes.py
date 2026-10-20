@@ -8,6 +8,7 @@ rung's own page count, so a 64-page bucket at a 2048-token rung is compiled with
 import unittest
 from unittest import mock
 
+from sgl_jax.srt.managers.schedule_batch import decode_kv_ladder_steps
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -24,6 +25,7 @@ def _manager(page_size, bs_buckets, cache_loc_buckets, page_buckets):
 
 
 def _ladder(value):
+    decode_kv_ladder_steps.cache_clear()  # the parsed ladder is cached per process
     return mock.patch.dict("os.environ", {"SGLANG_JAX_DECODE_KV_LADDER": value})
 
 
