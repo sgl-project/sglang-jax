@@ -1,6 +1,6 @@
 """dsa_dense_arm_flags: the host-side dense-arm rule shared by ForwardBatch.init_new and the fused-prefill
 target batch (exact-dense arm): pure EXTEND only, per-sequence max_seq <= DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT
-(default 2048), bound clamped to the model's index_topk when given."""
+(opt-in, 0 = off by default; production 2048), bound clamped to the model's index_topk when given."""
 
 import os
 
@@ -48,9 +48,11 @@ def test_device_seq_lens_never_synced(env):
     assert dsa_dense_arm_flags(ForwardMode.TARGET_VERIFY, dev, 4) is False
 
 
-def test_default_bound_without_env(monkeypatch):
-    # registered default (environ.py): 2048
+def test_default_is_off_without_env(monkeypatch):
+    # registered default (environ.py): 0 = the exact-dense arm is opt-in; production sets 2048
     monkeypatch.delenv("DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT", raising=False)
+    assert dsa_dense_arm_flags(ForwardMode.EXTEND, np.array([16]), 16) is False
+    monkeypatch.setenv("DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT", "2048")
     assert dsa_dense_arm_flags(ForwardMode.EXTEND, np.array([2048]), 2048) is True
     assert dsa_dense_arm_flags(ForwardMode.EXTEND, np.array([2049]), 2049) is False
 
