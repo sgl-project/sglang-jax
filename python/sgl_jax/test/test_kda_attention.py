@@ -233,6 +233,7 @@ def write_initial_state(
     recurrent_buffer = recurrent_buffer.at[recurrent_indices].set(
         ssm_state, out_sharding=pool.recurrent_sharding
     )
+    conv_state = conv_logical_to_packed(conv_state, pool.conv_sharding)
     conv_buffer = (
         conv_buffer_list[0].at[recurrent_indices].set(conv_state, out_sharding=pool.conv_sharding)
     )
@@ -243,8 +244,30 @@ def gather_ssm(pool: RecurrentStatePool, recurrent_buffer: jax.Array, indices: n
     return recurrent_buffer.at[indices].get(out_sharding=pool.recurrent_sharding)
 
 
+def _conv_tp(sharding: NamedSharding) -> int:
+    return sharding.mesh.shape["tensor"] if sharding.spec[1] == "tensor" else 1
+
+
+def conv_logical_to_packed(conv: jax.Array, sharding: NamedSharding) -> jax.Array:
+    """``[B, q|k|v, K-1]`` -> the pool's per-shard ``[q_r|k_r|v_r]`` channel layout."""
+    tp = _conv_tp(sharding)
+    B, D3, K1 = conv.shape
+    x = np.asarray(conv).reshape(B, 3, tp, D3 // 3 // tp, K1).transpose(0, 2, 1, 3, 4)
+    return jax.device_put(x.reshape(B, D3, K1), sharding)
+
+
+def conv_packed_to_logical(conv: jax.Array, sharding: NamedSharding) -> jax.Array:
+    """Inverse of :func:`conv_logical_to_packed`."""
+    tp = _conv_tp(sharding)
+    B, D3, K1 = conv.shape
+    x = np.asarray(conv).reshape(B, tp, 3, D3 // 3 // tp, K1).transpose(0, 2, 1, 3, 4)
+    return jax.device_put(x.reshape(B, D3, K1), sharding)
+
+
 def gather_conv(pool: RecurrentStatePool, conv_buffer: jax.Array, indices: np.ndarray):
-    return conv_buffer.at[indices].get(out_sharding=pool.conv_sharding)
+    """Gather per-request conv state in the logical ``[q|k|v]`` layout."""
+    packed = conv_buffer.at[indices].get(out_sharding=pool.conv_sharding)
+    return conv_packed_to_logical(packed, pool.conv_sharding)
 
 
 def create_test_data(
