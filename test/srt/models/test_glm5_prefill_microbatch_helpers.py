@@ -362,6 +362,10 @@ class DenseLayerScheduleTest(unittest.TestCase):
 class _MoeStubLayer(_DenseStubLayer):
     is_moe_layer = True
 
+    def fused_reduce_supported(self):
+        # EPMoE with deferrable shared experts on a tensor-only mesh: the two-stage path applies
+        return True
+
     def mlp_dispatch(self, hidden, dispatch_info=None):
         self.log.append(("dispatch", self.layer_id, float(hidden[0, 0])))
         anchor = (hidden[:1, :1] * 0 + 7.0).astype(jnp.float32)  # [1,1], identifiable
@@ -587,3 +591,43 @@ class SchedGroupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TwoStageFallbackTest(unittest.TestCase):
+    def test_moe_layer_without_two_stage_support_uses_mlp_partial(self):
+        """A MoE layer whose fused_reduce_supported() is False (fused backend, no shared
+        experts, data axis > 1, non-deferrable shared down_proj) takes the per-window
+        mlp_partial / mlp_reduce path instead of mlp_dispatch."""
+        T = 512
+        fb = _fb(T)
+        fb.attn_backend.full_slot = {0: 0}
+        fb.out_cache_loc = jnp.arange(T, dtype=jnp.int32)
+        fb.positions = jnp.arange(T, dtype=jnp.int32)
+        log = []
+
+        class _NoTwoStage(_MoeStubLayer):
+            def fused_reduce_supported(self):
+                return False
+
+            def mlp_dispatch(self, hidden, dispatch_info=None):
+                raise AssertionError("mlp_dispatch must not be called on this layer")
+
+        layers = [_NoTwoStage(0, log)]
+        parts = [glm5_moe._slice_forward_batch(fb, lo, hi) for lo, hi in [(0, 256), (256, 512)]]
+        hidden = [p.input_ids[:, None].astype(jnp.float32) for p in parts]
+        pool = glm5_moe._MicrobatchPoolView(_StubPool(1, T))
+        glm5_moe._microbatch_pinned_layers(
+            layers,
+            parts,
+            hidden,
+            [None, None],
+            [None, None],
+            [None, None],
+            pool,
+            {0: 0},
+            pin=lambda x, a: x,
+        )
+        kinds = [e[0] for e in log]
+        self.assertEqual(kinds.count("mlp"), 2, log)
+        self.assertEqual(kinds.count("reduce"), 2, log)
+        self.assertNotIn("dispatch", kinds, log)
