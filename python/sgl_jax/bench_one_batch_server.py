@@ -9,12 +9,19 @@ python3 -m sgl_jax.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B -
 
 python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
 python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+
+The input/output cost columns in --show-report are derived from the *server's* tp_size
+(read from /get_server_info) and the per-chip-hour price of the selected TPU generation
+(built-in table from the official Cloud TPU pricing sheet, 3-year commitment by default).
+The assumptions are printed above the table.
+python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --chip ironwood --pricing-tier 3yr
 """
 
 import argparse
 import dataclasses
 import itertools
 import json
+import math
 import multiprocessing
 import os
 import time
@@ -27,6 +34,37 @@ from sgl_jax.srt.entrypoints import http_server
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import is_in_ci, write_github_step_summary
+
+# ---------------------------------------------------------------------------
+# Cloud TPU per-chip-hour pricing, USD.
+#
+# Source: official Cloud TPU pricing sheet, snapshot taken Oct 2026.
+# For each generation we take the cheapest listed US region. The default tier
+# used for the cost columns is the 3-year commitment price.
+#
+# devices_per_chip = number of JAX devices (TensorCores) one *billable chip*
+# exposes. The server's tp_size counts JAX devices, so
+# num_chips = ceil(tp_size / devices_per_chip).
+# ---------------------------------------------------------------------------
+TPU_PRICING_SNAPSHOT = "Oct 2026"
+TPU_PRICING_SOURCE = "official Cloud TPU pricing sheet"
+TPU_PRICING_TIERS = ("3yr", "1yr", "on_demand")
+TPU_PRICING_TIER_LABELS = {
+    "3yr": "3-year commitment",
+    "1yr": "1-year commitment",
+    "on_demand": "on-demand",
+}
+TPU_PRICING = {
+    # key: (display name, region, devices_per_chip, {tier: $/chip-hr})
+    "ironwood": ("Ironwood (v7x)", "us-central1", 2, {"on_demand": 12.00, "1yr": 8.40, "3yr": 5.40}),
+    "trillium": ("Trillium (v6e)", "us-east1", 1, {"on_demand": 2.70, "1yr": 1.89, "3yr": 1.22}),
+    "v5p": ("TPU v5p", "us-east5", 1, {"on_demand": 4.20, "1yr": 2.94, "3yr": 1.89}),
+    "v5e": ("TPU v5e", "us-central1", 1, {"on_demand": 1.20, "1yr": 0.84, "3yr": 0.54}),
+    "v4": ("TPU v4 pod", "us-central2", 1, {"on_demand": 3.22, "1yr": 2.0286, "3yr": 1.449}),
+    "v3": ("TPU v3 pod", "europe-west4", 2, {"on_demand": 2.00, "1yr": 1.26, "3yr": 0.90}),
+    "v2": ("TPU v2 pod", "us-central1", 2, {"on_demand": 1.50, "1yr": 0.945, "3yr": 0.675}),
+}
+TPU_CHIP_ALIASES = {"v7x": "ironwood", "v7": "ironwood", "v6e": "trillium"}
 
 
 @dataclasses.dataclass
@@ -46,6 +84,16 @@ class BenchArgs:
     profile: bool = False
     profile_by_stage: bool = False
     api_type: str = "native"  # "native" or "openai"
+    # Cost model for the --show-report table.
+    #   hourly cost = price_per_chip_hour * num_chips
+    #   price       = --hourly-cost-per-chip if > 0, else TPU_PRICING[chip][tier]
+    #   num_chips   = --num-chips if > 0, else ceil(server tp_size / devices_per_chip)
+    chip: str = "ironwood"  # key into TPU_PRICING (or alias)
+    pricing_tier: str = "3yr"  # 3yr | 1yr | on_demand
+    hourly_cost_per_chip: float = 0.0  # $/chip-hour override; 0 = from TPU_PRICING
+    devices_per_chip: int = 0  # JAX devices per billable chip override; 0 = from TPU_PRICING
+    num_chips: int = 0  # 0 = derive from server tp_size
+    input_util: float = 0.7  # assumed prefill utilization for input cost
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -77,6 +125,50 @@ class BenchArgs:
             default=BenchArgs.api_type,
             choices=["native", "openai"],
             help="API type to use: 'native' for /generate or 'openai' for /v1/completions",
+        )
+        parser.add_argument(
+            "--chip",
+            type=str,
+            default=BenchArgs.chip,
+            help="TPU generation used for pricing: "
+            + ", ".join(sorted(TPU_PRICING) + sorted(TPU_CHIP_ALIASES))
+            + f" (default: {BenchArgs.chip}).",
+        )
+        parser.add_argument(
+            "--pricing-tier",
+            type=str,
+            default=BenchArgs.pricing_tier,
+            choices=TPU_PRICING_TIERS,
+            help=f"Which price column of the {TPU_PRICING_SOURCE} to use "
+            f"(default: {BenchArgs.pricing_tier} = 3-year commitment).",
+        )
+        parser.add_argument(
+            "--hourly-cost-per-chip",
+            type=float,
+            default=BenchArgs.hourly_cost_per_chip,
+            help="Override price in $/hour of one billable chip. "
+            "0 (default) = look up --chip / --pricing-tier in the built-in table.",
+        )
+        parser.add_argument(
+            "--devices-per-chip",
+            type=int,
+            default=BenchArgs.devices_per_chip,
+            help="Override JAX devices (cores) per billable chip, used to convert the "
+            "server's tp_size into a chip count. 0 (default) = from the built-in table "
+            "(v7x: 2, v6e/v5p/v5e/v4: 1).",
+        )
+        parser.add_argument(
+            "--num-chips",
+            type=int,
+            default=BenchArgs.num_chips,
+            help="Explicit number of billable chips. If 0 (default), derived as "
+            "ceil(server tp_size / devices_per_chip).",
+        )
+        parser.add_argument(
+            "--input-util",
+            type=float,
+            default=BenchArgs.input_util,
+            help="Assumed prefill utilization when computing input cost.",
         )
 
     @classmethod
@@ -302,6 +394,141 @@ def run_one_case(
     )
 
 
+def resolve_hourly_cost(server_info: dict, server_args: ServerArgs, bench_args: BenchArgs):
+    """Build the CostModel used for the $/1M-token columns in --show-report.
+
+    The number of accelerators is taken from the *running server* (via
+    /get_server_info), not from this script's own CLI args. When benchmarking
+    an existing server with --base-url, the client-side ``server_args.tp_size``
+    is just the default (1), which would silently under-price the deployment.
+
+    On TPUs ``tp_size`` counts JAX devices (cores) while billing is per chip,
+    so devices are converted to chips with ``devices_per_chip`` unless
+    ``--num-chips`` is given explicitly.
+    """
+    server_tp_size = None
+    tp_source = "server /get_server_info"
+    if isinstance(server_info, dict):
+        if "tp_size" in server_info:
+            server_tp_size = server_info["tp_size"]
+        elif "decode" in server_info and server_info["decode"]:
+            # PD-disaggregated deployments: price the decode side.
+            server_tp_size = server_info["decode"][0].get("tp_size")
+            tp_source = "server /get_server_info (decode side)"
+        elif "prefill" in server_info and server_info["prefill"]:
+            server_tp_size = server_info["prefill"][0].get("tp_size")
+            tp_source = "server /get_server_info (prefill side)"
+
+    if server_tp_size is None:
+        server_tp_size = server_args.tp_size
+        tp_source = "client-side --tp-size (FALLBACK, server did not report tp_size)"
+        print(
+            "WARNING: could not read tp_size from /get_server_info; falling back to "
+            f"client-side --tp-size={server_tp_size}. Cost columns may be wrong; "
+            "pass --num-chips to override."
+        )
+
+    # Chip / pricing lookup.
+    chip_key = bench_args.chip.lower()
+    chip_key = TPU_CHIP_ALIASES.get(chip_key, chip_key)
+    if chip_key not in TPU_PRICING:
+        raise ValueError(
+            f"Unknown --chip {bench_args.chip!r}. Known: "
+            + ", ".join(sorted(TPU_PRICING) + sorted(TPU_CHIP_ALIASES))
+        )
+    chip_name, region, table_devices_per_chip, prices = TPU_PRICING[chip_key]
+    tier = bench_args.pricing_tier
+
+    if bench_args.hourly_cost_per_chip > 0:
+        price_per_chip_hour = bench_args.hourly_cost_per_chip
+        price_source = "--hourly-cost-per-chip override"
+    else:
+        price_per_chip_hour = prices[tier]
+        price_source = (
+            f"{TPU_PRICING_SOURCE}, {TPU_PRICING_TIER_LABELS[tier]} column, "
+            f"{region}, snapshot {TPU_PRICING_SNAPSHOT}"
+        )
+
+    if bench_args.devices_per_chip > 0:
+        devices_per_chip = bench_args.devices_per_chip
+        devices_source = "--devices-per-chip override"
+    else:
+        devices_per_chip = table_devices_per_chip
+        devices_source = f"built-in table for {chip_name}"
+
+    if bench_args.num_chips > 0:
+        num_chips = bench_args.num_chips
+        chips_source = "--num-chips override"
+    else:
+        num_chips = max(1, math.ceil(server_tp_size / devices_per_chip))
+        chips_source = f"ceil(tp_size {server_tp_size} / {devices_per_chip} devices per chip)"
+
+    return CostModel(
+        chip_key=chip_key,
+        chip_name=chip_name,
+        region=region,
+        pricing_tier=tier,
+        price_per_chip_hour=price_per_chip_hour,
+        price_source=price_source,
+        devices_per_chip=devices_per_chip,
+        devices_source=devices_source,
+        server_tp_size=server_tp_size,
+        tp_source=tp_source,
+        num_chips=num_chips,
+        chips_source=chips_source,
+        input_util=bench_args.input_util,
+    )
+
+
+@dataclasses.dataclass
+class CostModel:
+    """Everything that goes into the $/1M-token columns, with provenance."""
+
+    chip_key: str
+    chip_name: str
+    region: str
+    pricing_tier: str
+    price_per_chip_hour: float
+    price_source: str
+    devices_per_chip: int
+    devices_source: str
+    server_tp_size: int
+    tp_source: str
+    num_chips: int
+    chips_source: str
+    input_util: float
+
+    @property
+    def hourly_cost(self) -> float:
+        return self.price_per_chip_hour * self.num_chips
+
+    def input_cost_per_1m(self, input_throughput: float) -> float:
+        return 1e6 / (input_throughput * self.input_util) / 3600 * self.hourly_cost
+
+    def output_cost_per_1m(self, output_throughput: float) -> float:
+        return 1e6 / output_throughput / 3600 * self.hourly_cost
+
+    def assumptions_markdown(self) -> str:
+        lines = [
+            "**Cost assumptions** (used for the `input cost` / `output cost` columns)",
+            "",
+            f"- Chip: **{self.chip_name}**, priced per chip-hour.",
+            f"- Price: **${self.price_per_chip_hour:.2f}/chip-hr** — {self.price_source}.",
+            f"- Devices per chip: {self.devices_per_chip} ({self.devices_source}).",
+            f"- Server tp_size: {self.server_tp_size} ({self.tp_source}).",
+            f"- Billable chips: **{self.num_chips}** = {self.chips_source}.",
+            f"- Hourly cost: **${self.hourly_cost:.2f}/hr** "
+            f"= {self.num_chips} chips x ${self.price_per_chip_hour:.2f}/chip-hr.",
+            f"- Input cost  = 1e6 / (input_tput x {self.input_util} util) / 3600 x hourly cost.",
+            "- Output cost = 1e6 / output_tput / 3600 x hourly cost.",
+            "",
+            f"> Prices are from the {TPU_PRICING_SOURCE} as of {TPU_PRICING_SNAPSHOT}; "
+            "re-check before quoting externally. Override with --chip, --pricing-tier, "
+            "--hourly-cost-per-chip, --devices-per-chip, --num-chips.",
+        ]
+        return "\n".join(lines)
+
+
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
@@ -395,7 +622,10 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
-    summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+    cost = resolve_hourly_cost(server_info, server_args, bench_args)
+
+    summary = "\n" + cost.assumptions_markdown() + "\n\n"
+    summary += f"Input lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
     summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
 
     if bench_args.profile:
@@ -419,8 +649,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         acc_length,
         trace_link,
     ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
-        input_util = 0.7
         accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
         line = (
             f"| {batch_size} | "
@@ -429,8 +657,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             f"{output_throughput:.2f} | "
             f"{accept_length} | "
             f"{1 / (output_throughput / batch_size) * 1000:.2f} | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
+            f"{cost.input_cost_per_1m(input_throughput):.2f} | "
+            f"{cost.output_cost_per_1m(output_throughput):.2f} |"
         )
         if trace_link:
             line += f" [Profile]({trace_link}) |"
