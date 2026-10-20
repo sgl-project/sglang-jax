@@ -76,8 +76,9 @@ class Envs:
     # into one [E, K, 2N] grouped matmul (interleaved in 256-column chunks so
     # GEMM1 emits silu(gate)*up from the gmm_v2 epilogue). Per-channel-scaled or
     # unquantized experts with moe tensor parallel 1 only; block-scaled experts
-    # keep the two-call path. Escape hatch only.
-    SGLANG_JAX_EPMOE_FUSED_GATE_UP = EnvBool(True)
+    # keep the two-call path. Opt-in (bit-identical to the two-call path; GLM-5.2
+    # serving on v7x sets it).
+    SGLANG_JAX_EPMOE_FUSED_GATE_UP = EnvBool(False)
 
     # GLM-5 prefill micro-batching: an EXTEND chunk of at least
     # DSA_PREFILL_MICROBATCH_MIN_TOKENS (padded) tokens runs as this many
@@ -99,20 +100,16 @@ class Envs:
     # Per-executable XLA options ("flag=value,flag=value"). PREFILL applies to
     # EXTEND / MIXED executables of at least PREFILL_XLA_OPTIONS_MIN_TOKENS
     # (padded) tokens, DECODE to decode-shaped ones (DECODE, TARGET_VERIFY,
-    # DRAFT_EXTEND); neither touches the other side. The prefill default is the
-    # GLM-5.2 v7x production set: keep the two micro-batch windows' all-reduces
-    # apart (crs combiner threshold 1), no multi-output fusion across the
-    # windows (the scheduling groups reject fused producers), dense all-to-all
-    # on the SparseCore, all-reduce latency multiplier 8, and tolerate groups
-    # the scheduler cannot honour. Empty string = no options.
-    SGLANG_JAX_PREFILL_XLA_OPTIONS = EnvStr(
-        "xla_jf_crs_combiner_threshold_in_bytes=1"
-        ",xla_jf_enable_multi_output_fusion=false"
-        ",xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all=true"
-        ",xla_tpu_sparse_core_all_reduce_latency_multiplier=8"
-        ",xla_jf_enable_producer_consumer_multi_output_fusion=false"
-        ",xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true"
-    )
+    # DRAFT_EXTEND); neither touches the other side. Empty = no options (default).
+    # The GLM-5.2 v7x production prefill set is
+    # xla_jf_crs_combiner_threshold_in_bytes=1 (keep the two micro-batch windows'
+    # all-reduces apart), xla_jf_enable_multi_output_fusion=false and
+    # xla_jf_enable_producer_consumer_multi_output_fusion=false (the scheduling
+    # groups reject fused producers),
+    # xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all=true,
+    # xla_tpu_sparse_core_all_reduce_latency_multiplier=8,
+    # xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true.
+    SGLANG_JAX_PREFILL_XLA_OPTIONS = EnvStr("")
     SGLANG_JAX_PREFILL_XLA_OPTIONS_MIN_TOKENS = EnvInt(2048)
     SGLANG_JAX_DECODE_XLA_OPTIONS = EnvStr("")
 
@@ -120,8 +117,9 @@ class Envs:
     # on the TensorCore (xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes):
     # on v7x the SparseCore all-reduce is 21-26 us slower per call for the
     # [bs, hidden] bf16 decode all-reduces; the offload only pays from ~48 MB
-    # (prefill chunks). TPU only. 0 = leave XLA's cost model alone.
-    SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES = EnvInt(32 << 20)
+    # (prefill chunks). TPU only. 0 = leave XLA's cost model alone (default);
+    # GLM-5.2 serving on v7x sets 33554432 (32 MiB).
+    SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES = EnvInt(0)
 
     # GLM-5: keep the token-embedding table replicated on every device instead
     # of vocab-sharded on "tensor". The sharded lookup is an XLA gather plus one

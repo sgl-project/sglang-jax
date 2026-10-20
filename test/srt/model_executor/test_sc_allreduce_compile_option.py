@@ -42,12 +42,10 @@ class ScAllReduceMinBytesTest(unittest.TestCase):
             self.assertIsNone(aot_dispatch.decode_no_sc_gather_compiler_options_fn())
             self.assertIsNone(_spec_options())
 
-    def test_unset_is_production_default(self):
+    def test_unset_is_off(self):
         with mock.patch.dict(os.environ, {}, clear=False), _on_tpu():
             os.environ.pop("SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES", None)
-            self.assertEqual(
-                aot_dispatch.sc_all_reduce_min_bytes_compiler_options(), {AR_KEY: str(32 << 20)}
-            )
+            self.assertIsNone(aot_dispatch.sc_all_reduce_min_bytes_compiler_options())
 
     def test_set_applies_to_decode_only(self):
         env = {"SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES": str(32 << 20)}

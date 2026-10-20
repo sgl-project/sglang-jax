@@ -1,6 +1,6 @@
 """SGLANG_JAX_PREFILL_XLA_OPTIONS adds per-executable XLA options to the
 prefill-shaped executables (EXTEND / MIXED) and leaves decode-shaped ones
-(DECODE, TARGET_VERIFY, DRAFT_EXTEND) untouched; unset = the production default
+(DECODE, TARGET_VERIFY, DRAFT_EXTEND) untouched; unset = no options
 set (environ.py), empty = none. Mirrors SGLANG_JAX_DECODE_XLA_OPTIONS on the
 other side of the split."""
 
@@ -35,9 +35,20 @@ class PrefillXlaOptionsTest(unittest.TestCase):
             self.assertIsNone(aot_dispatch.prefill_compiler_options())
             self.assertIsNone(aot_dispatch.prefill_compiler_options_fn())
 
-    def test_unset_is_production_default(self):
+    def test_unset_is_no_options(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(ENV, None)
+            self.assertIsNone(aot_dispatch.prefill_compiler_options())
+            self.assertIsNone(aot_dispatch.prefill_compiler_options_fn())
+
+    def test_production_set_parses(self):
+        prod = (
+            f"{COMBINER}=1,xla_jf_enable_multi_output_fusion=false,{A2A}=true,"
+            "xla_tpu_sparse_core_all_reduce_latency_multiplier=8,"
+            "xla_jf_enable_producer_consumer_multi_output_fusion=false,"
+            "xla_tpu_scheduling_annotation_deannotate_unsupported_groups=true"
+        )
+        with mock.patch.dict(os.environ, {ENV: prod}):
             opts = aot_dispatch.prefill_compiler_options()
             self.assertEqual(opts[COMBINER], "1")
             self.assertEqual(opts[A2A], "true")
