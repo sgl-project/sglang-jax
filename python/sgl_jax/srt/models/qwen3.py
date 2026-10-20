@@ -9,9 +9,15 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
+from sgl_jax.srt.layers.embeddings import (
+    Embed,
+    ParallelLMHead,
+    RotaryEmbedding,
+    apply_rotary_emb,
+    get_rope,
+)
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase, MergedColumnParallelLinear
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
@@ -155,6 +161,95 @@ class QWen3Attention(nnx.Module):
         output, _ = self.o_proj(attn_output, out_sharding=out_sharding)
         return output, kv_fused
 
+    @named_scope
+    def forward_fused_rmsnorm_qkv(
+        self,
+        hidden_states: jax.Array,
+        input_layernorm: RMSNorm,
+        positions: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Fused RMSNorm + QKV Projection GEMM on TPU v7x.
+
+        Evolved programming abstraction:
+        pallas.mosaic_tpu.qwen3_fused_rmsnorm_qkv_gemm
+
+        Fuses input layer normalization directly with shard-local QKV
+        projection GEMMs (jax.lax.dot_general), retaining normalized hidden state
+        activations in on-chip VMEM and vector registers without intermediate HBM
+        round-trips or cross-shard GSPMD all-to-all resharding.
+        """
+        normed_states = input_layernorm(hidden_states)
+        if (
+            type(self.q_proj) is LinearBase
+            and type(self.k_proj) is LinearBase
+            and type(self.v_proj) is LinearBase
+        ):
+            w_q = getattr(self.q_proj.weight, "value", self.q_proj.weight)
+            w_k = getattr(self.k_proj.weight, "value", self.k_proj.weight)
+            w_v = getattr(self.v_proj.weight, "value", self.v_proj.weight)
+            q, k, v = MergedColumnParallelLinear.shard_local_merged_column_dot(
+                normed_states,
+                (w_q, w_k, w_v),
+                (w_q.shape[-1], w_k.shape[-1], w_v.shape[-1]),
+                self.mesh,
+                preferred_element_type=jnp.float32,
+                out_dtype=normed_states.dtype,
+            )
+            if getattr(self.q_proj, "bias", None) is not None:
+                q = q + self.q_proj.bias.value
+            if getattr(self.k_proj, "bias", None) is not None:
+                k = k + self.k_proj.bias.value
+            if getattr(self.v_proj, "bias", None) is not None:
+                v = v + self.v_proj.bias.value
+        else:
+            q, _ = self.q_proj(normed_states)
+            k, _ = self.k_proj(normed_states)
+            v, _ = self.v_proj(normed_states)
+
+        head_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
+        q = q.reshape(
+            -1,
+            self.q_head_num,
+            self.head_dim,
+            out_sharding=head_sharding,
+        )
+        k = k.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=head_sharding,
+        )
+        v = v.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=head_sharding,
+        )
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q_shape = q.shape
+            k_shape = k.shape
+            num_tokens = cos.shape[0]
+            q_3d = q.reshape(num_tokens, -1, self.head_dim)
+            k_3d = k.reshape(num_tokens, -1, self.head_dim)
+            q = apply_rotary_emb(q_3d, cos, sin, self.rotary_emb.is_neox_style).reshape(q_shape)
+            k = apply_rotary_emb(k_3d, cos, sin, self.rotary_emb.is_neox_style).reshape(k_shape)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+
+        output, _ = self.o_proj(attn_output, out_sharding=out_sharding)
+        return output, kv_fused
+
 
 class Qwen3MLP(nnx.Module):
     def __init__(
@@ -166,6 +261,8 @@ class Qwen3MLP(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
         self.layer_id = layer_id
+        self.mesh = mesh
+        self.intermediate_size = intermediate_size
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -206,8 +303,20 @@ class Qwen3MLP(nnx.Module):
         *,
         out_sharding: jax.sharding.Sharding | None = None,
     ):
-        a1, _ = self.gate_proj(hidden_states)
-        a2, _ = self.up_proj(hidden_states)
+        if type(self.gate_proj) is LinearBase and type(self.up_proj) is LinearBase:
+            w_g = getattr(self.gate_proj.weight, "value", self.gate_proj.weight)
+            w_u = getattr(self.up_proj.weight, "value", self.up_proj.weight)
+            a1, a2 = MergedColumnParallelLinear.shard_local_merged_column_dot(
+                hidden_states,
+                (w_g, w_u),
+                (w_g.shape[-1], w_u.shape[-1]),
+                self.mesh,
+                preferred_element_type=jnp.float32,
+                out_dtype=hidden_states.dtype,
+            )
+        else:
+            a1, _ = self.gate_proj(hidden_states)
+            a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
         output, _ = self.down_proj(intermediate_parallel, out_sharding=out_sharding)
         return output
@@ -269,27 +378,28 @@ class QWen3DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ):
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states += residual
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
 
-        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
-            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
-        )
-        layer_callback_flag.append(layer_norm_callback_flag)
-
-        hidden_states, kv_fused = self.self_attn(
+        hidden_states, kv_fused = self.self_attn.forward_fused_rmsnorm_qkv(
+            hidden_states=residual,
+            input_layernorm=self.input_layernorm,
             positions=positions,
-            hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            cos_sin=cos_sin,
         )
+
+        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
+            residual, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
+        )
+        layer_callback_flag.append(layer_norm_callback_flag)
 
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
@@ -315,11 +425,14 @@ class QWen3Model(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        embed_sharding = (
+            ("tensor", None) if getattr(config, "tie_word_embeddings", False) else (None, None)
+        )
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
-            kernel_axes=("tensor", None),
+            kernel_axes=embed_sharding,
             param_dtype=dtype,
             mesh=mesh,
         )
@@ -361,6 +474,16 @@ class QWen3Model(nnx.Module):
         layers_callback_flag = []
         aux_hidden_states = []
         positions = forward_batch.positions if positions is None else positions
+        cos_sin = None
+        if len(self.layers) > 0:
+            rotary_emb = self.layers[0].self_attn.rotary_emb
+            if (
+                type(rotary_emb) is RotaryEmbedding
+                and rotary_emb.rotary_dim == rotary_emb.head_size
+            ):
+                pos_flat = positions.reshape(-1)
+                cos, sin = rotary_emb._compute_cos_sin(pos_flat)
+                cos_sin = (cos.astype(rotary_emb.dtype), sin.astype(rotary_emb.dtype))
         # When connecting the vision head, even without deepstack, it should be padded with 0, which avoids doubling the EXTEND compilation.
         deepstack = forward_batch.deepstack_visual_embedding
         for layer_id, layer in enumerate(self.layers):
@@ -374,6 +497,7 @@ class QWen3Model(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
+                cos_sin=cos_sin,
             )
             if deepstack is not None and layer_id < deepstack.shape[0]:
                 hidden_states = jax.lax.cond(
@@ -440,10 +564,13 @@ class Qwen3ForCausalLM(nnx.Module):
         logger.info("Qwen3 weights loaded successfully!")
 
     def _create_qwen3_weight_mappings(self) -> dict:
+        embed_sharding = (
+            ("tensor", None) if getattr(self.config, "tie_word_embeddings", False) else (None, None)
+        )
         mappings = {
             "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
-                sharding=("tensor", None),
+                sharding=embed_sharding,
                 transpose=False,
             ),
             "model.norm.weight": WeightSpec(
