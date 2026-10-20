@@ -28,6 +28,7 @@ def gmm(
     acc_dtype: jnp.dtype | None = None,
     activation_quantized_dtype: jnp.dtype | None = None,
     v2_tile_info: Any = None,
+    glu_chunk: int | None = None,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -83,6 +84,8 @@ def gmm(
         v2_kwargs = {}
         if v2_tile_info is not None:
             v2_kwargs["tile_info"] = v2_tile_info
+        if glu_chunk:
+            v2_kwargs["glu_chunk"] = int(glu_chunk)
         out = gmm_v2_kernel(
             lhs,
             rhs,
@@ -97,6 +100,8 @@ def gmm(
             **v2_kwargs,
         )
     else:
+        if glu_chunk:
+            raise NotImplementedError("glu_chunk (SwiGLU epilogue) requires the gmm v2 kernel")
         out = gmm_v1_kernel(
             lhs,
             rhs,

@@ -99,6 +99,10 @@ class QuantizationConfig:
         is_static_checkpoint: Whether the checkpoint is static (true for checkpoints quantized offline, false for on-the-fly quantization)
         ignored_layers: Optional list of layer name patterns to exclude from quantization
         weight_block_size: Optional block sizes for block quantization (e.g., [128, 128])
+        moe_weight_block_size: MoE-only block sizes; only consulted when
+            ``moe_weight_block_size_override`` is set (``quantization.moe.weight_block_size``
+            present in the YAML, ``null`` meaning per-channel MoE scales while
+            linear layers keep ``weight_block_size``)
     """
 
     linear_rules: list[dict] | None = None
@@ -108,6 +112,14 @@ class QuantizationConfig:
     ignored_layers: list[str] | None = None
     weight_block_size: tuple[int, int] | None = None
     allow_narrow_n_blockwise: bool = False
+    moe_weight_block_size: tuple[int, int] | None = None
+    moe_weight_block_size_override: bool = False
+    # ``quantization.linear.per_channel_requant``: "a16" | "a8" | null. After loading, every
+    # block-quant fp8 QuantizedLinear is requantized to per-output-channel fp8 scales (see
+    # utils/quantization/per_channel_requant.py); "a8" also quantizes its activations to fp8.
+    # ``per_channel_requant_skip``: regex on the module path; matching layers keep block scales.
+    linear_per_channel_requant: str | None = None
+    linear_per_channel_requant_skip: str | None = None
 
     def to_dict(self) -> dict:
         # Required by transformers.PretrainedConfig.to_json_string when this
@@ -127,6 +139,12 @@ class QuantizationConfig:
                 list(self.weight_block_size) if self.weight_block_size is not None else None
             ),
             "allow_narrow_n_blockwise": self.allow_narrow_n_blockwise,
+            "moe_weight_block_size": (
+                list(self.moe_weight_block_size) if self.moe_weight_block_size is not None else None
+            ),
+            "moe_weight_block_size_override": self.moe_weight_block_size_override,
+            "linear_per_channel_requant": self.linear_per_channel_requant,
+            "linear_per_channel_requant_skip": self.linear_per_channel_requant_skip,
         }
 
     @classmethod
@@ -143,9 +161,15 @@ class QuantizationConfig:
                 activation_dtype: 'int8'  # optional, null for weight-only
                 scale_policy: 'per_channel'  # optional, default per_channel
 
+            per_channel_requant: null  # optional: a16 | a8 -> block-quant fp8 linears are
+                                       # requantized to per-channel scales after loading
+            per_channel_requant_skip: null  # optional regex on the module path
+
           moe:
             weight_dtype: 'int8'
             activation_dtype: null  # null = no activation quantization
+            weight_block_size: null  # optional; overrides the global value for
+                                     # MoE experts (null = per-channel scales)
         ```
         """
         resolved_path = _resolve_config_path(yaml_path)
@@ -183,6 +207,24 @@ class QuantizationConfig:
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
         allow_narrow_n_blockwise = quant.get("allow_narrow_n_blockwise", False)
+        # An explicit ``moe.weight_block_size`` (even ``null``) decouples the MoE
+        # scale granularity from the linear layers', e.g. FP8 block-128 linear
+        # layers next to int4 per-channel routed experts.
+        moe_weight_block_size_override = "weight_block_size" in moe_section
+        moe_weight_block_size = (
+            normalize_weight_block_size(moe_section.get("weight_block_size"))
+            if moe_weight_block_size_override
+            else None
+        )
+        pc = linear_section.get("per_channel_requant")
+        pc = str(pc).strip().lower() if pc is not None else None
+        if pc in ("", "0", "off", "none", "null"):
+            pc = None
+        if pc not in (None, "a16", "a8"):
+            raise ValueError(
+                f"quantization.linear.per_channel_requant must be a16, a8 or null, got {pc!r}"
+            )
+        pc_skip = linear_section.get("per_channel_requant_skip") or None
 
         return cls(
             linear_rules=linear_rules,
@@ -192,6 +234,10 @@ class QuantizationConfig:
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             allow_narrow_n_blockwise=allow_narrow_n_blockwise,
+            moe_weight_block_size=moe_weight_block_size,
+            moe_weight_block_size_override=moe_weight_block_size_override,
+            linear_per_channel_requant=pc,
+            linear_per_channel_requant_skip=pc_skip,
         )
 
     @classmethod
@@ -215,6 +261,12 @@ class QuantizationConfig:
     def get_moe_activation_dtype(self) -> jnp.dtype | None:
         """Get the dtype for MoE activation quantization."""
         return self.moe_activation_dtype
+
+    def get_moe_weight_block_size(self) -> tuple[int, int] | None:
+        """Block sizes for MoE expert weights (MoE override, else the global value)."""
+        if self.moe_weight_block_size_override:
+            return self.moe_weight_block_size
+        return self.weight_block_size
 
     def get_linear_rules(self) -> list[dict]:
         """Get the quantization rules for linear layer quantization."""

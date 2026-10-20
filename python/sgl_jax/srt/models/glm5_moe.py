@@ -1,4 +1,7 @@
+import copy
+import json
 import logging
+import os
 from functools import partial
 from typing import Any
 
@@ -13,10 +16,20 @@ from transformers import PretrainedConfig
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.environ import envs
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
+from sgl_jax.srt.kernels.collectives.oneshot_allreduce import (
+    defer_reduce,
+    force_fused_reduce,
+    fused_all_reduce,
+    fused_moe_enabled,
+)
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase, prepad_replicated_quantized_linears
+from sgl_jax.srt.layers.linear import (
+    LinearBase,
+    fuse_quantized_linears,
+    prepad_replicated_quantized_linears,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
@@ -28,18 +41,30 @@ from sgl_jax.srt.layers.moe import (
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
+from sgl_jax.srt.utils.quantization.int4_experts import routed_expert_scale_suffix
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     dequantize_tensor,
     quantize_tensor,
 )
 
 logger = logging.getLogger(__name__)
+_LOGGED_ONCE: set[str] = set()
+
+
+def _log_once(msg: str) -> None:
+    if msg not in _LOGGED_ONCE:
+        _LOGGED_ONCE.add(msg)
+        logger.info(msg)
+
 
 _INDEXER_ROPE_CONCAT = envs.SGLANG_JAX_INDEXER_ROPE_CONCAT.get()
 
 
+# Opt-in: fuse q_a_proj + kv_a_proj_with_mqa + indexer.wk (all replicated, same
+# hidden_states input) into one fp8 blockwise matmul per layer after weight
+# load. 3 -> 1 launches/layer; outputs are byte-identical slices.
 @partial(jax.jit, static_argnames=("quantized_dtype",))
 def _requantize_blockwise_shared_weight(
     weight_q: jax.Array,
@@ -150,7 +175,12 @@ class GlmDsaIndexer(nnx.Module):
         )
 
     def project(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        key: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Indexer projections only (query, key, per-head weights); no top-k.
 
@@ -160,7 +190,8 @@ class GlmDsaIndexer(nnx.Module):
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
-        key, _ = self.wk(hidden_states)
+        if key is None:
+            key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
         rope_dim = 64
@@ -184,13 +215,19 @@ class GlmDsaIndexer(nnx.Module):
         return query, key, weights
 
     def __call__(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        key: jax.Array | None = None,
     ) -> jax.Array:
         # 1. Project Query and Key
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
-        key, _ = self.wk(hidden_states)
+        if key is None:
+            key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
         # Apply RoPE
@@ -294,7 +331,11 @@ class Glm5Attention(nnx.Module):
             scope_name="q_a_proj",
         )
         self.q_a_layernorm = RMSNorm(
-            self.q_lora_rank, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_a_layernorm"
+            self.q_lora_rank,
+            epsilon=rms_norm_eps,
+            param_dtype=jnp.float32,
+            dtype=dtype,
+            scope_name="q_a_layernorm",
         )
         self.q_b_proj = LinearBase(
             input_size=self.q_lora_rank,
@@ -315,7 +356,11 @@ class Glm5Attention(nnx.Module):
             scope_name="kv_a_proj_with_mqa",
         )
         self.kv_a_layernorm = RMSNorm(
-            self.kv_lora_rank, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="kv_a_layernorm"
+            self.kv_lora_rank,
+            epsilon=rms_norm_eps,
+            param_dtype=jnp.float32,
+            dtype=dtype,
+            scope_name="kv_a_layernorm",
         )
 
         self.kv_b_proj = LinearBase(
@@ -405,6 +450,38 @@ class Glm5Attention(nnx.Module):
 
         return prepare_absorbed_mla(self, loader, mappings, prefix)
 
+    def fuse_in_proj(self):
+        """Fold q_a_proj, kv_a_proj_with_mqa and
+        indexer.wk into one fp8 blockwise matmul. Runs after WeightLoader.load, once the
+        weights are concrete (the old post_load_weights hook no longer exists)."""
+        # NOTE: nnx Pytree attributes are typed on first assignment (static vs
+        # data), so the fused module is only assigned when built (never pre-set
+        # to None) and the per-module linears stay in place; the forward path
+        # checks ``getattr(self, "fused_in_proj", None)``.
+        if getattr(self, "fused_in_proj", None) is None:
+            mods = [self.q_a_proj, self.kv_a_proj_with_mqa]
+            if self.indexer is not None:
+                mods.append(self.indexer.wk)
+            fused = fuse_quantized_linears(mods, scope_name="fused_in_proj")
+            if fused is not None:
+                fused_mod, splits = fused
+                self._fused_in_splits = tuple(splits)
+                self.fused_in_proj = fused_mod
+                # Release the now-unused per-module weights (~17 MB/layer fp8 +
+                # scales) so the fusion does not shrink the KV pool: keep the
+                # modules (nnx attribute typing) but point their params at
+                # empty arrays of the same dtype/rank.
+                for m in mods:
+                    wq = m.weight_q.value
+                    ws = m.weight_scale.value
+                    m.weight_q = nnx.Param(jnp.zeros((0, wq.shape[1]), wq.dtype))
+                    m.weight_scale = nnx.Param(jnp.zeros(ws.shape[:2] + (0,), ws.dtype))
+                logger.info(
+                    "fused_in_proj built: splits=%s in=%d",
+                    self._fused_in_splits,
+                    fused_mod.weight_q.value.shape[1],
+                )
+
     def _forward_mqa(
         self,
         q_nope: jax.Array,
@@ -488,7 +565,22 @@ class Glm5Attention(nnx.Module):
         dsa_topk_pages_in: jax.Array | None = None,
         dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
-        q_compressed, _ = self.q_a_proj(hidden_states)
+        k_idx_raw = None
+        hs_plain = hidden_states
+        if getattr(self, "fused_in_proj", None) is not None:
+            fused_out, _ = self.fused_in_proj(hidden_states)
+            # split at every segment end so the build-time zero-padding tail
+            # (if any) lands in its own, unused trailing part
+            bounds = [
+                sum(self._fused_in_splits[: k + 1]) for k in range(len(self._fused_in_splits))
+            ]
+            parts = jnp.split(fused_out, bounds, axis=-1)
+            q_compressed, latent_cache = parts[0], parts[1]
+            if len(parts) > 2:
+                k_idx_raw = parts[2]
+        else:
+            q_compressed, _ = self.q_a_proj(hidden_states)
+            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
         q_compressed = self.q_a_layernorm(q_compressed)
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
@@ -501,18 +593,17 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["dsa_topk_reuse"] = dsa_topk_reuse
             if self.indexer is not None:
                 q_idx, k_idx, idx_w = self.indexer.project(
-                    hidden_states, q_compressed, positions, self.rotary_emb
+                    hs_plain, q_compressed, positions, self.rotary_emb, key=k_idx_raw
                 )
                 dsa_kwargs["q_idx"] = q_idx
                 dsa_kwargs["k_idx"] = k_idx
                 dsa_kwargs["idx_weights"] = idx_w
         elif self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+            _ = self.indexer(hs_plain, q_compressed, positions, self.rotary_emb, key=k_idx_raw)
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
 
-        latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
         compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
         compressed = self.kv_a_layernorm(compressed)
 
@@ -695,6 +786,7 @@ class Glm5DecoderLayer(nnx.Module):
         force_moe: bool = False,
     ):
         self.layer_id = layer_id
+        self.mesh = mesh
         self.hidden_size = config.hidden_size
         rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
@@ -899,13 +991,15 @@ class Glm5DecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
+            param_dtype=jnp.float32,
+            dtype=dtype,
             scope_name="input_layernorm",
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
+            param_dtype=jnp.float32,
+            dtype=dtype,
             scope_name="post_attention_layernorm",
         )
 
@@ -921,6 +1015,33 @@ class Glm5DecoderLayer(nnx.Module):
         dsa_topk_pages_in: jax.Array | None = None,
         dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
+        hidden_states, residual, kv_fused = self.attn_block(
+            positions,
+            hidden_states,
+            forward_batch,
+            token_to_kv_pool,
+            residual,
+            dsa_topk_in=dsa_topk_in,
+            dsa_topk_pages_in=dsa_topk_pages_in,
+            dsa_topk_reuse=dsa_topk_reuse,
+        )
+        hidden_states, topk_ids = self.mlp_block(hidden_states, dispatch_info)
+        return hidden_states, residual, kv_fused, topk_ids
+
+    def attn_block(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        residual: jax.Array | None = None,
+        *,
+        dsa_topk_in: jax.Array | None = None,
+        dsa_topk_pages_in: jax.Array | None = None,
+        dsa_topk_reuse: bool = False,
+    ):
+        """Input norm -> attention (incl. o_proj and its all-reduce) -> residual -> post-attention
+        norm. Returns ``(hidden_states, residual, kv_fused)``; ``mlp_block`` finishes the layer."""
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -941,12 +1062,37 @@ class Glm5DecoderLayer(nnx.Module):
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        return hidden_states, residual, kv_fused
 
+    def mlp_block(
+        self, hidden_states: jax.Array, dispatch_info: ExpertLocationMetadata | None = None
+    ):
+        """MoE (routed + shared, incl. the combine all-reduce) or dense MLP on the
+        post-attention-norm hidden states. Returns ``(hidden_states, topk_ids)``."""
+        value, topk_ids, deferred = self.mlp_partial(hidden_states, dispatch_info)
+        return self.mlp_reduce(value, deferred), topk_ids
+
+    def mlp_reduce(self, value: jax.Array, deferred: bool) -> jax.Array:
+        """Finish ``mlp_partial``: the fused all-reduce of the routed + shared partial sums
+        when ``deferred``, identity otherwise."""
+        return fused_all_reduce(value, self.mesh) if deferred else value
+
+    def mlp_partial(
+        self, hidden_states: jax.Array, dispatch_info: ExpertLocationMetadata | None = None
+    ):
+        """``mlp_block`` up to the layer-level all-reduce. Returns ``(value, topk_ids, deferred)``:
+        on the fused all-reduce path ``value`` is the per-device partial sum (routed + shared)
+        and ``deferred`` is True (``mlp_reduce`` must finish it); otherwise ``value`` is final."""
         if self.is_moe_layer:
-            if self.shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
-            else:
-                shared_output = None
+            # Opt-in (SGLANG_JAX_ONESHOT_AR_MIN_BYTES + SITES=fused): let the shared-expert
+            # down_proj and the EPMoE combine return per-device partials and reduce their sum
+            # with one Pallas all-reduce -- the single collective XLA would otherwise emit for
+            # psum(shared) + psum(routed). Only valid when the MoE output is fully replicated.
+            fuse_ar = (
+                fused_moe_enabled(hidden_states)
+                and self.shared_experts is not None
+                and not self.use_fused
+            )
             router_logits = self.moe_gate(hidden_states)
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
@@ -956,15 +1102,179 @@ class Glm5DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            if fuse_ar:
+                with defer_reduce():
+                    shared_output = self.shared_experts(hidden_states)
+                    hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+                return hidden_states + shared_output, topk_ids, True
+            else:
+                if self.shared_experts is not None:
+                    shared_output = self.shared_experts(hidden_states)
+                else:
+                    shared_output = None
 
-            if shared_output is not None:
-                hidden_states = hidden_states + shared_output
+                hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+
+                if shared_output is not None:
+                    hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, topk_ids
+        return hidden_states, topk_ids, False
+
+    def mlp_dispatch(
+        self, hidden_states: jax.Array, dispatch_info: ExpertLocationMetadata | None = None
+    ):
+        """PIN=4 stage 1 of ``mlp_partial`` (MoE layers on the fused all-reduce path only):
+        router, top-k, shared experts (deferred partial) and ``EPMoE.dispatch_stage`` (token
+        sort + SparseCore dispatch gather). Returns a dict for ``mlp_experts``; ``d["anchor"]``
+        is a tiny array that depends on this window's dispatch gather."""
+        fuse_ar = (
+            fused_moe_enabled(hidden_states)
+            and self.shared_experts is not None
+            and not self.use_fused
+        )
+        if not (self.is_moe_layer and fuse_ar):
+            raise NotImplementedError(
+                "mlp_dispatch needs an EPMoE layer with shared experts on the fused all-reduce "
+                "path (SGLANG_JAX_ONESHOT_AR_SITES=fused / force_fused_reduce)"
+            )
+        router_logits = self.moe_gate(hidden_states)
+        correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+        topk_weights, topk_ids = self.topk(
+            router_logits, correction_bias, dispatch_info=dispatch_info
+        )
+        with defer_reduce():
+            shared_output = self.shared_experts(hidden_states)
+        state, anchor = self.mlp.dispatch_stage(hidden_states, topk_ids)
+        return dict(
+            state=state,
+            anchor=anchor,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared=shared_output,
+        )
+
+    def mlp_experts(self, d, combine_pin: jax.Array | None = None):
+        """PIN=4 stage 2: grouped matmuls + combine (``combine_pin`` keeps the SparseCore combine
+        behind that array's producer) + shared partial. Returns ``(value, topk_ids, True)`` like
+        ``mlp_partial`` on the fused path."""
+        with defer_reduce():
+            routed = self.mlp.experts_stage(d["state"], d["topk_weights"], combine_pin=combine_pin)
+        return routed + d["shared"], d["topk_ids"], True
+
+
+# ── prefill micro-batching (DSA_PREFILL_MICROBATCH, default 2) ──────────────
+# Run an EXTEND chunk as N consecutive token windows inside one forward: at
+# every layer the windows go through the layer one after the other, so XLA
+# can schedule window A's SparseCore all-reduces (MoE combine, o_proj site;
+# ~27% of a 4k chunk on v7x tp8) under window B's qmm / gmm / attend and vice
+# versa. Window B attends over window A's KV of the same layer through the
+# pool overlay below (the kernels return the rewritten paged buffers), and
+# its attention metadata is the same chunk re-expressed as a chunked-prefill
+# continuation (``window_forward_metadata``). Numerically each window is the
+# plain prefill of its own rows; only the schedule changes. Pair it with
+# SGLANG_JAX_PREFILL_XLA_OPTIONS=xla_jf_crs_combiner_threshold_in_bytes=1 --
+# otherwise XLA's all-reduce combiner merges the two windows' same-shaped
+# all-reduces back into one and nothing overlaps.
+_PREFILL_MICROBATCH = envs.DSA_PREFILL_MICROBATCH.get()
+# below this many (padded) tokens a chunk is not split (1k prompts: fixed
+# per-forward costs dominate, halves would run below MXU-efficient M)
+_PREFILL_MICROBATCH_MIN_TOKENS = envs.DSA_PREFILL_MICROBATCH_MIN_TOKENS.get()
+# The window schedule ("PIN=7", 10-03; the earlier variants 1-6 and the later 8-13 were measured and
+# dropped): the windows run block-interleaved per layer (A.attn, B.attn, then the
+# MoE block), the MoE all-reduce is taken to the model level (force_fused_reduce: one fused_all_reduce
+# of routed + shared partials) and every all-reduce consumer is pinned behind the OTHER window's
+# pre-all-reduce value with a zero-valued data edge (_pin_after; gp92 HLO: XLA schedules call-done right
+# before the consumer, so where the consumer sits decides what the all-reduce overlaps). Two windows add
+# SparseCore-stream ordering for the MoE all-reduces (A.dispatch -> A.experts -> B.dispatch ->
+# A.all-reduce (operand pinned behind B's dispatch gather) -> B.experts (combine pinned behind A's
+# post-all-reduce value) -> B.all-reduce; gp150: the SC stream completes in start order) and one XLA
+# scheduling group per layer holding window B's MoE all-reduce of layer L and window A's attend
+# kernel of layer L+1 (dsa_sparse_backend.PREFILL_SCHED_GROUP), see _microbatch_pinned_layers.
+# Needs xla_jf_enable_producer_consumer_multi_output_fusion=false in SGLANG_JAX_PREFILL_XLA_OPTIONS.
+
+
+def _pin_after(x: jax.Array, anchor: jax.Array) -> jax.Array:
+    """``x`` with a scheduling dependency on ``anchor`` and the same value: adds
+    ``anchor[0, 0] * 0`` (XLA keeps float ``mul(_, 0)`` for NaN/Inf semantics, so
+    the edge survives optimization; the broadcast add fuses into the consumer)."""
+    tiny = anchor[tuple(slice(0, 1) for _ in range(anchor.ndim))].astype(jnp.float32)
+    # 0 even for a NaN / Inf anchor (tiny * 0 would be NaN); still a real data edge
+    zero = jnp.where(jnp.isfinite(tiny), tiny * 0, 0.0).reshape(()).astype(x.dtype)
+    return x + zero
+
+
+def prefill_microbatch_bounds(num_tokens: int, parts: int, align: int, min_tokens: int):
+    """``[(lo, hi), ...]`` token windows for a chunk of ``num_tokens`` rows, or
+    ``None`` when micro-batching does not apply (disabled, chunk too small, or
+    the windows would not sit on ``align`` -- the TSA all_to_all tiling /
+    zigzag block, tp * DSA_TSA_PREFILL_QB)."""
+    if parts < 2 or num_tokens < min_tokens:
+        return None
+    unit = align if align > 0 else 1
+    if num_tokens % unit:
+        return None
+    units = num_tokens // unit
+    if units < parts:
+        return None
+    # equal split in alignment units; a remainder of r units goes to the first r windows
+    base, rem = divmod(units, parts)
+    widths = [(base + (1 if i < rem else 0)) * unit for i in range(parts)]
+    edges = [0]
+    for w in widths:
+        edges.append(edges[-1] + w)
+    return [(edges[i], edges[i + 1]) for i in range(parts)]
+
+
+def _slice_forward_batch(forward_batch: ForwardBatch, lo: int, hi: int) -> ForwardBatch:
+    """The window ``[lo, hi)`` of an EXTEND batch as its own ForwardBatch view:
+    token-indexed arrays sliced, attention metadata windowed, everything else
+    shared with the original (which is left untouched)."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import window_forward_metadata
+
+    part = copy.copy(forward_batch)
+    part.input_ids = forward_batch.input_ids[lo:hi]
+    part.positions = forward_batch.positions[lo:hi]
+    part.out_cache_loc = forward_batch.out_cache_loc[lo:hi]
+    backend = copy.copy(forward_batch.attn_backend)
+    backend.forward_metadata = window_forward_metadata(
+        forward_batch.attn_backend.forward_metadata, lo, hi - lo
+    )
+    part.attn_backend = backend
+    return part
+
+
+class _MicrobatchPoolView:
+    """``token_to_kv_pool`` view for the later micro-batches of one forward: the
+    fused KV / indexer-key buffers a previous window already rewrote in this
+    forward are served instead of the pool's (the kernels update the paged
+    buffers functionally and return them); everything else passes through."""
+
+    def __init__(self, pool):
+        self._pool = pool
+        self._kv = {}
+        self._idx = {}
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+    def get_fused_kv_buffer(self, layer_id):
+        if layer_id in self._kv:
+            return self._kv[layer_id]
+        return self._pool.get_fused_kv_buffer(layer_id)
+
+    def get_indexer_key_buffer(self, slot_id):
+        if slot_id in self._idx:
+            return self._idx[slot_id]
+        return self._pool.get_indexer_key_buffer(slot_id)
+
+    def update(self, layer_id, slot_id, kv, idx):
+        if kv is not None:
+            self._kv[layer_id] = kv
+        if slot_id is not None and idx is not None:
+            self._idx[slot_id] = idx
 
 
 class Glm5Model(nnx.Module):
@@ -975,6 +1285,7 @@ class Glm5Model(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.config = config
+        self.mesh = mesh
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -983,7 +1294,7 @@ class Glm5Model(nnx.Module):
             features=config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
+            kernel_axes=_EMBED_KERNEL_AXES,
             mesh=mesh,
         )
 
@@ -1000,7 +1311,11 @@ class Glm5Model(nnx.Module):
         )
 
         self.norm = RMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=jnp.float32,
+            dtype=dtype,
+            scope_name="norm",
         )
 
     def __call__(
@@ -1009,6 +1324,10 @@ class Glm5Model(nnx.Module):
         token_to_kv_pool: KVCache,
     ) -> jax.Array:
         from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
+
+        bounds = self._prefill_microbatch_bounds(forward_batch)
+        if bounds is not None:
+            return self._call_microbatched(forward_batch, token_to_kv_pool, bounds)
 
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
@@ -1045,6 +1364,184 @@ class Glm5Model(nnx.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids
+
+    def _prefill_microbatch_bounds(self, forward_batch: ForwardBatch):
+        """Token windows for this batch, or ``None`` (see ``prefill_microbatch_bounds``)."""
+        if _PREFILL_MICROBATCH < 2 or forward_batch.forward_mode != ForwardMode.EXTEND:
+            return None
+        md = getattr(forward_batch.attn_backend, "forward_metadata", None)
+        cu_q_lens = getattr(md, "cu_q_lens", None)
+        seq_lens = getattr(md, "seq_lens", None)
+        if cu_q_lens is None or seq_lens is None:
+            return None
+        if cu_q_lens.shape[0] != seq_lens.shape[0] + 1:
+            _log_once("prefill micro-batch: off (attention metadata is not dp_size == 1)")
+            return None  # window_forward_metadata needs flat [S+1] / [S] metadata
+        from sgl_jax.srt.layers.attention import dsa_sparse_backend as dsb
+
+        align = self.mesh.shape["tensor"] * dsb._TSA_PREFILL_QB
+        num_tokens = int(forward_batch.input_ids.shape[0])
+        parts = _PREFILL_MICROBATCH
+        bounds = prefill_microbatch_bounds(num_tokens, parts, align, _PREFILL_MICROBATCH_MIN_TOKENS)
+        _log_once(
+            f"prefill micro-batch: {bounds if bounds else 'off'} for {num_tokens} tokens "
+            f"(parts={parts}, align={align}, min_tokens={_PREFILL_MICROBATCH_MIN_TOKENS})"
+        )
+        return bounds
+
+    def _call_microbatched(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache, bounds):
+        """``__call__`` with the chunk run as consecutive token windows on the PIN=7 schedule (see
+        the DSA_PREFILL_MICROBATCH note above). Same outputs as the single pass: hidden states in
+        token order, one rewritten buffer per layer."""
+        parts = [_slice_forward_batch(forward_batch, lo, hi) for lo, hi in bounds]
+        n = len(parts)
+        hidden = [self.embed_tokens(part.input_ids) for part in parts]
+        residual = [None] * n
+        dsa_topk = [None] * n
+        dsa_topk_pages = [None] * n
+        pool = _MicrobatchPoolView(token_to_kv_pool)
+        full_slot = getattr(forward_batch.attn_backend, "full_slot", None) or {}
+        with force_fused_reduce():
+            hidden, residual, layers_kv_fused, layers_idx_fused, layers_topk_ids = (
+                _microbatch_pinned_layers(
+                    self.layers, parts, hidden, residual, dsa_topk, dsa_topk_pages, pool, full_slot
+                )
+            )
+        outs = [h + r if r is not None else h for h, r in zip(hidden, residual)]
+        hidden_states = self.norm(jnp.concatenate(outs, axis=0))
+        return hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids
+
+
+def _microbatch_pinned_layers(
+    layers,
+    parts,
+    hidden,
+    residual,
+    dsa_topk,
+    dsa_topk_pages,
+    pool,
+    full_slot,
+    pin=None,
+):
+    """PIN=7 schedule (see the DSA_PREFILL_MICROBATCH note). Per layer:
+    attn_0..attn_{n-1} then the MoE / MLP blocks; every all-reduce consumer is pinned behind the
+    other window's pre-all-reduce anchor (attention-kernel KV output / MoE partial sum). With two
+    windows the MoE layers additionally order the SparseCore stream (two_stage) and tag window B's
+    MoE all-reduce + window A's next-layer attend kernel with one XLA scheduling group.
+    Returns (hidden, residual, layers_kv_fused, layers_idx_fused, layers_topk_ids)."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
+
+    pin = pin or _pin_after
+    n = len(parts)
+    two_stage = n == 2  # SparseCore-stream ordering pins + scheduling groups
+    # window B's MoE all-reduce of layer L and window A's attend kernel of layer L+1 share one
+    # _scheduling_group_id, so the scheduler overlaps them without any program-order / data-edge
+    # trick (gp194 HLO: edges only move the done; the start follows the scheduler's own SC-AR
+    # latency estimate).
+    sched_groups = two_stage
+    if sched_groups:
+        from jax.experimental import xla_metadata as _xla_metadata
+
+        from sgl_jax.srt.layers.attention import dsa_sparse_backend as _dsa_backend_mod
+    _SCHED_GROUP_BASE = 1000
+    layers_kv_fused, layers_idx_fused, layers_topk_ids = [], [], []
+    prev_mlp_anchor = [None] * n  # previous layer's MoE partial per window (pre all-reduce #2)
+    for li, layer in enumerate(layers):
+        kv_last = idx_last = None
+        attn_anchor = [None] * n  # attention-kernel KV output
+        for i, part in enumerate(parts):
+            # consumer of window i's previous-layer MoE all-reduce: pin behind window i-1's
+            # attention of this layer, or (window 0) behind the last window's MoE partial
+            anchor_val = prev_mlp_anchor[n - 1] if i == 0 else attn_anchor[i - 1]
+            if anchor_val is not None:
+                hidden[i] = pin(hidden[i], anchor_val)
+                if residual[i] is not None:
+                    residual[i] = pin(residual[i], anchor_val)
+            # window A's attend kernel of layer li joins the group of window B's MoE all-reduce
+            # of layer li-1 (tagged below with the same id)
+            if sched_groups and i == 0 and li >= 1:
+                _dsa_backend_mod.PREFILL_SCHED_GROUP = _SCHED_GROUP_BASE + li
+            try:
+                hidden[i], residual[i], kv_fused = layer.attn_block(
+                    part.positions,
+                    hidden[i],
+                    part,
+                    pool,
+                    residual[i],
+                    dsa_topk_in=dsa_topk[i],
+                    dsa_topk_pages_in=dsa_topk_pages[i],
+                )
+            finally:
+                if sched_groups:
+                    _dsa_backend_mod.PREFILL_SCHED_GROUP = None
+            if isinstance(kv_fused, DSAFusedCache):
+                kv_last, idx_last = kv_fused.kv, kv_fused.idx
+                if kv_fused.topk is not None:
+                    dsa_topk[i] = kv_fused.topk
+                if kv_fused.topk_pages is not None:
+                    dsa_topk_pages[i] = kv_fused.topk_pages
+            else:
+                kv_last, idx_last = kv_fused, None
+            attn_anchor[i] = kv_last
+            pool.update(layer.layer_id, full_slot.get(layer.layer_id), kv_last, idx_last)
+        mlp_anchor = [None] * n
+        topk_ids_parts = []
+        if two_stage and getattr(layer, "is_moe_layer", False):
+            # (10-03, gp150 k2/k3 + AOT replica): with SparseCore permute kernels in the
+            # MoE block, XLA hoists window B's combine call-start ahead of window A's MoE
+            # all-reduce; the SparseCore stream completes in start order, so A's all-reduce
+            # data phase waits behind B's gmm and its done is exposed (50 ms per 4k window).
+            # Two extra zero-valued edges fix the stream order: A's all-reduce operand is pinned
+            # behind B's dispatch gather output (A's all-reduce enters the stream after B's
+            # dispatch, B's gmm then runs under it) and B's combine input behind A's
+            # post-all-reduce value (B's combine cannot be hoisted ahead of A's all-reduce).
+            if attn_anchor[1] is not None:
+                hidden[0] = pin(hidden[0], attn_anchor[1])
+            d_a = layer.mlp_dispatch(hidden[0], parts[0].expert_location_metadata)
+            value_a, topk_a, _ = layer.mlp_experts(d_a)
+            hidden[1] = pin(hidden[1], value_a)  # B's MLP behind A's partial
+            d_b = layer.mlp_dispatch(hidden[1], parts[1].expert_location_metadata)
+            pinned_a = pin(value_a, d_b["anchor"])
+            hidden[0] = layer.mlp_reduce(pinned_a, True)
+            value_b, topk_b, _ = layer.mlp_experts(d_b, combine_pin=hidden[0])
+            if sched_groups and li + 1 < len(layers):
+                # same group id as window A's attend kernel of the next layer (see the attention phase)
+                with _xla_metadata.set_xla_metadata(
+                    _scheduling_group_id=_SCHED_GROUP_BASE + li + 1
+                ):
+                    hidden[1] = layer.mlp_reduce(value_b, True)
+            else:
+                hidden[1] = layer.mlp_reduce(value_b, True)
+            mlp_anchor = [value_a, value_b]
+            topk_ids_parts = [topk_a, topk_b]
+            prev_mlp_anchor = mlp_anchor
+            layers_kv_fused.append(kv_last)
+            if idx_last is not None:
+                layers_idx_fused.append(idx_last)
+            if all(t is None for t in topk_ids_parts):
+                layers_topk_ids.append(None)
+            else:
+                layers_topk_ids.append(jnp.concatenate(topk_ids_parts, axis=0))
+            continue
+        for i, part in enumerate(parts):
+            # consumer of window i's o_proj all-reduce: pin behind window i+1's attention
+            # (kernel output), or (last window) behind window 0's MoE partial
+            anchor_val = attn_anchor[i + 1] if i + 1 < n else mlp_anchor[0]
+            if anchor_val is not None:
+                hidden[i] = pin(hidden[i], anchor_val)
+            value, topk_ids, deferred = layer.mlp_partial(hidden[i], part.expert_location_metadata)
+            mlp_anchor[i] = value if deferred else None
+            hidden[i] = layer.mlp_reduce(value, deferred)
+            topk_ids_parts.append(topk_ids)
+        prev_mlp_anchor = mlp_anchor
+        layers_kv_fused.append(kv_last)
+        if idx_last is not None:
+            layers_idx_fused.append(idx_last)
+        if all(t is None for t in topk_ids_parts):
+            layers_topk_ids.append(None)
+        else:
+            layers_topk_ids.append(jnp.concatenate(topk_ids_parts, axis=0))
+    return hidden, residual, layers_kv_fused, layers_idx_fused, layers_topk_ids
 
 
 def _prepare_fused_shared_experts(mappings, blocks):
@@ -1153,6 +1650,8 @@ class Glm5ForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_glm5_weight_mappings(model_config)
         loader.load(weight_mappings)
+        for layer in self.model.layers:
+            layer.self_attn.fuse_in_proj()
         prepad_replicated_quantized_linears(self)
 
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
@@ -1169,7 +1668,7 @@ class Glm5ForCausalLM(nnx.Module):
         mappings = {
             "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
-                sharding=("tensor", None),
+                sharding=_EMBED_KERNEL_AXES,  # follows SGLANG_JAX_EMBED_REPLICATED (gp910: hardcoded shard left the table split while the module declared it replicated)
                 transpose=False,
             ),
             "model.norm.weight": WeightSpec(
@@ -1186,6 +1685,7 @@ class Glm5ForCausalLM(nnx.Module):
 
         quant_config = getattr(model_config, "quantization_config", None)
         is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
+        moe_scale_suffix = routed_expert_scale_suffix(quant_config)
 
         hf_layer_indices = list(range(num_layers))
         for layer_idx in range(num_layers):
@@ -1196,6 +1696,7 @@ class Glm5ForCausalLM(nnx.Module):
                 target_idx < first_k_dense_replace,
                 is_static_quant=is_static_quant,
                 has_indexer=indexer_types is None or indexer_types[target_idx] == "full",
+                moe_scale_suffix=moe_scale_suffix,
             )
             mappings.update(layer_mappings)
 
@@ -1208,6 +1709,7 @@ class Glm5ForCausalLM(nnx.Module):
         is_mlp_layer: bool,
         is_static_quant: bool = False,
         has_indexer: bool = True,
+        moe_scale_suffix: str = ".weight_scale_inv",
     ) -> dict:
         prefix = f"model.layers.{target_idx}"
         target_prefix = f"model.layers.{layer_idx}"
@@ -1342,7 +1844,9 @@ class Glm5ForCausalLM(nnx.Module):
 
                     scale_key = key + "_scale"
                     target_scale_param = target_param + "_scale"
-                    scale_src_paths = [p.replace(".weight", ".weight_scale_inv") for p in src_paths]
+                    # FP8 block checkpoints: ``weight_scale_inv`` [out_blocks, in_blocks];
+                    # int4 per-channel expert checkpoints: ``weight_scale`` [out, 1].
+                    scale_src_paths = [p.replace(".weight", moe_scale_suffix) for p in src_paths]
 
                     # Stacked HF scale is [E, out_blocks, in_blocks]. Load EP-sharded
                     # and replicated on the block dims (matches deepseek_v3); the
@@ -1435,8 +1939,39 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
 _NEXTN_TOP_LEVEL_MODULES = ("eh_proj", "enorm", "hnorm", "shared_head", "embed_tokens", "lm_head")
 
 
-def nextn_ignored_layers(ignored_layers, nextn_layer_idx: int) -> list[str]:
+def _checkpoint_modules_to_not_convert(mc) -> list[str] | None:
+    """The checkpoint's raw ``modules_to_not_convert`` / ``ignored_layers`` list.
+
+    ``ModelConfig`` overwrites ``hf_config.quantization_config`` with the unified
+    ``QuantizationConfig`` object, so prefer the raw dict it keeps on
+    ``hf_quantization_config_raw``; fall back to the hf_config dict if still raw.
+    """
+    raw = getattr(mc, "hf_quantization_config_raw", None)
+    if not isinstance(raw, dict):
+        raw = getattr(getattr(mc, "hf_config", None), "quantization_config", None)
+    if not isinstance(raw, dict):
+        # hf_config is lru-cached across the target and draft ModelConfigs, so
+        # the draft can only see the overwritten object: read config.json.
+        model_path = getattr(mc, "model_path", None)
+        if not model_path:
+            return None
+        try:
+            with open(os.path.join(model_path, "config.json")) as f:
+                raw = json.load(f).get("quantization_config")
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+    return raw.get("ignored_layers") or raw.get("modules_to_not_convert")
+
+
+def nextn_ignored_layers(ignored_layers, nextn_layer_idx: int, hf_ignored=None) -> list[str]:
     """Translate the checkpoint's ``modules_to_not_convert`` for the MTP layer.
+
+    ``hf_ignored`` is the checkpoint's raw list: a user yaml
+    (``--quantization-config-path``) builds ``ignored_layers`` without it, so
+    the MTP layer's bf16 modules (``eh_proj`` ...) are merged from the checkpoint
+    here; entries for other layers are left to the main model's own config.
 
     The FP8 checkpoint lists the unquantized MTP modules under
     ``model.layers.{num_hidden_layers}.*`` (e.g. ``eh_proj``, ``mlp.gate``), but
@@ -1447,6 +1982,9 @@ def nextn_ignored_layers(ignored_layers, nextn_layer_idx: int) -> list[str]:
     """
     ignored = list(ignored_layers or [])
     prefix = f"model.layers.{nextn_layer_idx}."
+    for ig in hf_ignored or []:
+        if ig.startswith(prefix) and ig not in ignored:
+            ignored.append(ig)
     extra = []
     for ig in ignored:
         if not ig.startswith(prefix):
@@ -1476,6 +2014,16 @@ def nextn_pool_updates(kv_fused, is_dsa: bool):
     return {"token_to_kv_pool": (kv, [kv_fused.idx])}
 
 
+# SGLANG_JAX_EMBED_REPLICATED (default on) keeps the token-embedding table replicated on every
+# device instead of vocab-sharded on "tensor". The vocab-sharded lookup is an
+# XLA gather + one bf16[tokens, hidden] all-reduce over all devices per lookup (embeddings.py:112;
+# 3 per fused draft-extend module + 1 per verify step at cc64, 63-88 us each; one 96 MiB AR per 8k
+# prefill window). The replicated lookup is a local gather: same values (x + 0 == x exactly in bf16),
+# no all-reduce; cost = +vocab x hidden x 2 B HBM per device (GLM-5.2: 154880 x 6144 = 1.9 GB).
+_EMBED_REPLICATED = envs.SGLANG_JAX_EMBED_REPLICATED.get()
+_EMBED_KERNEL_AXES = (None, None) if _EMBED_REPLICATED else ("tensor", None)
+
+
 class GlmMoeDsaForCausalLMNextN(nnx.Module):
     load_lm_head_from_target = True
 
@@ -1485,7 +2033,9 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         qc = mc.quantization_config
         if qc is not None and qc.is_static_checkpoint:
             idx = getattr(mc.hf_config, "num_hidden_layers", 78)
-            qc.ignored_layers = nextn_ignored_layers(qc.ignored_layers, idx)
+            qc.ignored_layers = nextn_ignored_layers(
+                qc.ignored_layers, idx, hf_ignored=_checkpoint_modules_to_not_convert(mc)
+            )
 
     def __init__(
         self,
@@ -1504,7 +2054,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
-            kernel_axes=("tensor", None),
+            kernel_axes=_EMBED_KERNEL_AXES,
             param_dtype=dtype,
             mesh=mesh,
         )
@@ -1655,6 +2205,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             is_mlp_layer=False,
             is_static_quant=is_static_quant,
             has_indexer=True,
+            moe_scale_suffix=routed_expert_scale_suffix(quant_config),
         )
         for k, v in decoder_mappings.items():
             if isinstance(v.target_path, str):

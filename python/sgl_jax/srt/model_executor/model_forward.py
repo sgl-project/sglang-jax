@@ -22,6 +22,20 @@ def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
     return type(memory_pools)(**pools)
 
 
+def select_run_model_by_mode(jitted_default, jitted_prefill=None):
+    """``forward_batch -> jitted run_model``: ``jitted_prefill`` (the jit compiled with
+    SGLANG_JAX_PREFILL_XLA_OPTIONS) for the prefill-shaped EXTEND / MIXED batches at or
+    above SGLANG_JAX_PREFILL_XLA_OPTIONS_MIN_TOKENS when one was built, the default jit
+    for everything else."""
+    if jitted_prefill is None:
+        return lambda forward_batch: jitted_default
+    from sgl_jax.srt.model_executor.aot_dispatch import prefill_options_apply
+
+    return lambda forward_batch: (
+        jitted_prefill if prefill_options_apply(forward_batch) else jitted_default
+    )
+
+
 def make_jitted_run_model(attn_backend, compiler_options=None):
     @partial(
         jax.jit,
