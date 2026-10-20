@@ -94,8 +94,10 @@ class Envs:
     # on smaller cache_loc shapes than max_req_len; the max-capacity bucket
     # stays the fallback and the same steps are precompiled. Batches below
     # LADDER_MIN_BS requests skip steps under LADDER_SMALLBS_FLOOR (bs1 at the
-    # 2048 step was +0.16 ms/step slower than at 4096). Empty = off.
-    SGLANG_JAX_DECODE_KV_LADDER = EnvStr("2048,4096,8192,16384,65536")
+    # 2048 step was +0.16 ms/step slower than at 4096). Empty = off (default:
+    # every rung is one more decode executable to precompile per bs bucket, so
+    # the ladder is opt-in; GLM-5.2 serving on v7x uses 2048,4096,8192,16384,65536).
+    SGLANG_JAX_DECODE_KV_LADDER = EnvStr("")
     SGLANG_JAX_DECODE_KV_LADDER_MIN_BS = EnvInt(8)
     SGLANG_JAX_DECODE_KV_LADDER_SMALLBS_FLOOR = EnvInt(4096)
 
