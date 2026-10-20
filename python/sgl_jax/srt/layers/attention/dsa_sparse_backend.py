@@ -774,7 +774,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
                 if compute_pages:
                     topk_pages = compute_topk_pages(
-                        topk, page_size=self.page_size, pages_per_seq=pages_per_seq, k_pages_max=512
+                        topk,
+                        page_size=self.page_size,
+                        pages_per_seq=pages_per_seq,
+                        # sparse_mla_page_level keeps 511 hit pages + the new-token page (#1785)
+                        k_pages_max=511,
                     )
                 else:
                     topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
