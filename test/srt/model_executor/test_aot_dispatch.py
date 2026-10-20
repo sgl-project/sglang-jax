@@ -139,6 +139,7 @@ class TestAotDispatcher(unittest.TestCase):
     def test_saved_sampler_and_logprobs_without_compiling(self):
         from flax import nnx
 
+        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
         from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
         from sgl_jax.srt.layers.sampler import (
             Sampler,
@@ -159,6 +160,8 @@ class TestAotDispatcher(unittest.TestCase):
         mesh = create_device_mesh([1, 1], [1, 1], devices=jax.devices()[:1])
         manager = object.__new__(CompilationManager)
         manager.vocab_size = 128
+        manager.page_size = 128
+        manager.attn_backend = FlashAttention(1, 1, 128, page_size=128, mesh=mesh)
         manager.enable_static_lora = False
         manager.capture_hidden_states = False
         manager.has_recurrent_state = False

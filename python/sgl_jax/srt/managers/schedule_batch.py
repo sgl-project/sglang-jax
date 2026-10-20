@@ -2501,11 +2501,14 @@ class ScheduleBatch:
         cache_loc_paddings: list,
         page_size: int,
         per_dp_bs_size: int,
+        *,
+        return_page_indices: bool = False,
     ) -> np.ndarray:
-        """Merge cache_loc from all DP ranks with page alignment.
+        """Merge token locations or physical page IDs in fixed DP segments.
 
-        Returns:
-            cache_loc array
+        Bucket capacities remain in tokens. With ``return_page_indices``,
+        return batch-owned page IDs without constructing token locations;
+        otherwise use the existing token-location buffer.
         """
         # Calculate total cache_loc size needed
         total_cache_loc_size = 0
@@ -2556,30 +2559,45 @@ class ScheduleBatch:
                 )
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
-        # View into the persistent buffer; intentionally NOT re-zeroed per step.
-        # Safe because:
-        #  - padding slots are never read on-device: attention kernels (RPA v3 /
-        #    MLA v2 / native) bound page reads by cu_kv_lens / seq_lens, and every
-        #    real-request page slot lands on a written position.
-        #  - every buffer value is a valid in-bounds KV slot index (init is
-        #    np.zeros + only valid slots are ever written), so even SWA's
-        #    host-side mapping[cache_loc] lookup (flashattention_backend) can't go
-        #    OOB. This REQUIRES the init buffer to be np.zeros, not np.empty.
-        cache_loc_host_buf = self.req_to_token_pool.cache_loc_host_buf
-        assert (
-            cache_loc_host_buf is not None and cache_loc_host_buf.shape[0] >= total_cache_loc_size
-        ), (
-            "cache_loc_host_buf is not initialized or too small: "
-            f"capacity={0 if cache_loc_host_buf is None else cache_loc_host_buf.shape[0]}, "
-            f"required={total_cache_loc_size}"
-        )
-        cache_loc_cpu = cache_loc_host_buf[:total_cache_loc_size]
+        if return_page_indices:
+            assert total_cache_loc_size % (self.dp_size * page_size) == 0
+            # Padding uses physical page 0, which may belong to a live request.
+            # FA/MLA v2 bound KV reads by cu_kv_lens / seq_lens, so padded
+            # entries do not contribute to attention. Page 0 also keeps SWA's
+            # host-side mapping[0] lookup in bounds.
+            page_indices = np.zeros(
+                (self.dp_size, per_dp_cache_loc_size // page_size), dtype=np.int32
+            )
+        else:
+            # View into the persistent buffer; intentionally NOT re-zeroed per step.
+            # Safe because:
+            #  - padding slots are never read on-device: attention kernels (RPA v3 /
+            #    MLA v2 / native) bound page reads by cu_kv_lens / seq_lens, and every
+            #    real-request page slot lands on a written position.
+            #  - every buffer value is a valid in-bounds KV slot index (init is
+            #    np.zeros + only valid slots are ever written), so even SWA's
+            #    host-side mapping[cache_loc] lookup (flashattention_backend) can't go
+            #    OOB. This REQUIRES the init buffer to be np.zeros, not np.empty.
+            cache_loc_host_buf = self.req_to_token_pool.cache_loc_host_buf
+            assert (
+                cache_loc_host_buf is not None
+                and cache_loc_host_buf.shape[0] >= total_cache_loc_size
+            ), (
+                "cache_loc_host_buf is not initialized or too small: "
+                f"capacity={0 if cache_loc_host_buf is None else cache_loc_host_buf.shape[0]}, "
+                f"required={total_cache_loc_size}"
+            )
+            cache_loc_cpu = cache_loc_host_buf[:total_cache_loc_size]
 
         offset_bs = 0
         req_to_token = self.req_to_token_pool.req_to_token
         max_context_len = req_to_token.shape[1]
         req_to_token_flat = req_to_token.reshape(-1)
-        page_ramp = np.arange(page_size, dtype=req_to_token.dtype) if page_size > 1 else None
+        page_ramp = (
+            np.arange(page_size, dtype=req_to_token.dtype)
+            if page_size > 1 and not return_page_indices
+            else None
+        )
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -2598,7 +2616,7 @@ class ScheduleBatch:
             offsets[0] = 0
             np.cumsum(aligned_lens[:-1], out=offsets[1:])
 
-            if page_size > 1:
+            if page_size > 1 or return_page_indices:
                 # PagedTokenToKVPoolAllocator writes page-contiguous slot indices
                 # (req_to_token[i, p*ps+j] == req_to_token[i, p*ps] + j), so the
                 # per-req loop can be replaced by one gather of page-start values
@@ -2614,12 +2632,16 @@ class ScheduleBatch:
                     flat_src = np.repeat(row_base - page_cum * page_size, n_pages)
                     flat_src += np.arange(total_pages, dtype=np.int64) * page_size
                     page_starts = req_to_token_flat[flat_src]
-                    dest = cache_loc_cpu[offset_bs : offset_bs + total_aligned]
-                    np.add(
-                        page_starts.reshape(total_pages, 1),
-                        page_ramp.reshape(1, page_size),
-                        out=dest.reshape(total_pages, page_size),
-                    )
+                    if return_page_indices:
+                        assert total_pages <= page_indices.shape[1]
+                        page_indices[dp_rank, :total_pages] = page_starts // page_size
+                    else:
+                        dest = cache_loc_cpu[offset_bs : offset_bs + total_aligned]
+                        np.add(
+                            page_starts.reshape(total_pages, 1),
+                            page_ramp.reshape(1, page_size),
+                            out=dest.reshape(total_pages, page_size),
+                        )
             else:
                 # Non-paged allocator has no page-contiguity guarantee.
                 for r in range(n_reqs):
@@ -2631,6 +2653,9 @@ class ScheduleBatch:
 
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
+
+        if return_page_indices:
+            return page_indices.ravel()
 
         # cache_loc_cpu is a view into the reusable host_buf; PD eager-stash
         # can overwrite it via _disp(nxt) before this batch's H2D consumes the
@@ -3222,6 +3247,11 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
+        use_compact_kv_metadata = (
+            self.req_to_token_pool.supports_compact_kv_metadata
+            and self.forward_mode in (ForwardMode.EXTEND, ForwardMode.DECODE)
+            and (self.spec_algorithm is None or self.spec_algorithm.is_none())
+        )
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
         else:
@@ -3257,9 +3287,13 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
-        # Step 4: Merge cache_loc from all DP ranks
-        cache_loc_cpu = self._merge_cache_loc(
-            bs_paddings, cache_loc_paddings, page_size, per_dp_bs_padding
+        # Step 4: Merge page IDs or token locations from all DP ranks.
+        cache_indices = self._merge_cache_loc(
+            bs_paddings,
+            cache_loc_paddings,
+            page_size,
+            per_dp_bs_padding,
+            return_page_indices=use_compact_kv_metadata,
         )
 
         # Step 5: Merge sampling info from all DP ranks
@@ -3448,7 +3482,8 @@ class ScheduleBatch:
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions,
-            cache_loc=cache_loc_cpu,
+            cache_loc=None if use_compact_kv_metadata else cache_indices,
+            allocated_page_indices=cache_indices if use_compact_kv_metadata else None,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
@@ -3843,8 +3878,8 @@ class ModelWorkerBatch:
     sampling_info: ModelWorkerSamplingInfo
     # Position information [total_tokens]
     positions: np.ndarray
-    # cache_loc
-    cache_loc: np.ndarray
+    # Historical KV token locations; omitted when allocated_page_indices is used.
+    cache_loc: np.ndarray | None
 
     # For logprob
     return_logprob: bool
@@ -3870,7 +3905,8 @@ class ModelWorkerBatch:
     # into original order, removing the need for per-rank index math.
     logits_indices_selector: np.ndarray | None = None
 
-    # Batch-owned immutable page IDs for supported speculative relay backends.
+    # Batch-owned physical page IDs, packed by request in fixed DP segments.
+    # Speculative relay producers make these immutable for upload caching.
     allocated_page_indices: np.ndarray | None = None
     eagle_page_indices_device_cache: tuple | None = None
 

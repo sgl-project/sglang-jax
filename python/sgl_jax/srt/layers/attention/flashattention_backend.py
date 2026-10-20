@@ -15,7 +15,10 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
 from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
     get_tuned_block_sizes_v3,
 )
-from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
+from sgl_jax.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    get_batch_page_indices,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
@@ -203,6 +206,8 @@ class FlashAttentionMetadata:
 class FlashAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
 
+    supports_compact_kv_metadata = True
+
     def __init__(
         self,
         num_attn_heads,
@@ -250,22 +255,8 @@ class FlashAttention(AttentionBackend):
                 "Inconsistent DP batch metadata: expected per_dp_bs_size * dp_size == len(seq_lens), "
                 f"got {batch.per_dp_bs_size} * {batch.dp_size} != {len(batch.seq_lens)}"
             )
-        if len(batch.cache_loc) % batch.dp_size != 0:
-            raise ValueError(
-                "Inconsistent cache_loc layout for DP sharding: "
-                f"len(cache_loc)={len(batch.cache_loc)} is not divisible by dp_size={batch.dp_size}"
-            )
-
-        total_loc_len = len(batch.cache_loc)
-        per_dp_loc_len = total_loc_len // batch.dp_size
-
-        # Reshape cache_loc to (dp_size, per_dp_loc_len) — O(1) view
-        cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
-        # Stride by page_size to pick one slot per page — O(1) view
-        strided_2d = cache_loc_2d[:, :: self.page_size]
-
-        # MSA ctx-bucket: drop the per-DP zero-padded page tail. cache_loc is
-        # cumsum-packed within a DP rank (schedule_batch._merge_cache_loc), so
+        # MSA ctx-bucket: drop the per-DP zero-padded page tail. Pages are
+        # packed within a DP rank (schedule_batch._merge_cache_loc), so
         # all valid pages live in the [:, :sum(seq_pages)] prefix and
         # sum(seq_pages) <= bs_per_dp * max(seq_pages) <= bs_per_dp * bucket.
         # RPA indexes via cu_kv_lens (unaffected); _msa_inner derives
@@ -273,26 +264,26 @@ class FlashAttention(AttentionBackend):
         # DECODE only — EXTEND uses the largest cache_loc bucket unconditionally.
         # Backends may bound the decode page table (e.g. MSA context buckets);
         # the per-request page count still follows kv_lens/cu_kv_lens.
+        max_pages_per_dp = None
         if batch.forward_mode == ForwardMode.DECODE:
             limit = self._decode_page_limit(batch)
             if limit is not None:
-                n_keep = batch.per_dp_bs_size * limit
-                if n_keep < strided_2d.shape[1]:
-                    strided_2d = strided_2d[:, :n_keep]
+                max_pages_per_dp = batch.per_dp_bs_size * limit
 
-        # Physical slot -> Physical page index
-        page_indices = (strided_2d // self.page_size).ravel()
+        page_indices_2d = get_batch_page_indices(
+            batch, self.page_size, max_pages_per_dp=max_pages_per_dp
+        )
+        page_indices = page_indices_2d.ravel()
 
-        # SWA page indices: stride first, then apply mapping on ~N_pages entries
-        # instead of ~N_tokens entries (256x fewer random accesses)
+        # SWA mapping is indexed by physical token slot; map one page start
+        # per entry, then convert the mapped locations back to page IDs.
         swa_page_indices = None
         swa_mapping = getattr(self, "swa_index_mapping", None)
         if swa_mapping is not None:
-            n_pages = strided_2d.shape[1]
-            swa_strided = np.empty((batch.dp_size, n_pages), dtype=np.int32)
+            swa_strided = np.empty_like(page_indices_2d)
             for i in range(batch.dp_size):
                 mapping = swa_mapping[i] if isinstance(swa_mapping, list) else swa_mapping
-                swa_strided[i] = mapping[strided_2d[i]]
+                swa_strided[i] = mapping[page_indices_2d[i] * self.page_size]
             swa_page_indices = (swa_strided // self.page_size).ravel()
 
         # cu_q_lens per DP rank section (each section starts from 0)

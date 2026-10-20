@@ -831,6 +831,9 @@ class ModelRunnerKVCacheMixin:
                 max_context_len=self.model_config.context_len + 4,
                 dtype=np.int32,
             )
+            self.req_to_token_pool.supports_compact_kv_metadata = (
+                self.attn_backend.supports_compact_kv_metadata
+            )
 
         self.token_to_kv_pool = self._create_token_to_kv_pool(dp_size, max_num_reqs=max_num_reqs)
 
@@ -848,6 +851,9 @@ class ModelRunnerKVCacheMixin:
                 state_size=state_size,
                 enable_recurrent_extra_buffer=self.server_args.enable_recurrent_extra_buffer,
                 ping_pong_slots=_recurrent_ping_pong_slots(self.server_args),
+            )
+            self.req_to_token_pool.supports_compact_kv_metadata = (
+                self.attn_backend.supports_compact_kv_metadata
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

@@ -416,6 +416,7 @@ class TestBucketComputation(unittest.TestCase):
         # export and warmup agree, and extend shapes are unaffected.
         backend = MagicMock()
         backend.decode_page_buckets = [1, 2]
+        backend.use_compact_kv_metadata.return_value = False
         cm = CompilationManager(
             _make_server_args(), 8, 256, 1, 8, 128, 255, 256, attn_backend=backend
         )
