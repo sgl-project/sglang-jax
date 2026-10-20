@@ -24,7 +24,8 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from functools import partial
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -51,6 +52,184 @@ def _make_host_sharding(mesh: Mesh, partition_spec: PartitionSpec) -> NamedShard
             "falling back to default sharding."
         )
         return NamedSharding(mesh, partition_spec)
+
+
+def _host_to_device_array(x: np.ndarray, sharding: NamedSharding) -> jax.Array:
+    """Place a host ``numpy`` array on the mesh WITHOUT a cross-host collective.
+
+    ``jax.device_put(np_array, <non-fully-addressable NamedSharding>)`` runs
+    ``multihost_utils.assert_equal`` -- an all-gather across every process -- to
+    check all hosts passed the same value. HiCache's index arrays are tiny,
+    derived from scheduler state that is identical on every host by
+    construction, and are built on threads other than the forward launcher, so
+    that implicit collective is both wasted and a launch-order hazard on
+    multi-host meshes. Build the array per addressable device instead.
+    """
+    x = np.ascontiguousarray(x)
+    return jax.make_array_from_callback(x.shape, sharding, lambda idx: x[idx])
+
+
+@dataclass(frozen=True)
+class _BufferGroup:
+    """One list of per-layer device buffers that a host slot must carry.
+
+    A host slot packs one page of every buffer in the group over its layers as
+    ``(layer_num, *per_layer_shape)``. MHA pools have a single group
+    (``kv_buffer``); the MLA pool under ``dsa_sparse`` has two (latent
+    ``kv_buffer`` + ``indexer_key_buffer``) with different trailing shapes, so
+    they cannot share one array and are staged/transferred side by side.
+    """
+
+    name: str
+    get_buffers: Callable[[], list[jax.Array]]
+    set_buffer: Callable[[int, jax.Array], None]
+    layer_num: int
+    per_layer_shape: tuple[int, ...]
+    dtype: Any
+    partition_spec: PartitionSpec
+    # Derived shardings (see LRUHostKVPool.__init__ for the rationale).
+    slot_spec: PartitionSpec
+    host_sharding: NamedSharding
+    device_packed_sharding: NamedSharding
+    batched_layer_sharding: NamedSharding
+
+    @staticmethod
+    def build(
+        name: str,
+        *,
+        get_buffers: Callable[[], list[jax.Array]],
+        set_buffer: Callable[[int, jax.Array], None],
+        layer_num: int,
+        per_layer_shape: tuple[int, ...],
+        dtype: Any,
+        mesh: Mesh,
+        partition_spec: PartitionSpec,
+        shard_slot: bool = False,
+    ) -> _BufferGroup:
+        # A slot is the page packed over layers: prepend a replicated layer
+        # axis and drop the device pool's leading page/DP axis (a single
+        # gathered page is not DP-sharded). Any TP axis on trailing dims is kept.
+        trailing = list(tuple(partition_spec)[1:])
+        trailing += [None] * (len(per_layer_shape) - len(trailing))
+        if shard_slot:
+            # Spread the slot over the page axis' mesh axis ("data") instead of
+            # replicating it on every device. A replicated pinned-host slot costs
+            # one copy PER LOCAL DEVICE PER HOST (8x on a 4-chip tpu7x host, and
+            # again on every host); on GLM-5 that is ~108 MB of pinned RAM per
+            # page per host and exhausted a 990 GB host in 80 s of prefill.
+            # Pick the first trailing dim that is divisible by the axis size and
+            # not already sharded: for MLA [page_size/pack, pack, kv_dim] that is
+            # the token-group dim (64 bf16 / 32 fp8), both divisible by dp=32.
+            data_axis = tuple(partition_spec)[0]
+            size = int(mesh.shape[data_axis]) if data_axis in mesh.shape else 1
+            if size > 1:
+                for i, (dim, ax) in enumerate(zip(per_layer_shape, trailing)):
+                    if ax is None and dim % size == 0:
+                        trailing[i] = data_axis
+                        break
+                else:
+                    logger.warning(
+                        "host pool group %s: no trailing dim of %s divisible by %s=%d; "
+                        "host slots will be replicated (%dx pinned RAM)",
+                        name,
+                        per_layer_shape,
+                        data_axis,
+                        size,
+                        size,
+                    )
+        slot_spec = PartitionSpec(None, *trailing)
+        return _BufferGroup(
+            name=name,
+            get_buffers=get_buffers,
+            set_buffer=set_buffer,
+            layer_num=layer_num,
+            per_layer_shape=tuple(per_layer_shape),
+            dtype=dtype,
+            partition_spec=partition_spec,
+            slot_spec=slot_spec,
+            host_sharding=_make_host_sharding(mesh, slot_spec),
+            device_packed_sharding=NamedSharding(mesh, slot_spec),
+            # Batched gather output (one layer, MANY pages): page axis is back
+            # (not DP-distributed) and the trailing dims follow the slot layout, so
+            # the gather lands each device's slice directly (no 32x replicated
+            # broadcast) and the host put is a local per-device copy.
+            batched_layer_sharding=NamedSharding(mesh, PartitionSpec(None, *trailing)),
+        )
+
+    def slot_bytes(self) -> int:
+        """Bytes of one full (unsharded) slot of this group."""
+        n = self.layer_num
+        for d in self.per_layer_shape:
+            n *= int(d)
+        return n * jnp.dtype(self.dtype).itemsize
+
+    def replicas_per_host(self, mesh: Mesh) -> float:
+        """How many full-slot equivalents one host holds in pinned memory.
+
+        local_devices / (product of mesh-axis sizes the slot is sharded over).
+        Replicated slot on an 8-chip host -> 8.0; sharded 32-way -> 8/32 = 0.25.
+        """
+        shard = 1
+        for ax in tuple(self.slot_spec):
+            if ax is None:
+                continue
+            for a in ax if isinstance(ax, tuple) else (ax,):
+                shard *= int(mesh.shape[a])
+        return len(mesh.local_devices) / shard
+
+
+@partial(
+    jax.jit, static_argnames=("mesh", "cache_spec", "slot_tail"), donate_argnames=("kv_cache",)
+)
+def write_pages_layer(base_pages, sel, local_page_ids, kv_cache, mesh, cache_spec, slot_tail):
+    """One-layer, page-granular in-place write: ``kv_cache[local_page_ids[i]] = base_pages[sel[i]]``.
+
+    Layout-agnostic counterpart of :func:`memory_pool.write_kv_layer`. The MHA
+    path expands pages into per-token slots and drives a 5-D fused Pallas
+    kernel that assumes ``kv_cache.shape[1] == page_size`` and a head axis; the
+    MLA pool stores a page as a ``(page_size // packing, packing, kv_dim)`` token
+    grid with no head axis, so neither assumption holds. HiCache only ever moves
+    whole pages, so a page-level ``dynamic-update-slice`` is sufficient -- and it
+    is exactly the device layout already, so no reshape is needed.
+
+    ``base_pages`` is ``[n_c, *per_layer_shape]`` -- the n_c REAL staged pages
+    for this layer, in slot layout ``P(None, *slot_tail)``. ``sel`` (``[n_b]``,
+    ``n_b == per_shard * dp_size``) picks, for every rank-major padded slot, the
+    row of ``base_pages`` to write (padding rows point at 0 and are dropped via
+    their ``-1`` page id). The padded expansion happens *inside* the jit as a
+    gather, so the Python side never stacks ``n_b`` arrays (with dp=32 that was
+    a 16k-operand concatenate and minutes of XLA compile per bucket).
+    ``local_page_ids`` are SHARD-LOCAL page ids, ``-1`` for padding. Under
+    ``shard_map`` each data-shard receives its own contiguous chunk of both,
+    matching the shard-local page indexing of its ``kv_cache`` slice.
+    """
+    data_axis = tuple(cache_spec)[0]
+    pages_spec = PartitionSpec(data_axis, *tuple(cache_spec)[1:])
+    pages = base_pages.at[sel.astype(jnp.int32)].get(
+        out_sharding=NamedSharding(mesh, PartitionSpec(None, *slot_tail))
+    )
+    pages = jax.sharding.reshard(pages, NamedSharding(mesh, pages_spec))
+    local_page_ids = jax.sharding.reshard(
+        local_page_ids.astype(jnp.int32), NamedSharding(mesh, PartitionSpec(data_axis))
+    )
+
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=(pages_spec, PartitionSpec(data_axis), cache_spec),
+        out_specs=cache_spec,
+        check_vma=False,
+    )
+    def _update(local_pages, local_ids, local_cache):
+        # Out-of-range index + mode="drop" skips the padding rows.
+        safe = jnp.where(local_ids < 0, local_cache.shape[0], local_ids)
+        return local_cache.at[safe].set(local_pages, mode="drop")
+
+    return _update(pages, local_page_ids, kv_cache)
+
+
+# Largest number of real pages one flush_load launch handles; larger restores
+# are split so staged/padded shapes (and compiled buckets) stay bounded.
+_MAX_FLUSH_PAGES = 64
 
 
 @dataclass
@@ -309,16 +488,87 @@ class LRUHostKVPool(HostKVPool):
         self._partition_spec = partition_spec
         self._pool_name = pool_name
 
-        # A slot is the page packed over layers: prepend a replicated layer
-        # axis and drop the device pool's leading page/DP axis (a single
-        # gathered page is not DP-sharded). The TP axis on heads is preserved.
-        self._slot_spec = PartitionSpec(None, *tuple(partition_spec)[1:])
-        self._host_sharding = _make_host_sharding(mesh, self._slot_spec)
-        self._device_packed_sharding = NamedSharding(mesh, self._slot_spec)
-        # Batched gather output (one layer, MANY pages): page axis is back and
-        # replicated (gathered pages are not DP-distributed); same form PD uses.
-        self._batched_layer_sharding = NamedSharding(
-            mesh, PartitionSpec(None, *tuple(partition_spec)[1:])
+        # H2D scatter flavour. The MHA fused pool exposes
+        # ``attention_data_partition_axis`` and is written through the
+        # token-granular Pallas kernel (``write_kv_layer``); any other pool
+        # (MLA latent/indexer: no token axis, no head axis) goes through the
+        # page-granular ``write_pages_layer``. Decided first because it also
+        # selects the host-slot layout below.
+        self._token_scatter = hasattr(device_pool, "attention_data_partition_axis")
+        # Page-path slots are sharded over the data axis instead of replicated
+        # (see _BufferGroup.build); the MHA token path keeps its TPU-validated
+        # replicated-over-data layout untouched.
+        shard_slot = not self._token_scatter
+
+        # Buffer groups: every list of per-layer device buffers a page lives in.
+        # Group 0 is the pool's ``kv_buffer`` (the only group for MHA pools).
+        # The MLA pool under ``dsa_sparse`` carries a second paged buffer list,
+        # ``indexer_key_buffer`` (lightning-indexer keys, different kv_dim), that
+        # must be offloaded/restored alongside the latent KV or a restored
+        # prefix silently attends with zeroed indexer keys.
+        groups = [
+            _BufferGroup.build(
+                "kv",
+                get_buffers=lambda dp=device_pool: dp.kv_buffer,
+                set_buffer=lambda layer, buf, dp=device_pool: dp.kv_buffer.__setitem__(layer, buf),
+                layer_num=layer_num,
+                per_layer_shape=self._per_layer_shape,
+                dtype=dtype,
+                mesh=mesh,
+                partition_spec=partition_spec,
+                shard_slot=shard_slot,
+            )
+        ]
+        indexer_bufs = getattr(device_pool, "indexer_key_buffer", None)
+        if indexer_bufs:
+            idx0 = indexer_bufs[0]
+            idx_spec = getattr(getattr(idx0, "sharding", None), "spec", partition_spec)
+            groups.append(
+                _BufferGroup.build(
+                    "indexer",
+                    get_buffers=lambda dp=device_pool: dp.indexer_key_buffer,
+                    set_buffer=lambda slot, buf, dp=device_pool: dp.indexer_key_buffer.__setitem__(
+                        slot, buf
+                    ),
+                    layer_num=len(indexer_bufs),
+                    per_layer_shape=tuple(int(d) for d in idx0.shape[1:]),
+                    dtype=idx0.dtype,
+                    mesh=mesh,
+                    partition_spec=idx_spec,
+                    shard_slot=shard_slot,
+                )
+            )
+            logger.info(
+                "host pool %s: offloading DSA indexer-key buffers too (%d slots, page shape %s)",
+                pool_name,
+                len(indexer_bufs),
+                tuple(int(d) for d in idx0.shape[1:]),
+            )
+        self._groups: tuple[_BufferGroup, ...] = tuple(groups)
+
+        # Legacy single-group aliases (group 0), kept for readers of these names.
+        g0 = self._groups[0]
+        self._slot_spec = g0.slot_spec
+        self._host_sharding = g0.host_sharding
+        self._device_packed_sharding = g0.device_packed_sharding
+        self._batched_layer_sharding = g0.batched_layer_sharding
+
+        if not self._token_scatter:
+            logger.info(
+                "host pool %s: device pool %s has no fused MHA layout; using page-granular H2D scatter",
+                pool_name,
+                type(device_pool).__name__,
+            )
+        logger.info(
+            "host pool %s: slot layout %s; pinned host RAM per page per host = %.1f MB "
+            "(full slot %.1f MB x %.3f replicas/host); pool of %d pages = %.1f GB/host",
+            pool_name,
+            [(g.name, tuple(g.slot_spec)) for g in self._groups],
+            self.host_bytes_per_slot_local() / 2**20,
+            sum(g.slot_bytes() for g in self._groups) / 2**20,
+            self._groups[0].replicas_per_host(mesh),
+            pool_size,
+            self.host_bytes_per_slot_local() * pool_size / 2**30,
         )
         # PD's bucketed batched-gather helpers, reused to bound compiled shapes
         # (one kernel per page bucket). Imported at runtime to avoid a
@@ -333,7 +583,8 @@ class LRUHostKVPool(HostKVPool):
 
         self._lock = threading.Lock()
         self._free_ids: list[int] = list(range(pool_size))
-        self._slots: list[jax.Array | None] = [None] * pool_size
+        # One host array per buffer group, or None while the slot is empty.
+        self._slots: list[list[jax.Array] | None] = [None] * pool_size
         self._lock_ref: list[int] = [0] * pool_size
         # Allocated-state mirror of the free-list (O(1) membership for the
         # page-id boundary checks below; a bare ``in self._free_ids`` is O(n)).
@@ -350,16 +601,16 @@ class LRUHostKVPool(HostKVPool):
         self._last_exhaust_log = 0.0
         # D2H: pages gathered by stage_backup (buffer-owning thread, sync) await
         # their async host transfer in flush_backup (D2H worker), keyed by
-        # buffer_id; each value is ``(epoch, array)`` so flush can reject a stale
-        # publish from a slot reused since staging.
+        # buffer_id; each value is ``(epoch, [array per group])`` so flush can
+        # reject a stale publish from a slot reused since staging.
         self._pending_lock = threading.Lock()
-        self._pending_gather: dict[int, tuple[int, jax.Array]] = {}
+        self._pending_gather: dict[int, tuple[int, list[jax.Array]]] = {}
         # H2D (mirror): pages staged by stage_load (worker, slow device_put, never
         # touches kv_buffer) await their cheap in-place scatter in flush_load
         # (buffer-owning thread, donation-safe window), keyed by buffer_id; value
-        # is ``(epoch, array)`` for the same staleness guard.
+        # is ``(epoch, [array per group])`` for the same staleness guard.
         self._pending_load_lock = threading.Lock()
-        self._pending_load: dict[int, tuple[int, jax.Array]] = {}
+        self._pending_load: dict[int, tuple[int, list[jax.Array]]] = {}
 
     # ------------------------------------------------------------------
     # HostKVPool ABC
@@ -494,7 +745,6 @@ class LRUHostKVPool(HostKVPool):
                 self._require_allocated(buffer_id)
             gens = {bid: self._generation[bid] for bid in host_buffer_ids}
         self._require_device_pages(device_indices)
-        buffers = self._device_pool.kv_buffer
         n = len(device_indices)
         # Bucket the page count so each layer's gather compiles once per bucket
         # (PD pattern), not once per distinct n. Pad with page 0; the padding
@@ -503,18 +753,29 @@ class LRUHostKVPool(HostKVPool):
         dev_idx_np = np.asarray(device_indices, dtype=np.int32)
         if n_b > n:
             dev_idx_np = np.concatenate([dev_idx_np, np.zeros(n_b - n, dtype=dev_idx_np.dtype)])
-        page_indices = jax.device_put(dev_idx_np, NamedSharding(self._mesh, PartitionSpec(None)))
-        # One batched gather per layer (page axis back); keep the per-layer loop
-        # so peak HBM stays at one layer's bucket (PD caps it this way too).
-        per_layer = [
-            self._jit_gather_one_layer(buffers[layer], page_indices, self._batched_layer_sharding)
-            for layer in range(self._layer_num)
-        ]
-        packed = jnp.stack(per_layer, axis=0)  # (layer_num, n_b, *per_layer_shape)
-        jax.block_until_ready(packed)
+        page_indices = _host_to_device_array(
+            dev_idx_np, NamedSharding(self._mesh, PartitionSpec(None))
+        )
+        # One batched gather per layer per buffer group (page axis back); keep
+        # the per-layer loop so peak HBM stays at one layer's bucket (PD caps it
+        # this way too). The gather indexes axis 0 only, so it is layout-agnostic
+        # (MHA token rows and MLA token grids alike).
+        packed_groups: list[jax.Array] = []
+        for group in self._groups:
+            buffers = group.get_buffers()
+            per_layer = [
+                self._jit_gather_one_layer(
+                    buffers[layer], page_indices, group.batched_layer_sharding
+                )
+                for layer in range(group.layer_num)
+            ]
+            packed_groups.append(jnp.stack(per_layer, axis=0))  # (layer_num, n_b, *shape)
+        jax.block_until_ready(packed_groups)
         # Slice the real pages back per buffer_id (cheap views on the now-
-        # materialized array); padding rows [n:] are dropped.
-        gathered = {bid: packed[:, i] for i, bid in enumerate(host_buffer_ids)}
+        # materialized arrays); padding rows [n:] are dropped.
+        gathered = {
+            bid: [packed[:, i] for packed in packed_groups] for i, bid in enumerate(host_buffer_ids)
+        }
         # Publish under _lock, tagging each entry with the epoch captured at
         # entry. A free()+realloc() since then leaves _allocated True but bumps
         # the epoch, so the stale gather is dropped rather than landing in the
@@ -528,16 +789,16 @@ class LRUHostKVPool(HostKVPool):
                         gathered[buffer_id],
                     )
 
-    def flush_backup(self, host_buffer_ids: list[int]) -> None:
+    def flush_backup(self, host_buffer_ids: list[int], *, block: bool = True) -> list[jax.Array]:
         """D2H phase 2: ``device_put`` the staged pages into their host slots.
 
-        Touches only ``_pending_gather`` / ``_slots`` (never the KV buffer), so
-        it runs on the D2H worker concurrently with forward.
+        Touches only ``_pending_gather`` / ``_slots`` (never the KV buffer).
+        With ``block=False`` the host copies are only *issued*; the returned
+        arrays can be waited on from any thread (waiting is not a launch).
         """
         if not host_buffer_ids:
-            return
-        # Per-slot host transfer: on the worker thread (off the hot path), never
-        # the profiled bottleneck. Batching would need to slice a pinned-host
+            return []
+        # Per-slot host transfer. Batching would need to slice a pinned-host
         # array, which has no CPU implementation.
         staged: list[jax.Array] = []
         for buffer_id in host_buffer_ids:
@@ -548,8 +809,11 @@ class LRUHostKVPool(HostKVPool):
                     f"flush_backup with no staged gather for buffer_id={buffer_id}; "
                     f"stage_backup() must run (synchronously) first"
                 )
-            gen, packed = entry
-            host_packed = jax.device_put(packed, self._host_sharding)
+            gen, packed_list = entry
+            host_packed = [
+                jax.device_put(packed, group.host_sharding)
+                for packed, group in zip(packed_list, self._groups)
+            ]
             # Publish into _slots only if the slot is still the same allocation
             # that staged this gather (epoch unchanged): a release()/free()
             # (+realloc) after the pop above would otherwise resurrect stale data
@@ -557,8 +821,10 @@ class LRUHostKVPool(HostKVPool):
             with self._lock:
                 if self._allocated[buffer_id] and self._generation[buffer_id] == gen:
                     self._slots[buffer_id] = host_packed
-            staged.append(host_packed)
-        jax.block_until_ready(staged)
+            staged.extend(host_packed)
+        if block:
+            jax.block_until_ready(staged)
+        return staged
 
     def copy_into(self, device_indices: list[int], host_buffer_ids: list[int]) -> None:
         # Sync convenience (gather + host transfer on one thread): tests and
@@ -576,20 +842,20 @@ class LRUHostKVPool(HostKVPool):
         self.stage_load(host_buffer_ids)
         self.flush_load(host_buffer_ids, device_indices)
 
-    def stage_load(self, host_buffer_ids: list[int]) -> None:
+    def stage_load(self, host_buffer_ids: list[int], *, block: bool = True) -> list[jax.Array]:
         """H2D phase 1: ``device_put`` host slots onto the device into per-buffer
         staging arrays.
 
-        Touches only ``_slots`` / ``_pending_load`` (never the KV buffer), so it
-        runs on the H2D worker concurrently with forward; the cheap scatter is
-        deferred to :meth:`flush_load`.
+        Touches only ``_slots`` / ``_pending_load`` (never the KV buffer); the
+        cheap scatter is deferred to :meth:`flush_load`. With ``block=False`` the
+        copies are only issued and the returned arrays can be awaited elsewhere.
         """
         if not host_buffer_ids:
-            return
-        # Per-slot transfer: worker thread, off the hot path, not the bottleneck.
-        # Batching would need to stack pinned-host arrays (no CPU implementation).
+            return []
+        # Per-slot transfer. Batching would need to stack pinned-host arrays
+        # (no CPU implementation).
         staged: list[jax.Array] = []
-        loaded: dict[int, jax.Array] = {}
+        loaded: dict[int, list[jax.Array]] = {}
         # Read the slot refs + capture epochs under _lock, so the publish can
         # reject a slot reused since this (slow) device_put started.
         with self._lock:
@@ -601,10 +867,14 @@ class LRUHostKVPool(HostKVPool):
             slot = slots[buffer_id]
             if slot is None:
                 raise RuntimeError(f"stage_load from empty buffer_id={buffer_id}")
-            packed_dev = jax.device_put(slot, self._device_packed_sharding)
+            packed_dev = [
+                jax.device_put(arr, group.device_packed_sharding)
+                for arr, group in zip(slot, self._groups)
+            ]
             loaded[buffer_id] = packed_dev
-            staged.append(packed_dev)
-        jax.block_until_ready(staged)
+            staged.extend(packed_dev)
+        if block:
+            jax.block_until_ready(staged)
         # Publish tagged with the entry epoch (same ABA guard as stage_backup): a
         # free()+realloc() mid-stage bumps the epoch, so the stale device copy is
         # dropped instead of landing in the reused slot's pending load. Lock order
@@ -617,14 +887,24 @@ class LRUHostKVPool(HostKVPool):
                         loaded[buffer_id],
                     )
 
-    def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
-        """H2D phase 2: scatter the staged pages into the KV buffer via the
-        in-place aliased Pallas kernel (``write_kv_layer``).
+    def flush_load(
+        self, host_buffer_ids: list[int], device_indices: list[int], *, block: bool = True
+    ) -> None:
+        """H2D phase 2: scatter the staged pages into the device buffers in place.
 
         Sync + on the KV-owning thread, in a donation-safe window: it reads +
-        reassigns ``kv_buffer[layer]``, which the forward donates every step.
-        ``device_indices`` are GLOBAL device page ids, expanded to ``page_size``
-        token slots for the kernel ``loc``.
+        reassigns ``kv_buffer[layer]`` (and the indexer buffers for DSA), which
+        the forward donates every step. ``device_indices`` are GLOBAL device page
+        ids.
+
+        Two scatter flavours, picked at construction (``self._token_scatter``):
+
+        * MHA fused pool ``[pages, page_size, heads*2/pack, pack, hd]``: pages are
+          expanded to per-token ``loc`` and written by the in-place Pallas kernel
+          (``write_kv_layer``), as before.
+        * Any other layout (MLA ``[pages, page_size/pack, pack, kv_dim]``, DSA
+          indexer keys): whole pages are written by :func:`write_pages_layer`
+          with shard-local page ids. No token axis is assumed.
         """
         if len(host_buffer_ids) != len(device_indices):
             raise ValueError(
@@ -634,9 +914,7 @@ class LRUHostKVPool(HostKVPool):
         if not host_buffer_ids:
             return
         self._require_device_pages(device_indices)
-        from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
-        PS = self._page_size
         # Capture each slot's current epoch under _lock; a page whose epoch moved
         # since stage_load (free()+realloc()) is stale and must not be scattered
         # into the caller's device pages.
@@ -650,7 +928,7 @@ class LRUHostKVPool(HostKVPool):
                 cur_gen[buffer_id] = (
                     self._generation[buffer_id] if self._allocated[buffer_id] else None
                 )
-        staged_pages: list[jax.Array] = []
+        staged_pages: list[list[jax.Array]] = []  # per slot: one array per group
         fresh: list[bool] = []
         for buffer_id in host_buffer_ids:
             with self._pending_load_lock:
@@ -660,57 +938,85 @@ class LRUHostKVPool(HostKVPool):
                     f"flush_load with no staged page for buffer_id={buffer_id}; "
                     f"stage_load() must run first"
                 )
-            gen, packed = entry
-            staged_pages.append(packed)
+            gen, packed_list = entry
+            staged_pages.append(packed_list)
             fresh.append(cur_gen[buffer_id] == gen)
 
-        n = len(host_buffer_ids)
         dp = self._device_pool
         dp_size = int(dp.dp_size)
         num_dev_pages = int(dp.kv_buffer[0].shape[0])
         pages_per_shard = num_dev_pages // dp_size
 
-        # The KV buffer's page axis is sharded contiguously across the data axis:
-        # shard d owns global pages [d*pages_per_shard, (d+1)*pages_per_shard).
-        # write_kv_layer's shard_map splits loc/data into dp_size equal contiguous
-        # chunks and indexes each shard's LOCAL slice -- so a global page must land
-        # in its owning shard's chunk, addressed as a shard-local offset (passing
-        # global ids writes to the wrong shard under dp>1). Give every shard a
-        # fixed per_shard bucket (pad_to_page_bucket(n) == the worst case where all
-        # n pages fall on one shard) so the compiled shape depends only on
-        # (n bucket, dp_size). For dp_size==1 this collapses to one global==local
-        # chunk -- identical to the single-shard layout.
-        per_shard = self._pad_to_page_bucket(n)
-        n_b = per_shard * dp_size
-        # Bucket each transfer page into its owning shard's slot list; padding
-        # slots keep staged index 0 (data ignored) and loc -1 (kernel skips it).
-        shard_sel = [[0] * per_shard for _ in range(dp_size)]
-        shard_loc = [[-1] * per_shard for _ in range(dp_size)]
-        fill_pos = [0] * dp_size
-        for k, gp in enumerate(int(p) for p in device_indices):
-            if not fresh[k]:
-                continue  # slot freed/realloc'd since stage_load: drop stale page
+        # Only fresh (not realloc'd since stage_load) pages are written.
+        live = [k for k in range(len(host_buffer_ids)) if fresh[k]]
+        if not live:
+            return
+        # Split big restores into bounded chunks so shapes/compiles stay small.
+        for c0 in range(0, len(live), _MAX_FLUSH_PAGES):
+            chunk = live[c0 : c0 + _MAX_FLUSH_PAGES]
+            self._flush_chunk(chunk, staged_pages, device_indices, pages_per_shard, dp_size, block)
+
+    def _flush_chunk(self, chunk, staged_pages, device_indices, pages_per_shard, dp_size, block):
+        """Write one bounded chunk of staged pages (indices into ``staged_pages``).
+
+        The KV buffer's page axis is sharded contiguously across the data axis:
+        shard d owns global pages [d*pages_per_shard, (d+1)*pages_per_shard).
+        Both scatter kernels shard_map their inputs into dp_size equal
+        contiguous chunks and index each shard's LOCAL slice -- so a global page
+        must land in its owning shard's chunk, addressed as a shard-local offset
+        (passing global ids writes to the wrong shard under dp>1). Every shard
+        gets the same ``per_shard`` slots = bucket(max pages any one shard owns
+        in this chunk), so the compiled shape depends only on that bucket and
+        dp_size. For dp_size==1 this collapses to one global==local chunk.
+        """
+        # Bucket each page into its owning shard's slot list.
+        by_shard: list[list[tuple[int, int]]] = [[] for _ in range(dp_size)]  # (base_row, local)
+        for row, k in enumerate(chunk):
+            gp = int(device_indices[k])
             d = gp // pages_per_shard
-            pos = fill_pos[d]
-            shard_sel[d][pos] = k
-            shard_loc[d][pos] = gp - d * pages_per_shard
-            fill_pos[d] = pos + 1
-        sel = [k for chunk in shard_sel for k in chunk]
-        stack = jnp.stack(
-            [staged_pages[i] for i in sel], axis=0
+            by_shard[d].append((row, gp - d * pages_per_shard))
+        per_shard = self._pad_to_page_bucket(max(len(b) for b in by_shard))
+        n_b = per_shard * dp_size
+        # Rank-major padded layout: ``sel`` = base row per slot (padding -> 0),
+        # ``loc_pages`` = shard-local page id per slot (padding -> -1).
+        sel = np.zeros(n_b, dtype=np.int32)
+        loc_pages = np.full(n_b, -1, dtype=np.int64)
+        for d, entries in enumerate(by_shard):
+            for pos, (row, lp) in enumerate(entries):
+                sel[d * per_shard + pos] = row
+                loc_pages[d * per_shard + pos] = lp
+        # Real slots padded to a bucket too (fewer compiled base shapes); the pad
+        # rows duplicate row 0 and are never selected.
+        n_c = self._pad_to_page_bucket(len(chunk))
+        base_idx = list(chunk) + [chunk[0]] * (n_c - len(chunk))
+
+        if self._token_scatter:
+            self._flush_load_tokens(staged_pages, base_idx, sel, loc_pages, n_b, block)
+        else:
+            self._flush_load_pages(staged_pages, base_idx, sel, loc_pages, block)
+
+    def _flush_load_tokens(self, staged_pages, base_idx, sel, loc_pages, n_b, block) -> None:
+        """MHA fused layout: expand pages to token slots, Pallas in-place write."""
+        from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
+
+        dp = self._device_pool
+        PS = self._page_size
+        group = self._groups[0]  # MHA pools have exactly one buffer group
+        base = jnp.stack([staged_pages[i][0] for i in base_idx], axis=0)  # (n_c, L, *shape)
+        stack = base.at[jnp.asarray(sel, dtype=jnp.int32)].get(
+            out_sharding=NamedSharding(dp.mesh, PartitionSpec(None, *tuple(group.slot_spec)))
         )  # (n_b, layer_num, *per_layer_shape)
 
         # Expand shard-local page ids -> shard-local token slots (page*PS + offset),
         # -1 for padding. The per-shard chunk order matches the loc/data data-axis
         # split so each shard receives exactly the pages it owns.
-        loc_pages = np.asarray([lp for chunk in shard_loc for lp in chunk], dtype=np.int64)
         loc_np = np.where(
             loc_pages[:, None] < 0,
             -1,
             loc_pages[:, None] * PS + np.arange(PS, dtype=np.int64),
         ).reshape(-1)
-        loc = jax.device_put(
-            jnp.asarray(loc_np, dtype=jnp.int32),
+        loc = _host_to_device_array(
+            loc_np.astype(np.int32),
             NamedSharding(dp.mesh, PartitionSpec(dp.attention_data_partition_axis)),
         )
         total_tokens = n_b * PS
@@ -728,25 +1034,65 @@ class LRUHostKVPool(HostKVPool):
                 None,
             ),
         )
-        for layer in range(self._layer_num):
+        buffers = group.get_buffers()
+        for layer in range(group.layer_num):
             # One slice for the whole batch's layer (page axis kept), folded to
-            # tokens — no per-page gather/concatenate.
+            # tokens -- no per-page gather/concatenate.
             layer_kv = stack[:, layer]  # (n_b, page_size, *per_head_tail)
             layer_kv = jax.lax.reshape(
                 layer_kv,
                 (total_tokens, 1) + tuple(layer_kv.shape[2:]),
                 out_sharding=folded_sharding,
             )
-            dp.kv_buffer[layer] = write_kv_layer(
-                layer_kv,
-                loc,
-                dp.kv_buffer[layer],
-                PS,
-                dp.kv_partition_axis,
-                dp.attention_data_partition_axis,
-                dp.mesh,
+            group.set_buffer(
+                layer,
+                write_kv_layer(
+                    layer_kv,
+                    loc,
+                    buffers[layer],
+                    PS,
+                    dp.kv_partition_axis,
+                    dp.attention_data_partition_axis,
+                    dp.mesh,
+                ),
             )
-        jax.block_until_ready(dp.kv_buffer)
+        if block:
+            jax.block_until_ready(group.get_buffers())
+
+    def _flush_load_pages(self, staged_pages, base_idx, sel, loc_pages, block) -> None:
+        """Layout-agnostic: whole-page in-place write per layer per buffer group.
+
+        The staged slot already has the device page layout (whatever it is), so
+        the only work is placing page ``i`` at shard-local page ``loc_pages[i]``
+        of the owning data-shard. No token expansion, no reshape. Per layer we
+        stack only the n_c real staged pages; the rank-major padded expansion is
+        a gather inside ``write_pages_layer``.
+        """
+        dp = self._device_pool
+        local_ids = jnp.asarray(loc_pages, dtype=jnp.int32)
+        sel_dev = jnp.asarray(sel, dtype=jnp.int32)
+        for gi, group in enumerate(self._groups):
+            buffers = group.get_buffers()
+            cache_spec = buffers[0].sharding.spec
+            slot_tail = tuple(group.slot_spec)[1:]
+            base = jnp.stack(
+                [staged_pages[i][gi] for i in base_idx], axis=0
+            )  # (n_c, layer_num, *per_layer_shape), slot layout
+            for layer in range(group.layer_num):
+                group.set_buffer(
+                    layer,
+                    write_pages_layer(
+                        base[:, layer],  # (n_c, *per_layer_shape)
+                        sel_dev,
+                        local_ids,
+                        buffers[layer],
+                        dp.mesh,
+                        cache_spec,
+                        slot_tail,
+                    ),
+                )
+            if block:
+                jax.block_until_ready(group.get_buffers())
 
     def precompile_transfers(self, max_pages: int | None = None) -> None:
         """Warm the JIT/Pallas compile of the four transfer kernels for every
@@ -763,7 +1109,9 @@ class LRUHostKVPool(HostKVPool):
         # count (never more than ``cap_real`` slots, so alloc always fits) and let
         # the transfer pad internally — covering the top partial bucket too.
         dev_pages_total = int(self._device_pool.size) // self._page_size
-        cap_real = min(self._pool_size, dev_pages_total)
+        # flush_load splits anything larger into _MAX_FLUSH_PAGES chunks, so
+        # warming beyond that only compiles shapes serving never launches.
+        cap_real = min(self._pool_size, dev_pages_total, _MAX_FLUSH_PAGES)
         if max_pages is not None:
             cap_real = min(cap_real, int(max_pages))
         if cap_real <= 0:
@@ -791,15 +1139,26 @@ class LRUHostKVPool(HostKVPool):
                 self.stage_load(host_ids)
                 self.flush_load(host_ids, device_idx)
             except Exception as e:
+                self.free(slots)
+                if warmed == 0:
+                    # The smallest transfer failing is not a kernel-size limit,
+                    # it means this device pool / layout is not supported by the
+                    # transfer path. Serving would come up "healthy" and crash the
+                    # scheduler on the first host-cache hit; fail at startup instead.
+                    raise RuntimeError(
+                        f"hicache precompile: the smallest transfer ({r} page(s)) failed "
+                        f"for device pool {type(self._device_pool).__name__}; HiCache is "
+                        f"not functional for this configuration"
+                    ) from e
                 # A page count too large for the write_kv_layer Pallas kernel
                 # (SMEM overflow) must never crash the server: serving never
                 # drives a transfer that big either. Log and stop.
-                self.free(slots)
                 logger.warning(
-                    "hicache precompile: %d pages failed to warm (%s); stopping "
+                    "hicache precompile: %d pages failed to warm (%s: %s); stopping "
                     "at the largest kernel-safe size",
                     r,
                     type(e).__name__,
+                    str(e).splitlines()[0][:300] if str(e) else "",
                 )
                 break
             self.free(slots)
@@ -810,6 +1169,11 @@ class LRUHostKVPool(HostKVPool):
             real_counts[warmed - 1] if warmed else 0,
             time.perf_counter() - t0,
         )
+
+    def host_bytes_per_slot_local(self) -> int:
+        """Pinned host bytes one page slot costs on THIS host (all groups, all
+        local replicas/shards). Used to budget the pool against host RAM."""
+        return int(sum(g.slot_bytes() * g.replicas_per_host(self._mesh) for g in self._groups))
 
     def available_size(self) -> int:
         """Free page slots (HiCache control plane counts in pages)."""

@@ -1,9 +1,10 @@
 """HiCache control plane for L1 (HBM) <-> L2 (host pinned) KV transfers.
 
-Thin scheduling layer: async D2H (write) offloaded to a worker thread because
-D2H bandwidth is ~16x slower than H2D (~2.8 vs ~45.7 GB/s); sync H2D (load)
-stays inline. All data movement goes through HostKVPool page-addressed primitives;
-the controller only passes int page ids, keeping the storage backend swappable.
+Thin scheduling layer over the HostKVPool page-addressed primitives; the
+controller only passes int page ids, keeping the storage backend swappable.
+Every device launch is issued through one injectable ``launcher`` (the forward
+thread in overlap mode) so multi-host meshes see a deterministic launch order;
+see :class:`HiCacheController` for the rationale.
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ from __future__ import annotations
 import logging
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
+
+import jax
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool
@@ -19,21 +22,49 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _inline_launcher(fn: Callable[[], Any]) -> Future:
+    """Run ``fn`` on the calling thread and wrap its outcome in a resolved Future."""
+    future: Future = Future()
+    try:
+        future.set_result(fn())
+    except BaseException as e:  # noqa: BLE001 - propagate via the future like an executor would
+        future.set_exception(e)
+    return future
+
+
 class HiCacheController:
-    """Schedules L1<->L2 KV transfers over a HostKVPool."""
+    """Schedules L1<->L2 KV transfers over a HostKVPool.
+
+    Multi-host safety
+    -----------------
+    On a multi-controller TPU mesh every process must enqueue the same device
+    programs in the same order (each launch joins a cross-host "launch group").
+    Transfers therefore never launch device work from their own thread: every
+    phase that touches the device (gather, D2H put, H2D put, scatter) is handed
+    to ``self._launcher`` -- in overlap mode the forward thread's FIFO, i.e. the
+    one thread per host that already owns all launches, so HiCache programs are
+    ordered identically relative to forwards on every host. The small worker
+    thread only *waits* for readiness (``block_until_ready`` is not a launch)
+    and settles bookkeeping. Without a launcher (unit tests, non-overlap
+    scheduler) jobs run inline on the caller's thread, which is then the sole
+    launcher by construction.
+    """
 
     def __init__(
         self,
         host_pool: HostKVPool,
         device_pool: Any,
         device_allocator: Any = None,
+        launcher: Callable[[Callable[[], Any]], Future] | None = None,
     ) -> None:
         self._host_pool = host_pool
         self._device_pool = device_pool
         self._device_allocator = device_allocator
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hicache-d2h")
+        self._launcher = launcher or _inline_launcher
+        # Readiness waiter: never issues device programs.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hicache-wait")
         self._pending: list[Future] = []
-        # Guards against freeing a host page while the worker is still writing it.
+        # Guards against freeing a host page while a write to it is still in flight.
         self._inflight_lock = threading.Lock()
         self._inflight: set[int] = set()
         # Mirrors _inflight for the async H2D load path.
@@ -42,52 +73,77 @@ class HiCacheController:
         self._pending_load: list[Future] = []
         self._shutdown_done = False
 
+    def set_launcher(self, launcher: Callable[[Callable[[], Any]], Future] | None) -> None:
+        """Install the single device-launch thread's submit function (or None for inline)."""
+        self._launcher = launcher or _inline_launcher
+
+    def run_on_launcher(self, fn: Callable[[], Any]) -> Any:
+        """Run ``fn`` on the launcher thread and wait for its result."""
+        return self._launcher(fn).result()
+
     def write(self, device_indices: list[int], host_buffer_ids: list[int]) -> Future:
         """Async D2H: copy device pages into reserved host page slots.
 
-        The device-side gather (stage_backup) runs synchronously on the caller's
-        thread because the forward path donates kv_buffer every step — reading it
-        from the worker would race that deletion. Only the slow host transfer
-        (flush_backup) is offloaded.
+        The gather + host put are *issued* on the launcher thread (ordered with
+        forwards, donation-safe); the returned future resolves once the host
+        copies are ready, which the waiter thread observes without launching.
         """
         host_buffer_ids = list(host_buffer_ids)
-        self._host_pool.stage_backup(list(device_indices), host_buffer_ids)
-        # Register in-flight ids before submit: if the worker finishes before
+        device_indices = list(device_indices)
+        # Register in-flight ids before submit: if the waiter finishes before
         # registration, its cleanup has nothing to remove and the ids leak.
         with self._inflight_lock:
             self._inflight.update(host_buffer_ids)
-        future = self._executor.submit(self._do_d2h, host_buffer_ids)
+
+        def _issue() -> list:
+            self._host_pool.stage_backup(device_indices, host_buffer_ids)
+            return self._host_pool.flush_backup(host_buffer_ids, block=False)
+
+        launched = self._launcher(_issue)
+        future = self._executor.submit(self._await_d2h, launched, host_buffer_ids)
         self._pending.append(future)
         return future
 
     def load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
         """Sync H2D: stage host pages onto device, then scatter into kv_buffer.
 
-        Donation-safe default (stage + flush on the forward thread). The overlap
-        scheduler can instead split into async stage_load + flush_load to hide
-        the slow device_put behind compute.
+        Issued as one launcher job (ordered with forwards); blocks until done.
         """
         host_buffer_ids = list(host_buffer_ids)
-        self._host_pool.stage_load(host_buffer_ids)
-        self._host_pool.flush_load(host_buffer_ids, list(device_indices))
+        device_indices = list(device_indices)
+
+        def _issue():
+            self._host_pool.stage_load(host_buffer_ids)
+            self._host_pool.flush_load(host_buffer_ids, device_indices)
+
+        self._launcher(_issue).result()
 
     def stage_load(self, host_buffer_ids: list[int]) -> Future:
-        """Async H2D stage: offload host->device copy to the worker thread.
+        """Async H2D stage: issue the host->device copies on the launcher thread.
 
-        Never touches kv_buffer, so it safely overlaps the main-thread forward.
-        The cheap scatter is deferred to flush_load.
+        Never touches kv_buffer. The returned future resolves when the staged
+        device copies are ready; the cheap scatter is deferred to flush_load.
         """
         host_buffer_ids = list(host_buffer_ids)
         # Register in-flight ids before submit (same race-window fix as write).
         with self._inflight_load_lock:
             self._inflight_load.update(host_buffer_ids)
-        future = self._executor.submit(self._do_stage_load, host_buffer_ids)
+        launched = self._launcher(
+            lambda: self._host_pool.stage_load(host_buffer_ids, block=False)
+        )
+        future = self._executor.submit(self._await_stage_load, launched, host_buffer_ids)
         self._pending_load.append(future)
         return future
 
-    def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
-        """Complete the H2D scatter into kv_buffer. Must run donation-safe."""
+    def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> Future:
+        """Issue the H2D scatter into kv_buffer on the launcher thread.
+
+        FIFO order on the launcher guarantees it lands before any forward
+        enqueued afterwards, so callers need not block on the returned future
+        (the scheduler enqueues it before the next ``run_batch``).
+        """
         host_buffer_ids = list(host_buffer_ids)
+        device_indices = list(device_indices)
         with self._inflight_load_lock:
             busy = [b for b in host_buffer_ids if b in self._inflight_load]
         if busy:
@@ -95,18 +151,26 @@ class HiCacheController:
                 f"flush_load of page id(s) {busy} with in-flight stage_load; "
                 f"call check_load_status()/drain_loads() before flushing"
             )
-        self._host_pool.flush_load(host_buffer_ids, list(device_indices))
+        return self._launcher(
+            lambda: self._host_pool.flush_load(host_buffer_ids, device_indices, block=False)
+        )
 
-    def _do_d2h(self, host_buffer_ids: list[int]) -> None:
+    # -- waiter-thread bodies (no device launches here) ----------------------
+
+    def _await_d2h(self, launched: Future, host_buffer_ids: list[int]) -> None:
         try:
-            self._host_pool.flush_backup(host_buffer_ids)
+            staged = launched.result()
+            if staged:
+                jax.block_until_ready(staged)
         finally:
             with self._inflight_lock:
                 self._inflight.difference_update(host_buffer_ids)
 
-    def _do_stage_load(self, host_buffer_ids: list[int]) -> None:
+    def _await_stage_load(self, launched: Future, host_buffer_ids: list[int]) -> None:
         try:
-            self._host_pool.stage_load(host_buffer_ids)
+            staged = launched.result()
+            if staged:
+                jax.block_until_ready(staged)
         finally:
             with self._inflight_load_lock:
                 self._inflight_load.difference_update(host_buffer_ids)

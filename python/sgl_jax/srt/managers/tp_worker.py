@@ -352,6 +352,18 @@ class ModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def submit_device_job(self, fn):
+        """Run a device-touching callable now; the calling (scheduler) thread is
+        the sole launcher in non-overlap mode. Mirrors ModelWorkerClient's API."""
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        try:
+            future.set_result(fn())
+        except BaseException as e:  # noqa: BLE001 - surfaced to the submitter
+            future.set_exception(e)
+        return future
+
     def get_embedding_pool(self):
         return self.model_runner.embedding_pool
 
