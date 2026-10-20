@@ -171,6 +171,20 @@ class GenerationBatchResult:
     accept_lens: np.ndarray | None = None
 
 
+def validate_eagle_tree_request(req) -> str | None:
+    """Per-request guard for EAGLE tree drafting (--speculative-eagle-topk > 1).
+
+    Tree verify is wired to the greedy kernel only. Returns an error message
+    for a sampled request, otherwise None.
+    """
+    if req.sampling_params.top_k != 1:
+        return (
+            "EAGLE tree drafting (--speculative-eagle-topk > 1) supports greedy "
+            "sampling only; set temperature to 0 or top_k to 1."
+        )
+    return None
+
+
 def validate_dflash_request(req) -> str | None:
     """Per-request DFLASH guard (mirrors SGLang PR 22077).
 
@@ -1269,6 +1283,17 @@ class Scheduler(
             dflash_err = validate_dflash_request(req)
             if dflash_err is not None:
                 req.set_finish_with_abort(dflash_err)
+                self._add_request_to_queue(req)
+                return
+
+        if (
+            self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+            and self.server_args.speculative_eagle_topk > 1
+        ):
+            tree_err = validate_eagle_tree_request(req)
+            if tree_err is not None:
+                req.set_finish_with_abort(tree_err)
                 self._add_request_to_queue(req)
                 return
 

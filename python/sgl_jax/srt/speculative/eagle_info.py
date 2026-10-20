@@ -223,7 +223,15 @@ class EagleDraftInput:
         speculative_num_draft_tokens: int,
         *,
         use_device_metadata: bool = False,
+        accept_width: int | None = None,
     ):
+        """Turn a verified batch into the draft model's extend batch.
+
+        With ``accept_width``, each request feeds that many tokens: the width
+        of the verify accept window (``speculative_num_steps + 1``), which is
+        how ``verified_id`` is laid out. Without it, the per-request token
+        count follows ``model_worker_batch.input_ids``.
+        """
         legacy_non_overlap = (
             model_worker_batch.spec_algorithm is not None
             and model_worker_batch.spec_algorithm.is_eagle3()
@@ -231,11 +239,15 @@ class EagleDraftInput:
         )
         model_worker_batch.spec_info_padded = self
         sel = model_worker_batch.logits_indices_selector
-        model_worker_batch.seq_lens[sel] = (
-            model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
-        )
         bs = batch_output.accept_lens.shape[0]
-        step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
+        if accept_width is not None:
+            model_worker_batch.seq_lens[sel] = model_worker_batch.seq_lens[sel] + accept_width - 1
+            step_plus_1 = accept_width
+        else:
+            model_worker_batch.seq_lens[sel] = (
+                model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
+            )
+            step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
         positions = getattr(batch_output.next_draft_input, "positions", None)
         if positions is not None and not legacy_non_overlap:
             model_worker_batch.positions = positions
