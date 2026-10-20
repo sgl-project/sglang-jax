@@ -378,6 +378,22 @@ class Glm5Attention(nnx.Module):
                     out_sharding=P(*uk_axes),
                 )
             )
+            # Replicated full-head copies for the TSA absorb-after-a2a path: filled by
+            # prepare_absorbed_mla.
+            self.w_uk_all = nnx.Param(
+                jnp.zeros(
+                    (self.kv_lora_rank, num_heads, self.qk_nope_head_dim),
+                    dtype=dtype,
+                    out_sharding=P(None, None, None),
+                )
+            )
+            self.w_uv_all = nnx.Param(
+                jnp.zeros(
+                    (self.kv_lora_rank, num_heads, self.v_head_dim),
+                    dtype=dtype,
+                    out_sharding=P(None, None, None),
+                )
+            )
             self.attn_mqa = RadixAttention(
                 num_heads=num_heads,
                 head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -389,6 +405,8 @@ class Glm5Attention(nnx.Module):
         else:
             self.w_uk = None
             self.w_uv = None
+            self.w_uk_all = None
+            self.w_uv_all = None
             self.attn_mqa = None
 
         self.attn_mha = RadixAttention(
@@ -429,6 +447,10 @@ class Glm5Attention(nnx.Module):
         ql_nope = ql_nope.transpose(1, 0, 2)
 
         c_kv_3d = compressed[:, None, :]
+        if self.w_uk_all is not None:
+            dsa_kwargs = dict(
+                dsa_kwargs, dsa_absorb=(q_nope, self.w_uk_all.value, self.w_uv_all.value)
+            )
         attn_output, kv_fused = self.attn_mqa(
             ql_nope,
             c_kv_3d,
@@ -439,6 +461,9 @@ class Glm5Attention(nnx.Module):
             k_rope=k_rope,
             **dsa_kwargs,
         )
+        if attn_output.shape[-1] == self.v_head_dim:
+            # backend already applied W_UV on the token-sharded side (TSA absorb-after-a2a)
+            return attn_output.reshape(-1, self.num_heads * self.v_head_dim), kv_fused
         # "thr,rhd->thd" — fp32 accumulate; see ql_nope above.
         o_v = jax.lax.dot_general(
             attn_output,

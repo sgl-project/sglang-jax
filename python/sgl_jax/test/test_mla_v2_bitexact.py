@@ -172,7 +172,10 @@ class _CpuRef:
                 norm = parent._norm_idx(idx)
                 if parent._reshape_shape is not None or parent._bitcast_dtype is not None:
                     return _SubViewRef(parent, norm)
-                return _CpuRef(parent._buf, parent._idx + norm)
+                # Keep the whole index as one numpy tuple index: a multi-axis
+                # ``ref.at[:, pl.ds(a, n)]`` (head-major q/o DMA) must slice
+                # axis 1, not axis 0 twice.
+                return _CpuRef(parent._buf, parent._idx + (norm,))
 
         return _At()
 
@@ -367,6 +370,7 @@ def run_v2_kernel_with_capture(*args, **kwargs):
             mock.patch.object(pltpu, "make_async_copy", side_effect=_FakeAsyncCopy),
             mock.patch.object(pltpu, "bitcast", side_effect=_cpu_bitcast),
             mock.patch.object(lax, "fori_loop", side_effect=_py_fori_loop),
+            mock.patch.object(pl, "multiple_of", side_effect=lambda x, n: x),
         ):
             out, updated_kv = kmod.mla_ragged_paged_attention.__wrapped__(*args, **kwargs)
     return np.asarray(out), np.asarray(updated_kv), l_snapshots, acc_snapshots

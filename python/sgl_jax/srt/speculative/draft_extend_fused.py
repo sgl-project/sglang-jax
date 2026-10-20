@@ -683,7 +683,17 @@ def _build_chain_verify_arrays(
     bs = batch_size
     tid_range = jnp.arange(n, dtype=jnp.int32)
     verified_column = verified_id.astype(jnp.int32)[:, None]
-    token_chain = token_list[:, : n - 1].astype(jnp.int32)
+    token_list = token_list.astype(jnp.int32)
+    if token_list.ndim == 2 and token_list.shape[1] < n - 1:
+        # Width-1 bootstrap chain (first decode after a non-fused prefill, or a relay
+        # buffer seeded by it) reaching fused verify: gp79/gp80 (10-02) crashed here with
+        # reshape (1, 2) -> 4 on MTP + return_logprob requests. Pad the chain by
+        # repeating its last token; the duplicates are rejected by verify and the
+        # target logits supply the next token, so outputs are unchanged (only this
+        # step's accept length is shorter). Steady-state relay chains are full width.
+        pad = jnp.repeat(token_list[:, -1:], (n - 1) - token_list.shape[1], axis=1)
+        token_list = jnp.concatenate([token_list, pad], axis=1)
+    token_chain = token_list[:, : n - 1]
     verified_sharding = jax.typeof(verified_column).sharding
     if (
         isinstance(verified_sharding, NamedSharding)
@@ -2237,7 +2247,11 @@ def _prepare_logits_metadata(batch, mesh, *, include_accept_lens: bool = True):
 
 def _make_forward_batch(batch, model_runner):
     from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
-    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        ForwardBatch,
+        ForwardMode,
+        dsa_dense_arm_flags,
+    )
 
     data_sharding = NamedSharding(model_runner.mesh, P("data"))
     replicated_2d = NamedSharding(model_runner.mesh, P(None, None))
@@ -2289,9 +2303,28 @@ def _make_forward_batch(batch, model_runner):
         lora_token_indices = batch.lora_token_indices
         lora_ranks = batch.lora_ranks
 
+    # The fused-prefill target batch gets the same host-side dense-arm flag as ForwardBatch.init_new, so
+    # the main model's EXTEND chunk takes the exact-dense arm (plain dense MLA, no page scoring / top-k)
+    # instead of the qblock arm when every sequence fits the bound (knife 1, 2026-10-07; two-window chunks
+    # such as 8 x 1k included -- the dense attend kernel stays outside the PIN=7 scheduling group, inside
+    # it the two-window program does not compile: "annotation groups with gaps", gp277).
+    dsa_dense_exact = False
+    # Only the pure-EXTEND (prefill) batch is inspected: verify / draft-extend batches carry device-resident
+    # seq_lens (device_seq_lens_for_draft_extend) and reading them here would be a per-step D2H sync
+    # (+1 ms per step at bs1, measured 2026-10-07 gp749/gp752 vs gp742).
+    if batch.forward_mode == ForwardMode.EXTEND and not isinstance(batch.seq_lens, jax.Array):
+        dsa_dense_exact = dsa_dense_arm_flags(
+            batch.forward_mode,
+            batch.seq_lens,
+            len(input_ids),
+            who="draft_extend_fused._make_forward_batch",
+            index_topk=getattr(model_runner.attn_backend, "index_topk", None),
+        )
+
     return ForwardBatch(
         bid=batch.bid,
         forward_mode=batch.forward_mode,
+        dsa_dense_exact=dsa_dense_exact,
         batch_size=len(batch.seq_lens),
         input_ids=_prepare_device_array(input_ids, data_sharding, "forward.input_ids"),
         seq_lens=_prepare_device_array(batch.seq_lens, data_sharding, "forward.seq_lens"),
@@ -2808,8 +2841,12 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
 
     hidden_size = target_worker.model_config.hidden_size
+    # Placeholder only: fused_prefill replaces spec_info.hidden_states with the target's
+    # hidden before any use, but EagleDraftInput's device_fields moves it to the device, so
+    # a [tokens, hidden] f32 zeros buffer cost ~3 ms of np.zeros + ~1.8 ms of H2D per prefill
+    # call (gp251 1k host trace: 25 MB at 1024 tokens). One row keeps the pytree structure.
     model_worker_batch.spec_info_padded = EagleDraftInput(
-        hidden_states=np.zeros((len(model_worker_batch.input_ids), hidden_size), dtype=np.float32),
+        hidden_states=np.zeros((1, hidden_size), dtype=np.float32),
         verified_id=np.zeros((len(model_worker_batch.seq_lens),), dtype=np.int32),
         num_tokens_per_batch=np.asarray(1, dtype=np.int32),
         num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),

@@ -29,6 +29,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import need_attention_mask
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -148,6 +149,40 @@ class CaptureHiddenMode(IntEnum):
             raise ValueError(f"Unknown CaptureHiddenMode: {mode}")
 
 
+_DENSE_OK_LOGS = 0
+
+
+def dsa_dense_arm_flags(forward_mode, seq_lens, num_tokens, *, who="ForwardBatch", index_topk=None):
+    """Host-side (static) choice of the DSA prefill attention arm for a pure EXTEND batch.
+
+    Returns ``dsa_dense_exact``: every sequence fits ``DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT`` (exact-dense
+    arm: plain causal dense MLA, indexer keys written, no page scoring / top-k). The bound is clamped to
+    ``index_topk`` when given (same rule as the backend). Verify and draft-extend batches never take the
+    dense arm.
+    """
+    exact_max = envs.DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT.get()
+    if index_topk:
+        exact_max = min(exact_max, int(index_topk))
+    is_pure_extend = forward_mode == ForwardMode.EXTEND  # not verify/draft-extend
+    if not is_pure_extend or isinstance(seq_lens, jax.Array):
+        # never read device-resident seq_lens here: that is a D2H sync on the dispatch path
+        return False
+    max_seq = int(max(int(v) for v in seq_lens)) if len(seq_lens) > 0 else -1
+    dsa_dense_exact = bool(exact_max > 0 and is_pure_extend and 0 <= max_seq <= exact_max)
+    if exact_max > 0 and is_pure_extend:
+        global _DENSE_OK_LOGS
+        if _DENSE_OK_LOGS < 8:
+            _DENSE_OK_LOGS += 1
+            logger.info(
+                "%s: EXTEND max_seq=%d tokens=%d -> dsa_dense_exact=%s",
+                who,
+                max_seq,
+                int(num_tokens),
+                dsa_dense_exact,
+            )
+    return dsa_dense_exact
+
+
 @register_pytree_node_class
 @dataclass
 class ForwardBatch:
@@ -197,6 +232,11 @@ class ForwardBatch:
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
     deterministic: bool = True
+    # Host-decided static flag (jit cache key): every sequence of this EXTEND batch has
+    # context <= DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT (<= index_topk: dense == sparse exactly,
+    # no indexer top-k, no mask), so the DSA backend may take the exact-dense arm without a
+    # device-side lax.cond.
+    dsa_dense_exact: bool = False
     # Fused multimodal token embeddings (prefill only)
     input_embedding: jax.Array | None = None
     # MRoPE positions [3, total_tokens] for Qwen2.5-VL
@@ -249,6 +289,7 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
+            "dsa_dense_exact": self.dsa_dense_exact,
         }
         return (children, aux_data)
 
@@ -265,6 +306,7 @@ class ForwardBatch:
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.deterministic = aux_data.get("deterministic", True)
+        obj.dsa_dense_exact = aux_data.get("dsa_dense_exact", False)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -468,9 +510,17 @@ class ForwardBatch:
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
+        dsa_dense_exact = dsa_dense_arm_flags(
+            batch.forward_mode,
+            batch.seq_lens,
+            len(batch.input_ids),
+            who="ForwardBatch.init_new",
+            index_topk=getattr(model_runner.attn_backend, "index_topk", None),
+        )
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
+            dsa_dense_exact=dsa_dense_exact,
             batch_size=len(batch.seq_lens),
             input_ids=input_ids,
             seq_lens=seq_lens,

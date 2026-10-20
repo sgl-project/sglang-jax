@@ -141,7 +141,10 @@ def sparse_mla_page_level(
     S = kv_lens.shape[0]
 
     # Per-token seq id (decode: token t belongs to seq t after cu_q_lens=[0..T]).
-    seq_id = jnp.searchsorted(cu_q_lens[1:], jnp.arange(T), side="right")
+    # Number of boundaries <= t equals searchsorted(cu_q_lens[1:], t, side="right")
+    # for the sorted prefix sums; one compare+reduce fusion instead of a per-layer
+    # binary-search while loop (78 while ops = 0.42 ms/step at cc8 verify).
+    seq_id = jnp.sum(cu_q_lens[1:][None, :] <= jnp.arange(T)[:, None], axis=1).astype(jnp.int32)
     seq_id = jnp.clip(seq_id, 0, S - 1)
     tok_valid = kv_lens[seq_id] > 0  # [T] — padding seqs (bs padding) have kv_len==0
     # page_indices is packed per-seq at cu_kv_lens[i]//page_size (variable stride
@@ -286,6 +289,10 @@ def sparse_mla_page_level(
         vmem_limit_bytes=vmem_limit_bytes,
         # grouped: every pseudo-sequence has exactly G query rows.
         mixed_static_q_len=page_share_group if grouped else None,
+        # grouped: sp_dist is statically [0, 0, Ng]; the two decode kernels
+        # would be launched over empty ranges.
+        # grouped verify: do not emit the two empty decode MLA pallas_calls (launch tax only)
+        skip_decode_cases=grouped,
     )
     return o[..., :kv_lora_rank], cache_out
 
@@ -339,7 +346,10 @@ def sparse_mla_via_dense(
     S = kv_lens.shape[0]
 
     # ── 1. resolve topk seq-relative positions → flat physical slot ──────
-    seq_id = jnp.searchsorted(cu_q_lens[1:], jnp.arange(T), side="right")
+    # Number of boundaries <= t equals searchsorted(cu_q_lens[1:], t, side="right")
+    # for the sorted prefix sums; one compare+reduce fusion instead of a per-layer
+    # binary-search while loop (78 while ops = 0.42 ms/step at cc8 verify).
+    seq_id = jnp.sum(cu_q_lens[1:][None, :] <= jnp.arange(T)[:, None], axis=1).astype(jnp.int32)
     seq_id = jnp.clip(seq_id, 0, S - 1)
     seq_page_start = cu_kv_lens[seq_id] // page_size
     valid = topk_indices >= 0

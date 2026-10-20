@@ -1353,6 +1353,13 @@ def sample_custom_requests(
     return filtered_dataset
 
 
+def _num_special_tokens(tokenizer) -> int:
+    try:
+        return int(tokenizer.num_special_tokens_to_add())
+    except Exception:
+        return 0
+
+
 def compute_random_lens(full_len: int, range_ratio: float, num: int):
     return np.random.randint(
         max(int(full_len * range_ratio), 1),
@@ -1429,17 +1436,32 @@ def sample_random_requests(
             if prompt_len == 0:
                 continue
 
-            if prompt_len > input_lens[i]:
-                input_ids = prompt_token_ids[: input_lens[i]]
+            if return_text:
+                # Upstream sglang (benchmark/datasets/random.py): reserve the tokenizer's
+                # special tokens, repeat/truncate the ShareGPT ids to the target, decode ONCE
+                # and send the text as is. No re-encode loop and no random-token padding
+                # (the former decode->re-encode top-up left ~1/3 of the 1k prompts with a
+                # multilingual noise tail, ~7 % speculative accept length; 2026-10-05 audit).
+                target = max(1, int(input_lens[i]) - _num_special_tokens(tokenizer))
+                if prompt_len > target:
+                    input_ids = prompt_token_ids[:target]
+                else:
+                    ratio = (target + prompt_len - 1) // prompt_len
+                    input_ids = (prompt_token_ids * ratio)[:target]
+                input_content = tokenizer.decode(input_ids)
             else:
-                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
-                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            token_text, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
-                tokenizer, input_ids, input_lens[i], max_retry=max_retry
-            )
-            if token_mismatch > 0:
-                continue  # skip this request
-            input_content = token_text if return_text else token_ids
+                # token-id prompts (--tokenize-prompt): keep the exact-length adjust loop
+                if prompt_len > input_lens[i]:
+                    input_ids = prompt_token_ids[: input_lens[i]]
+                else:
+                    ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+                    input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+                _, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
+                    tokenizer, input_ids, input_lens[i], max_retry=max_retry
+                )
+                if token_mismatch > 0:
+                    continue  # skip this request
+                input_content = token_ids
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,

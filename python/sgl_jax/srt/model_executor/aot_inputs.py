@@ -1,6 +1,7 @@
 """Build offline inputs through the serving config, model registry and loaders."""
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.model_executor.aot_resources import AbstractResources
 from sgl_jax.srt.model_executor.aot_workloads import InputContext, get_input_builder
 from sgl_jax.srt.model_executor.model_forward import make_jitted_run_model
@@ -185,6 +187,7 @@ class AbstractModel:
             )
         )
         backend.forward_metadata = inputs.attention_metadata
+        apply_aot_dense_exact(inputs.batch, getattr(options, "num_tokens", None))
         args = (
             self.model_def,
             self.model_state_def,
@@ -194,6 +197,38 @@ class AbstractModel:
             inputs.logits,
         )
         return make_jitted_run_model(backend), args, self.model_config.hf_config, builder.spec
+
+
+def apply_aot_dense_exact(batch, num_tokens) -> bool:
+    """Gate-only replica knob (``SGL_JAX_AOT_DENSE_EXACT=1``).
+
+    The live scheduler flags pure-extend batches whose longest sequence fits in
+    ``DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT`` as exact-dense in ``ForwardBatch.init_new``;
+    the AOT input builders construct ``ForwardBatch`` directly, so AOT programs always
+    compile the qblock arm and a CPU AOT gate cannot reproduce the <=2048-token program
+    (gp277, 10-03: 1k two-window program failed on TPU with a scheduling-group gap that
+    the gate never saw). With the knob on, an EXTEND shape whose token count fits the
+    exact-dense bound (single-sequence view) gets the same flag. Returns whether it fired.
+    """
+    if os.environ.get("SGL_JAX_AOT_DENSE_EXACT", "0") != "1":
+        return False
+    exact_max = envs.DSA_PREFILL_DENSE_EXACT_MAX_CONTEXT.get()
+    mode = getattr(batch, "forward_mode", None)
+    is_extend = bool(mode is not None and getattr(mode, "name", "") == "EXTEND")
+    # SGL_JAX_AOT_DENSE_EXACT_FORCE=1 (gate-only, 2026-10-07): the AOT builder sees one sequence of
+    # ``num_tokens``, but production's batched prefill is N sequences of <= exact_max tokens each
+    # (8 x 1k -> 8192-token two-window program with the exact-dense arm); force the flag so a CPU
+    # gate can compile that program (gp277 annotation-gap replica for the V2 fix).
+    force = os.environ.get("SGL_JAX_AOT_DENSE_EXACT_FORCE", "0") == "1"
+    if (
+        exact_max <= 0
+        or not is_extend
+        or num_tokens is None
+        or (int(num_tokens) > exact_max and not force)
+    ):
+        return False
+    batch.dsa_dense_exact = True
+    return True
 
 
 def build_inputs(options, mesh):
