@@ -368,6 +368,7 @@ suites = {
         ),
         TestFile("python/sgl_jax/test/multimodal/test_rotary_embedding.py", 0.1),
         TestFile("test/srt/test_radix_input_ids.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_jit_cache.py", 0.5),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_unified_swa_scheduler.py",
