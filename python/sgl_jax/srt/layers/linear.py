@@ -634,7 +634,11 @@ class QuantizedLinear(nnx.Module):
 
 
 def fuse_quantized_linears(
-    mods: Sequence["QuantizedLinear"], *, scope_name: str, pad_n_to: int = 512
+    mods: Sequence["QuantizedLinear"],
+    *,
+    scope_name: str,
+    pad_n_to: int = 512,
+    member_paths: Sequence[str] | None = None,
 ) -> tuple["QuantizedLinear", list[int]] | None:
     """Concatenate replicated ``QuantizedLinear`` modules that consume the same
     input into ONE ``QuantizedLinear`` along the output dim.
@@ -655,6 +659,11 @@ def fuse_quantized_linears(
     last, unused segment), or ``None`` when the
     modules are not fusable (different input width / dtype / block size /
     non-replicated layout / 1-D scales / bias) so callers keep the unfused path.
+
+    ``member_paths`` (module paths of ``mods`` relative to the fused module's parent, e.g.
+    ``"q_a_proj"`` / ``"indexer/wk"``) are kept on the fused module as
+    ``fused_member_paths`` so later per-module passes keyed on the module path (the
+    per-channel requantization skip regex) still see the original layers.
     """
     if not mods or not all(isinstance(m, QuantizedLinear) for m in mods):
         return None
@@ -698,6 +707,7 @@ def fuse_quantized_linears(
         allow_narrow_n_blockwise=m0.allow_narrow_n_blockwise,
         scope_name=scope_name,
     )
+    fused.fused_member_paths = tuple(member_paths or ())
     return fused, [int(w.shape[0]) for w in w_qs]
 
 

@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+import math
 import os
 from functools import partial
 from typing import Any
@@ -460,9 +461,13 @@ class Glm5Attention(nnx.Module):
         # checks ``getattr(self, "fused_in_proj", None)``.
         if getattr(self, "fused_in_proj", None) is None:
             mods = [self.q_a_proj, self.kv_a_proj_with_mqa]
+            member_paths = ["q_a_proj", "kv_a_proj_with_mqa"]
             if self.indexer is not None:
                 mods.append(self.indexer.wk)
-            fused = fuse_quantized_linears(mods, scope_name="fused_in_proj")
+                member_paths.append("indexer/wk")
+            fused = fuse_quantized_linears(
+                mods, scope_name="fused_in_proj", member_paths=member_paths
+            )
             if fused is not None:
                 fused_mod, splits = fused
                 self._fused_in_splits = tuple(splits)
@@ -776,6 +781,34 @@ class Glm5MLP(nnx.Module):
         return output
 
 
+def fused_moe_reduce_supported(mesh, shared_experts, use_fused: bool) -> bool:
+    """Whether a MoE layer may defer its reduces and finish routed + shared with one
+    ``fused_all_reduce`` over the model ``tensor`` axis. Three conditions, each one a wrong
+    sum otherwise:
+
+    * shared experts live outside the fused MoE kernel (``use_fused`` keeps them in-kernel);
+    * the model ``tensor`` axis spans every device: the deferred EPMoE combine is a psum over
+      the ``expert`` axis of the flattened device list, which only equals the ``tensor``
+      all-reduce when no other mesh axis (``data``) is larger than one;
+    * the shared down projection is a row-parallel ``QuantizedLinear`` (reduce axis
+      ``tensor``), whose psum goes through ``maybe_oneshot_psum`` and can be deferred.
+      ``LinearBase`` reduces inside ``dot_general`` and a quantized layer whose reduce axis fell
+      back to replicated never reduces; both already return the full shared output, which the
+      fused all-reduce would multiply by the tensor size.
+    """
+    from sgl_jax.srt.layers.linear import QuantizedLinear
+
+    if shared_experts is None or use_fused:
+        return False
+    sizes = dict(mesh.shape)
+    if math.prod(sizes.values()) != sizes.get("tensor", 0):
+        return False
+    down = getattr(shared_experts, "down_proj", None)
+    if not isinstance(down, QuantizedLinear):
+        return False
+    return tuple(down.kernel_axes or (None, None))[0] == "tensor"
+
+
 class Glm5DecoderLayer(nnx.Module):
     def __init__(
         self,
@@ -1064,6 +1097,14 @@ class Glm5DecoderLayer(nnx.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         return hidden_states, residual, kv_fused
 
+    def fused_reduce_supported(self) -> bool:
+        """Whether this layer may take the fused MoE reduce path (``defer_reduce`` around the
+        shared experts + EPMoE combine, one ``fused_all_reduce``); see
+        :func:`fused_moe_reduce_supported`."""
+        return self.is_moe_layer and fused_moe_reduce_supported(
+            self.mesh, self.shared_experts, self.use_fused
+        )
+
     def mlp_block(
         self, hidden_states: jax.Array, dispatch_info: ExpertLocationMetadata | None = None
     ):
@@ -1088,11 +1129,7 @@ class Glm5DecoderLayer(nnx.Module):
             # down_proj and the EPMoE combine return per-device partials and reduce their sum
             # with one Pallas all-reduce -- the single collective XLA would otherwise emit for
             # psum(shared) + psum(routed). Only valid when the MoE output is fully replicated.
-            fuse_ar = (
-                fused_moe_enabled(hidden_states)
-                and self.shared_experts is not None
-                and not self.use_fused
-            )
+            fuse_ar = fused_moe_enabled(hidden_states) and self.fused_reduce_supported()
             router_logits = self.moe_gate(hidden_states)
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
@@ -1130,15 +1167,12 @@ class Glm5DecoderLayer(nnx.Module):
         router, top-k, shared experts (deferred partial) and ``EPMoE.dispatch_stage`` (token
         sort + SparseCore dispatch gather). Returns a dict for ``mlp_experts``; ``d["anchor"]``
         is a tiny array that depends on this window's dispatch gather."""
-        fuse_ar = (
-            fused_moe_enabled(hidden_states)
-            and self.shared_experts is not None
-            and not self.use_fused
-        )
-        if not (self.is_moe_layer and fuse_ar):
+        fuse_ar = fused_moe_enabled(hidden_states) and self.fused_reduce_supported()
+        if not fuse_ar:
             raise NotImplementedError(
-                "mlp_dispatch needs an EPMoE layer with shared experts on the fused all-reduce "
-                "path (SGLANG_JAX_ONESHOT_AR_SITES=fused / force_fused_reduce)"
+                "mlp_dispatch needs an EPMoE layer with deferrable shared experts on the fused "
+                "all-reduce path (SGLANG_JAX_ONESHOT_AR_SITES=fused / force_fused_reduce); "
+                "callers check fused_reduce_supported() and use mlp_partial otherwise"
             )
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
@@ -1486,7 +1520,7 @@ def _microbatch_pinned_layers(
             pool.update(layer.layer_id, full_slot.get(layer.layer_id), kv_last, idx_last)
         mlp_anchor = [None] * n
         topk_ids_parts = []
-        if two_stage and getattr(layer, "is_moe_layer", False):
+        if two_stage and getattr(layer, "is_moe_layer", False) and layer.fused_reduce_supported():
             # (AOT replica): with SparseCore permute kernels in the
             # MoE block, XLA hoists window B's combine call-start ahead of window A's MoE
             # all-reduce; the SparseCore stream completes in start order, so A's all-reduce

@@ -657,6 +657,12 @@ suites = {
             env={"JAX_PLATFORMS": "cpu"},
         ),
         TestFile(
+            "test/srt/layers/test_fused_moe_reduce_support.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
             "test/srt/layers/test_linear_per_channel_requant.py",
             0.5,
             runner="pytest",

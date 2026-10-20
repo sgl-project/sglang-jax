@@ -58,16 +58,50 @@ _GLU_EPILOGUE_CHUNK = 256
 _GLU_LOGGED: list = []
 
 
+def glu_epilogue_chunk(activation: str, intermediate_per_device: int) -> int:
+    """Interleave chunk for the gmm_v2 SwiGLU epilogue, or 0 (plain gate|up concat, activation
+    applied by XLA) when the activation is not silu or the per-device intermediate width is not
+    a multiple of the chunk (``validate_glu_chunk`` needs ``2N % (2 * chunk) == 0``)."""
+    if activation != "silu" or intermediate_per_device % _GLU_EPILOGUE_CHUNK != 0:
+        return 0
+    return _GLU_EPILOGUE_CHUNK
+
+
+def _explicit_spec(x: jax.Array):
+    """The operand's PartitionSpec padded to its rank when it carries an explicit-axes
+    sharding (reshapes of a sharded dim then need ``out_sharding``), else None."""
+    try:
+        sharding = jax.typeof(x).sharding
+    except Exception:  # noqa: BLE001 - concrete arrays without a typed sharding
+        return None
+    spec = getattr(sharding, "spec", None)
+    mesh = getattr(sharding, "mesh", None)
+    if spec is None or mesh is None or getattr(mesh, "empty", True):
+        return None
+    if not all(t == jax.sharding.AxisType.Explicit for t in mesh.axis_types):
+        return None
+    spec = tuple(spec) + (None,) * (x.ndim - len(spec))
+    return spec
+
+
 def interleave_gate_up(w0: jax.Array, w1: jax.Array, chunk: int) -> jax.Array:
     """[..., N] x2 -> [..., 2N] laid out as [w0[:chunk] | w1[:chunk] | w0[chunk:2chunk] | ...].
-    Pairs with ``gmm_v2(glu_chunk=chunk)`` / ``glu_from_interleaved``."""
+    Pairs with ``gmm_v2(glu_chunk=chunk)`` / ``glu_from_interleaved``. Under explicit sharding
+    the split / merged last dim keeps the operand's own axis (a size-1 ``tensor`` axis is still
+    an annotation the reshape has to be told about)."""
     n = w0.shape[-1]
     if w1.shape != w0.shape or n % chunk != 0:
         raise ValueError(f"interleave_gate_up: shapes {w0.shape}/{w1.shape}, chunk {chunk}")
     lead = w0.shape[:-1]
-    a = w0.reshape(*lead, n // chunk, 1, chunk)
-    b = w1.reshape(*lead, n // chunk, 1, chunk)
-    return jnp.concatenate([a, b], axis=-2).reshape(*lead, 2 * n)
+    spec = _explicit_spec(w0)
+    if spec is None:
+        a = w0.reshape(*lead, n // chunk, 1, chunk)
+        b = w1.reshape(*lead, n // chunk, 1, chunk)
+        return jnp.concatenate([a, b], axis=-2).reshape(*lead, 2 * n)
+    split_spec = P(*spec[:-1], spec[-1], None, None)
+    a = w0.reshape(*lead, n // chunk, 1, chunk, out_sharding=split_spec)
+    b = w1.reshape(*lead, n // chunk, 1, chunk, out_sharding=split_spec)
+    return jnp.concatenate([a, b], axis=-2).reshape(*lead, 2 * n, out_sharding=P(*spec))
 
 
 # The down-projection memset is skipped on the SparseCore-combine path (dispatch set
@@ -286,19 +320,22 @@ class EPMoE(nnx.Module):
                 w1,
                 scale_name="wi_1_scale",
             )
-            glu_chunk = _GLU_EPILOGUE_CHUNK if self.activation == "silu" else 0
+            glu_chunk = glu_epilogue_chunk(self.activation, int(w0.shape[-1]))
             if glu_chunk:
                 fused = interleave_gate_up(w0, w1, glu_chunk)
             else:
                 fused = jnp.concatenate([w0, w1], axis=-1)
-            self.wi_0 = nnx.Param(fused, out_sharding=P("expert", None, "tensor"))
+            # replicated experts (moe_dp_size > 1) have no "expert" mesh axis: keep the layout
+            # the unfused parameters were created with
+            ex = None if self.replicate_experts else "expert"
+            self.wi_0 = nnx.Param(fused, out_sharding=P(ex, None, "tensor"))
             self.wi_1 = None
             if s0 is not None and s1 is not None:
                 if glu_chunk:
                     fs = interleave_gate_up(s0, s1, glu_chunk)
                 else:
                     fs = jnp.concatenate([s0, s1], axis=-1)
-                self.wi_0_scale = nnx.Param(fs, out_sharding=P("expert", None, None, "tensor"))
+                self.wi_0_scale = nnx.Param(fs, out_sharding=P(ex, None, None, "tensor"))
                 self.wi_1_scale = None
         self.fused_gate_up = True
         self.glu_chunk = glu_chunk
@@ -914,7 +951,8 @@ class EPMoE(nnx.Module):
             if scatter_on_tensor:
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
             else:
-                output = maybe_oneshot_psum(output, "tensor", self.mesh.axis_names, site="moe")
+                # inside the moe_mesh shard_map: the kernel indexes the ("expert", "tensor") axes
+                output = maybe_oneshot_psum(output, "tensor", self.moe_mesh.axis_names, site="moe")
         if self.ep_size > 1:
             output = self._combine(output)
 

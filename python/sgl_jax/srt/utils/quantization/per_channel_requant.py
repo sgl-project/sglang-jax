@@ -50,6 +50,17 @@ def _requant(w_q: jax.Array, ws3: jax.Array, block_k: int) -> tuple[jax.Array, j
     return (w / sc).astype(w_q.dtype), sc[:, 0].astype(jnp.float32)
 
 
+def skip_matches(skip_re: str | None, path_str: str, member_paths=()) -> bool:
+    """``skip_re`` matches the module path, or -- for a module fused out of several linears
+    (``fused_member_paths``) -- the path any of those members had before fusion."""
+    if not skip_re:
+        return False
+    if re.search(skip_re, path_str):
+        return True
+    parent = path_str.rsplit("/", 1)[0] if "/" in path_str else ""
+    return any(re.search(skip_re, f"{parent}/{m}" if parent else m) for m in member_paths)
+
+
 def requantize_linears_per_channel(model: nnx.Module, mode: str, skip: str | None = None) -> int:
     """Rewrite every block-quant QuantizedLinear in ``model`` in place; returns the count.
     ``skip``: regex on the module path; matching layers keep their block scales."""
@@ -62,7 +73,7 @@ def requantize_linears_per_channel(model: nnx.Module, mode: str, skip: str | Non
         if not isinstance(m, QuantizedLinear):
             continue
         path_str = "/".join(str(k) for k in path)
-        if skip_re and re.search(skip_re, path_str):
+        if skip_matches(skip_re, path_str, getattr(m, "fused_member_paths", ())):
             logger.info("per-channel requant: skipping %s (matches %r)", path_str, skip_re)
             continue
         ws = m.weight_scale.value

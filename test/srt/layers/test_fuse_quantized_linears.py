@@ -16,6 +16,7 @@ import numpy as np
 from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.linear import QuantizedLinear, fuse_quantized_linears
+from sgl_jax.srt.utils.quantization.per_channel_requant import skip_matches
 
 BLOCK = (128, 128)
 
@@ -107,3 +108,27 @@ if __name__ == "__main__":
     test_fused_matches_unfused_fp8_act()
     test_not_fusable_returns_none()
     print("OK")
+
+
+def test_member_paths_feed_the_requant_skip():
+    # per_channel_requant_skip is a regex on the module path; the fused module must still be
+    # skipped when one of the layers it absorbed matches (its own path no longer does)
+    devs = np.array(jax.devices()[:1]).reshape(1, 1)
+    mesh = Mesh(devs, ("data", "tensor"))
+    rng = np.random.default_rng(1)
+    with mesh:
+        mods = [_make(mesh, 256, 512, rng, None), _make(mesh, 128, 512, rng, None)]
+        fused, _ = fuse_quantized_linears(
+            mods, scope_name="fused_in_proj", member_paths=["q_a_proj", "indexer/wk"]
+        )
+        plain, _ = fuse_quantized_linears(mods, scope_name="fused_in_proj")
+    assert fused.fused_member_paths == ("q_a_proj", "indexer/wk")
+    assert plain.fused_member_paths == ()
+    path = "model/layers/3/self_attn/fused_in_proj"
+    assert skip_matches("q_a_proj", path, fused.fused_member_paths)
+    assert skip_matches(r"indexer/wk$", path, fused.fused_member_paths)
+    assert skip_matches(r"layers/3/self_attn/q_a_proj", path, fused.fused_member_paths)
+    assert not skip_matches("q_a_proj", path, plain.fused_member_paths)
+    assert not skip_matches("o_proj", path, fused.fused_member_paths)
+    assert not skip_matches(None, path, fused.fused_member_paths)
+    assert skip_matches("fused_in_proj", path, ())

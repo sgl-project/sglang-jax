@@ -276,8 +276,11 @@ def fused_glu_down_configs(
         skip_prefix=skip_prefix,
     )
     t1, t2 = cfgs1.tiles, cfgs2.tiles
-    if cfgs1.lhs_cfgs.quant_dtype is None or cfgs2.lhs_cfgs.quant_dtype is None:
-        return None
+    # _quant_tile_matmul is the fp8-MXU form (per-block absmax float quantization); chips with an
+    # int8 MXU pick an int8 lhs for int4 / int8 weights and keep the two-call path.
+    for q in (cfgs1.lhs_cfgs.quant_dtype, cfgs2.lhs_cfgs.quant_dtype):
+        if q is None or not jnp.issubdtype(q, jnp.floating):
+            return None
     if (t1.tile_k, t1.tile_n) != (size_k, n1) or (t2.tile_k, t2.tile_n) != (size_i, size_k):
         return None
     if t1.tile_m != t2.tile_m:
