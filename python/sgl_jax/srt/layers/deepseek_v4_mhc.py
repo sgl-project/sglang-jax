@@ -181,8 +181,7 @@ class DeepseekV4MHC:
 
     Pallas operations consume local arrays inside a manual mesh scope. With an
     Explicit mesh, M wraps these calls in ``jax.shard_map`` with token-row input
-    and output specs and replicated parameter specs. See
-    ``docs/developer_guide/deepseek_v4_mhc_contract.md`` for the calling contract.
+    and output specs and replicated parameter specs.
     """
 
     def __init__(self, config, *, backend: str = "auto"):
