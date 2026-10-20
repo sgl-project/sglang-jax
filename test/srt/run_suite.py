@@ -267,8 +267,10 @@ suites = {
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_v4_backend.py", 5, runner="pytest"),
         TestFile("test/srt/kernels/csa_attention/test_attention.py", 3, runner="pytest"),
+        TestFile("test/srt/kernels/csa/test_csa.py", 3.2, runner="pytest"),
         TestFile("test/srt/kernels/csa_compressor/test_compressor.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_deepseek_v4_mhc.py", 2, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
@@ -313,6 +315,12 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile(
+            "test/srt/kernels/dsa/test_compute_topk_pages.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/constrained/test_grammar_backend.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_dp_feature_parity.py",
@@ -344,6 +352,13 @@ suites = {
         TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
         TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
+        TestFile("python/sgl_jax/test/kernels/test_mhc_tune.py", 0.1, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/layers/test_deepseek_v4_mhc.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,

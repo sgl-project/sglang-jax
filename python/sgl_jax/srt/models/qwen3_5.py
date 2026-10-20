@@ -17,9 +17,10 @@ Key conventions confirmed against the upstream torch reference
 * MoE mirrors qwen2_moe: ``GateLogit`` + ``TopK`` + ``FusedEPMoE`` routed path,
   plus a dense ``Qwen2MoeMLP`` shared expert gated by ``sigmoid(shared_gate)``.
 * GDN fuses HF's 4 in-proj keys into 2 JAX projections
-  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]); the model reshards
-  the sliced q/k/v/z/a/b to ``P("data","tensor")`` so each TP rank sees its
-  head-striped shard (the GDN backend's ``shard_map`` contract). The conv1d
+  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]) as
+  ``MergedColumnParallelLinear``s, so each TP rank holds its own heads of each
+  component and splits q/k/v/z/a/b locally (the GDN backend's ``shard_map``
+  contract). The conv1d
   weight is stripe-rearranged at load time (see the weight loader in P3).
 """
 
@@ -40,7 +41,12 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.embeddings import Embed, MRotaryEmbedding, ParallelLMHead
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import (
+    LinearBase,
+    MergedColumnParallelLinear,
+    split_merged_output,
+    stripe_merged_weight,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -234,26 +240,24 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
 
         self.key_dim = self.num_k_heads * self.head_k_dim  # 2048
         self.value_dim = self.num_v_heads * self.head_v_dim  # 4096
-        qkvz_out = 2 * self.key_dim + 2 * self.value_dim  # 12288 = [Q|K|V|Z]
-        ba_out = 2 * self.num_v_heads  # 64 = [B|A]
         conv_dim = 2 * self.key_dim + self.value_dim  # 8192 = [Q|K|V]
+        self.qkvz_sizes = (self.key_dim, self.key_dim, self.value_dim, self.value_dim)
+        self.ba_sizes = (self.num_v_heads, self.num_v_heads)
 
-        self.in_proj_qkvz = LinearBase(
+        self.in_proj_qkvz = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=qkvz_out,
+            output_sizes=self.qkvz_sizes,
             mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, "tensor"),
             scope_name="in_proj_qkvz",
         )
-        self.in_proj_ba = LinearBase(
+        self.in_proj_ba = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=ba_out,
+            output_sizes=self.ba_sizes,
             mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, "tensor"),
             scope_name="in_proj_ba",
         )
         # conv1d is a parameter container only (never called); weight laid out
@@ -304,11 +308,6 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             dt_bias=self.dt_bias,
         )
 
-    def _shard_dt(self, x):
-        # Reshard a sliced [T, C] tensor so its channel axis is head-striped
-        # across "tensor" (each TP rank gets its head shard). No-op at TP=1.
-        return jax.sharding.reshard(x, P("data", "tensor"))
-
     def _norm_gate(self, core_out, z):
         """Per-head RMSNorm over head_v_dim, then a silu(z) gate (silu, NOT the
         sigmoid of torch RMSNormGated). A method so the activation is unit-tested.
@@ -333,13 +332,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
         ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
 
-        kd, vd = self.key_dim, self.value_dim
-        q = self._shard_dt(qkvz[:, :kd])
-        k = self._shard_dt(qkvz[:, kd : 2 * kd])
-        v = self._shard_dt(qkvz[:, 2 * kd : 2 * kd + vd])
-        z = self._shard_dt(qkvz[:, 2 * kd + vd :])
-        b = self._shard_dt(ba[:, : self.num_v_heads])
-        a = self._shard_dt(ba[:, self.num_v_heads :])
+        q, k, v, z = split_merged_output(qkvz, self.qkvz_sizes, self.mesh)
+        b, a = split_merged_output(ba, self.ba_sizes, self.mesh)
 
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
         # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
@@ -694,8 +688,14 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         gdn = self.language_model.model.layers[layer_idx].self_attn
         conv = self._stripe_conv(conv.reshape(conv.shape[0], conv.shape[-1]), gdn, tp)
         return (
-            self._put(np.concatenate((qkv, z), axis=0).T, (None, "tensor")),
-            self._put(np.concatenate((b, a), axis=0).T, (None, "tensor")),
+            self._put(
+                stripe_merged_weight(np.concatenate((qkv, z), axis=0).T, gdn.qkvz_sizes, tp),
+                (None, "tensor"),
+            ),
+            self._put(
+                stripe_merged_weight(np.concatenate((b, a), axis=0).T, gdn.ba_sizes, tp),
+                (None, "tensor"),
+            ),
             self._put(conv, ("tensor", None)),
         )
 

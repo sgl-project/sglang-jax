@@ -88,6 +88,10 @@ class ForwardMode(IntEnum):
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
+    def is_spec_extend(self):
+        """Extend-shaped speculative batch (TARGET_VERIFY or DRAFT_EXTEND)."""
+        return self == ForwardMode.TARGET_VERIFY or self == ForwardMode.DRAFT_EXTEND
+
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
