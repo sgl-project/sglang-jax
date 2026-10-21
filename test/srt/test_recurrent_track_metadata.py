@@ -158,8 +158,6 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         self.assertEqual(req.recurrent_last_track_seqlen, 128)
 
     def test_builder_returns_none_when_no_boundary(self):
-        # No-boundary fast path: return None so recurrent backends take their
-        # no-tracking path instead of a full all-false-mask pool scatter.
         reqs = [
             _FakeReq(extend_input_len=100, buffer=[40, 41]),
             _FakeReq(extend_input_len=50, buffer=[42, 43]),
@@ -173,7 +171,6 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         self.assertTrue(all(r.recurrent_last_track_seqlen is None for r in reqs))
 
     def test_builder_returns_arrays_when_any_boundary(self):
-        # Mixed batch: one req on a boundary -> real arrays with a 0/1 mask.
         reqs = [
             _FakeReq(extend_input_len=100, buffer=[40, 41]),  # misses
             _FakeReq(extend_input_len=128, buffer=[42, 43]),  # hits
