@@ -918,7 +918,7 @@ def _recurrent_track_entry(
 def _build_recurrent_track_entries(
     reqs: list[Req], final_seq_lens: list[int], *, interval: int, pool, is_extend: bool
 ):
-    """Build fixed-shape track indices and a 0/1 boundary mask."""
+    """Build fixed-shape track indices and a 0/1 boundary mask; (None, None) if no request hits a boundary."""
     indices: list[int] = []
     mask: list[int] = []
     for req, final_seq_len in zip(reqs, final_seq_lens):
@@ -927,6 +927,8 @@ def _build_recurrent_track_entries(
         )
         indices.append(entry.track_index)
         mask.append(1 if entry.track_mask else 0)
+    if not any(mask):
+        return None, None
     return (
         np.asarray(indices, dtype=np.int32),
         np.asarray(mask, dtype=np.int32),

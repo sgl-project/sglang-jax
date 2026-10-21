@@ -157,7 +157,7 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         self.assertEqual(req.recurrent_next_track_idx, 0)
         self.assertEqual(req.recurrent_last_track_seqlen, 128)
 
-    def test_builder_returns_zero_arrays_when_no_boundary(self):
+    def test_builder_returns_none_when_no_boundary(self):
         reqs = [
             _FakeReq(extend_input_len=100, buffer=[40, 41]),
             _FakeReq(extend_input_len=50, buffer=[42, 43]),
@@ -165,10 +165,21 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         indices, mask = _build_recurrent_track_entries(
             reqs, [200, 150], interval=128, pool=_PingPongPool(), is_extend=True
         )
-        np.testing.assert_array_equal(indices, np.zeros(2, dtype=np.int32))
-        np.testing.assert_array_equal(mask, np.zeros(2, dtype=np.int32))
+        self.assertIsNone(indices)
+        self.assertIsNone(mask)
         # No req mutated when nothing hit a boundary.
         self.assertTrue(all(r.recurrent_last_track_seqlen is None for r in reqs))
+
+    def test_builder_returns_arrays_when_any_boundary(self):
+        reqs = [
+            _FakeReq(extend_input_len=100, buffer=[40, 41]),  # misses
+            _FakeReq(extend_input_len=128, buffer=[42, 43]),  # hits
+        ]
+        indices, mask = _build_recurrent_track_entries(
+            reqs, [200, 256], interval=128, pool=_PingPongPool(), is_extend=True
+        )
+        np.testing.assert_array_equal(indices, np.array([0, 42], dtype=np.int32))
+        np.testing.assert_array_equal(mask, np.array([0, 1], dtype=np.int32))
 
     def test_builder_padded_one_shot_on_boundary(self):
         reqs = [
