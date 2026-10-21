@@ -1,17 +1,48 @@
+import functools
 import logging
 from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.utils.quantization.quantization_utils import is_int4_dtype
 
 from .specs import WeightSpec
 
 logger = logging.getLogger(__name__)
+
+
+@functools.partial(jax.jit, static_argnames=("target_dtype", "do_transpose"))
+def unpack_4bit_jax(
+    lazy_weight: jax.Array,
+    target_dtype: jnp.dtype,
+    do_transpose: bool = False,
+) -> jax.Array:
+    if lazy_weight.dtype in [jnp.int32, jnp.uint32]:
+        shifts = jnp.arange(0, 32, 4, dtype=jnp.int32)
+        unpacked = (lazy_weight[..., None] >> shifts) & 0x0F
+        unpacked = jnp.reshape(unpacked, lazy_weight.shape[:-1] + (lazy_weight.shape[-1] * 8,))
+    else:
+        unpacked = jnp.stack([lazy_weight & 0x0F, lazy_weight >> 4], axis=-1)
+        unpacked = jnp.reshape(unpacked, lazy_weight.shape[:-1] + (lazy_weight.shape[-1] * 2,))
+
+    int4_dtype = getattr(jnp, "int4", getattr(ml_dtypes, "int4", None))
+    # Compressed-tensors stores signed 4-bit weights offset by +8.
+    unpacked_signed = unpacked.astype(jnp.int8) - 8
+    if int4_dtype is not None and target_dtype == int4_dtype:
+        final_array = unpacked_signed.astype(int4_dtype)
+    else:
+        final_array = unpacked_signed.astype(target_dtype)
+
+    if do_transpose:
+        final_array = jnp.transpose(final_array, (0, 2, 1))
+
+    return final_array
 
 
 class TensorLayout:
@@ -260,6 +291,12 @@ class TensorLayout:
         targets: dict[str, jax.ShapeDtypeStruct],
     ) -> tuple[jax.Array, ...]:
         """Return converted values in target_path order, preserving FP8 storage."""
+        if (
+            isinstance(mapping.target_path, str)
+            and is_int4_dtype(targets[mapping.target_path].dtype)
+            and weight.dtype in (jnp.int32, jnp.uint32, jnp.int8, jnp.uint8)
+        ):
+            weight = unpack_4bit_jax(weight, targets[mapping.target_path].dtype)
         if mapping.transpose_axes is not None and not hf_key.endswith(".bias"):
             weight = jnp.transpose(weight, mapping.transpose_axes)
         elif mapping.transpose and not hf_key.endswith(".bias"):
@@ -270,6 +307,17 @@ class TensorLayout:
 
     def transform_experts(self, weight, mapping, target):
         """Finish an already-stacked expert tensor using the same path during tracing."""
+        if is_int4_dtype(target.dtype) and weight.dtype in (
+            jnp.int32,
+            jnp.uint32,
+            jnp.int8,
+            jnp.uint8,
+        ):
+            weight = unpack_4bit_jax(
+                weight,
+                target.dtype,
+                do_transpose=mapping.transpose,
+            )
         if mapping.reshape is not None:
             weight = jnp.reshape(weight, mapping.reshape)
         if mapping.repeat is not None:

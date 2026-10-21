@@ -34,6 +34,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Draft architectures whose draft worker holds exactly ONE decoder layer: the NextN /
+# MTP heads (``*ForCausalLMNextN``, ``MiMoMTPForCausalLM``, ``MiMoV2MTPForCausalLM``,
+# ``Qwen3NextForCausalLMMTP``). Multi-layer MTP models (MiMo-V2-Flash) instantiate one
+# worker per layer, so the per-worker count is still 1. Everything else (DFlash,
+# Eagle3) sizes its KV pool from its own ``num_hidden_layers``.
+_SINGLE_LAYER_DRAFT_SUFFIXES = ("NextN", "MTPForCausalLM", "ForCausalLMMTP")
+
+
+def is_single_layer_draft_arch(hf_config) -> bool:
+    archs = getattr(hf_config, "architectures", None) or []
+    arch = archs[0] if archs else ""
+    return arch.endswith(_SINGLE_LAYER_DRAFT_SUFFIXES)
+
+
 def _compute_recurrent_per_req_bytes(
     num_layers: int,
     num_heads: int,
@@ -472,6 +486,21 @@ class ModelRunnerKVCacheMixin:
         available_kv_cache_bytes = self._profile_available_bytes(total_device_memory)
 
         cell_size = self._compute_cell_size()
+
+        # Accommodate Draft KV Cache Memory Footprint + Spec Headroom
+        if (
+            not self.is_draft_worker
+            and self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+        ):
+            # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
+            overhead_bytes = 1 * 1024 * 1024 * 1024
+            logger.info(
+                "Deducting %d bytes from available KV cache for draft memory overhead",
+                overhead_bytes,
+            )
+            available_kv_cache_bytes -= overhead_bytes
+
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
 
         logger.info(
@@ -530,10 +559,27 @@ class ModelRunnerKVCacheMixin:
             token_capacity = min(token_capacity, max_total_tokens)
 
         # Page alignment
-        token_capacity = token_capacity // self.server_args.page_size * self.server_args.page_size
+        token_capacity = (token_capacity // self.server_args.page_size) * self.server_args.page_size
 
         # DP scale
         token_capacity = token_capacity * dp_size
+
+        # Data mesh sharding alignment on total allocated pages (including dp_size reserved pages)
+        if hasattr(self, "mesh") and self.mesh is not None and "data" in self.mesh.shape:
+            data_mesh_dim = self.mesh.shape["data"]
+            if data_mesh_dim > 1:
+                usable_pages = token_capacity // self.server_args.page_size
+                allocated_pages = usable_pages + dp_size
+                step = math.lcm(dp_size, data_mesh_dim)
+                allocated_pages = (allocated_pages // step) * step
+                usable_pages = allocated_pages - dp_size
+                if usable_pages <= 0:
+                    raise RuntimeError(
+                        "Not enough KV cache capacity to align allocated pages "
+                        f"to data={data_mesh_dim} with dp_size={dp_size} reserved pages."
+                    )
+                token_capacity = usable_pages * self.server_args.page_size
+
         logger.info(
             "ModelRunner per dp max_total_num_tokens after dp_size %s: %s",
             dp_size,
@@ -971,6 +1017,14 @@ class ModelRunnerKVCacheMixin:
 
         For hybrid recurrent models, only full-attention layers need KV cache.
         """
+
+        if getattr(self, "is_draft_worker", False) and is_single_layer_draft_arch(
+            self.model_config.hf_config
+        ):
+            # NextN / MTP predictors: one decoder layer per draft worker. Other draft
+            # models (DFlash: 5 layers) keep their real layer count (#1639 review).
+            return 1
+
         cfg = self.linear_recurrent_config
         if cfg is not None:
             return len(cfg.full_attention_layer_ids)

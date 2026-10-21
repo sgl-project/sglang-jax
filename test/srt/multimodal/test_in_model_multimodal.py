@@ -33,6 +33,11 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     pack_vision_inputs,
     run_mrope_vision_model,
 )
+from sgl_jax.srt.multimodal.in_model.mm_utils import (
+    ItemTask,
+    MergeMapping,
+    gather_merge,
+)
 
 
 def _mesh(dp=1, tp=1):
@@ -89,7 +94,17 @@ class _EchoModel(InModelMultimodalContract):
     def get_multimodal_encode_funcs(self):
         def encode(lanes):
             self.calls += 1
-            result = jnp.asarray(np.concatenate([item.feature for lane in lanes for item in lane]))
+            capacity = _bucket_capacity(
+                max(sum(len(item.feature) for item in lane) for lane in lanes), 1
+            )
+            width = next(item.feature.shape[1] for lane in lanes for item in lane)
+            values = np.full((len(lanes), capacity, width), np.nan, dtype=np.float32)
+            for lane_index, lane in enumerate(lanes):
+                offset = 0
+                for item in lane:
+                    values[lane_index, offset : offset + len(item.feature)] = item.feature
+                    offset += len(item.feature)
+            result = jnp.asarray(values.reshape(-1, width))
             return (
                 jax.device_put(result, NamedSharding(self.mesh, PartitionSpec()))
                 if self.mesh is not None
@@ -181,9 +196,9 @@ def test_forward_reencodes_cache_hit_evicted_after_scheduling():
 
 @pytest.mark.parametrize("destination", [-1, 4])
 def test_merge_rejects_mappings_outside_chunk(destination):
-    task = orchestration.ItemTask(_item(), 1, [orchestration.MergeMapping(0, destination, 1)])
+    task = ItemTask(_item(), 1, [MergeMapping(0, destination, 1)])
     with pytest.raises(ValueError, match="exceeds"):
-        orchestration._gather_merge(jnp.zeros((4, 1)), jnp.ones((1, 1)), [task], None)
+        gather_merge(jnp.zeros((4, 1)), jnp.ones((1, 1)), [task], None)
 
 
 def _vision(model_type, mesh, tensor_parallel):
@@ -254,7 +269,6 @@ def test_packed_encoder_matches_individual_images_with_padding_and_empty_lanes(
             ]
         )
     np.testing.assert_allclose(packed[: len(expected)], expected, rtol=2e-5, atol=2e-5)
-    np.testing.assert_array_equal(packed[len(expected) :], 0)
     assert packed.shape[1] == (16 if model_type == "qwen3" else 8)
 
 
@@ -356,7 +370,7 @@ def test_retracted_prefill_continues_mrope_positions_past_prompt():
 
 @pytest.mark.parametrize("num_lanes", [1, 2, 4])
 @pytest.mark.parametrize("grids", [[(4, 2, 4), (1, 2, 2)], [(1, 2, 2), (3, 2, 4), (1, 4, 4)]])
-def test_temporal_pooling_restores_item_order(grids, num_lanes):
+def test_temporal_pooling_preserves_lane_layout(grids, num_lanes):
     # An independent, per-item mean encoder isolates packing from attention.
     class MeanEncoder:
         def prepare_metadata(self, grid_thw, capacity, *, sharding):
@@ -413,5 +427,14 @@ def test_temporal_pooling_restores_item_order(grids, num_lanes):
             MeanEncoder(), items_per_lane, pool_temporal_dimension=True, **kwargs
         )
     )
-    np.testing.assert_allclose(actual[: len(expected)], expected)
-    np.testing.assert_array_equal(actual[len(expected) :], 0)
+    lane_capacity = len(actual) // num_lanes
+    valid = np.concatenate(
+        [
+            actual[
+                lane_index * lane_capacity : lane_index * lane_capacity
+                + sum(end - start for item in lane for start, end in item.placeholder_ranges)
+            ]
+            for lane_index, lane in enumerate(items_per_lane)
+        ]
+    )
+    np.testing.assert_allclose(valid, expected)
