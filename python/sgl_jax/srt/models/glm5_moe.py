@@ -84,6 +84,87 @@ def _load_shared_expert(inputs, *, mesh, quantized_dtype):
 # No-op: FP32 accumulation logic removed to keep native BF16 execution.
 
 
+def moe_router(config, mesh, layer_id: int) -> tuple[GateLogit, TopK]:
+    """GLM-5.x router: sigmoid gate with expert bias, grouped top-k."""
+    gate = GateLogit(
+        input_size=config.hidden_size,
+        num_experts=config.n_routed_experts,
+        enable_expert_bias=True,
+        weight_dtype=jnp.float32,
+        # GLM-5.x checkpoints ship the gate weight in BF16 and the
+        # e_score_correction_bias in F32: store both checkpoint-native,
+        # keep the router dot in f32 (unchanged numerics).
+        kernel_dtype=jnp.bfloat16,
+        compute_dtype=jnp.float32,
+        bias_dtype=jnp.float32,
+        score_func=getattr(config, "scoring_func", "sigmoid"),
+    )
+    topk = TopK(
+        topk=config.num_experts_per_tok,
+        renormalize=config.norm_topk_prob,
+        num_expert_group=getattr(config, "n_group", 1),
+        topk_group=getattr(config, "topk_group", 1),
+        routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+        layer_id=layer_id,
+        mesh=mesh,
+    )
+    return gate, topk
+
+
+def fused_v2_moe(config, mesh, layer_id: int, dtype, num_shared_experts: int) -> FusedEPMoEV2:
+    """Routed (+ in-kernel shared) experts on the fused v2 kernel. A block-FP8 checkpoint's
+    shared-expert scales get block-scale params, requantized per channel at load
+    (Glm5ForCausalLM.prepare_weight_loading)."""
+    quant_config = getattr(config, "quantization_config", None)
+    n_group = getattr(config, "n_group", 1)
+    mlp = FusedEPMoEV2(
+        hidden_size=config.hidden_size,
+        num_experts=config.n_routed_experts,
+        num_experts_per_tok=config.num_experts_per_tok,
+        intermediate_dim=config.moe_intermediate_size,
+        mesh=mesh,
+        ep_size=getattr(config, "ep_size", 1),
+        weight_dtype=dtype,
+        dtype=dtype,
+        layer_id=layer_id,
+        renormalize_topk_logits=config.norm_topk_prob,
+        routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+        use_grouped_topk=n_group > 1,
+        num_groups=n_group,
+        top_k_groups=getattr(config, "topk_group", 1),
+        num_shared_experts=num_shared_experts,
+        moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+        quantization_config=quant_config,
+    )
+    block_size = getattr(quant_config, "weight_block_size", None)
+    if (
+        num_shared_experts
+        and getattr(quant_config, "is_static_checkpoint", False)
+        and block_size is not None
+    ):
+        block_n, block_k = map(int, block_size)
+        hidden = config.hidden_size
+        inter = config.moe_intermediate_size * num_shared_experts
+        for name, (rows, cols) in (
+            ("w1_shared", (inter, hidden)),
+            ("w3_shared", (inter, hidden)),
+            ("w2_shared", (hidden, inter)),
+        ):
+            if rows % block_n or cols % block_k:
+                raise ValueError(
+                    f"{name} {rows}x{cols} must be divisible by weight_block_size={block_size}"
+                )
+            setattr(
+                mlp,
+                f"{name}_block_scale",
+                nnx.Param(
+                    jnp.zeros((rows // block_n, cols // block_k), dtype=jnp.float32),
+                    out_sharding=P(None, None),
+                ),
+            )
+    return mlp
+
+
 class GlmNorm(nnx.Module):
     def __init__(self, dim: int, dtype: jnp.dtype = jnp.bfloat16):
         self.weight = nnx.Param(jnp.ones((dim,), dtype=dtype))
@@ -114,10 +195,18 @@ class GlmDsaIndexer(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         scope_name: str = "indexer",
+        rope_dim: int = 64,
+        index_kpool: int = 1,
     ):
         self.head_dim = index_head_dim
         self.n_head = index_n_heads
         self.mesh = mesh
+        self.rope_dim = rope_dim
+        # GLM-5.3-Flash KPool: every `index_kpool` consecutive token keys are softmax-pooled into one
+        # slot (weighted by a per-token gate plus a position embedding `ape`). GLM-5.1/5.2 leave it
+        # at 1 and keep the token-level indexer.
+        self.index_kpool = index_kpool
+        self.use_kpool = index_kpool > 1
 
         self.wq_b = LinearBase(
             input_size=q_lora_rank,
@@ -149,6 +238,26 @@ class GlmDsaIndexer(nnx.Module):
             scope_name="weights_proj",
         )
 
+        if self.use_kpool:
+            # Compress gate: per-token, per-dimension logit (hidden -> index_head_dim), matching
+            # `glm53.model.mla_project` (`ng = x @ gate`, shape [T, ihd]).
+            self.index_kpool_compress_gate = LinearBase(
+                input_size=hidden_size,
+                output_size=index_head_dim,
+                use_bias=False,
+                kernel_axes=(None, None),
+                params_dtype=dtype,
+                mesh=mesh,
+                scope_name="index_kpool_compress_gate",
+            )
+            # Position embedding added to each pool member's gate before the softmax: [kpool, ihd].
+            self.kpool_ape = nnx.Param(
+                jnp.zeros((index_kpool, index_head_dim), dtype=dtype, out_sharding=P(None, None))
+            )
+        else:
+            self.index_kpool_compress_gate = None
+            self.kpool_ape = None
+
     def project(
         self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -156,6 +265,8 @@ class GlmDsaIndexer(nnx.Module):
 
         Returns query [T, n_head, head_dim], key [T, head_dim], weights [T, n_head]
         after RoPE + Hadamard, ready for the DSA backend's streamindex_topk.
+        With KPool, key is [T, 2 * head_dim]: the raw key and its per-dim pool gate
+        logit; the DSA backend pools keys in the paged cache.
         """
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
@@ -163,24 +274,39 @@ class GlmDsaIndexer(nnx.Module):
         key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
-        rope_dim = 64
-        q_rope = query[:, :, :rope_dim]
-        k_rope = key[:, :rope_dim][:, None, :]
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        if _INDEXER_ROPE_CONCAT:
-            # concat instead of at[].set: avoids a read-modify-write of the
-            # full [T, n_head, head_dim] tensor (values are identical).
-            query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
-            key = jnp.concatenate((k_rope.squeeze(1), key[:, rope_dim:]), axis=-1)
-        else:
-            query = query.at[:, :, :rope_dim].set(q_rope)
-            key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
-
-        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        rope_dim = self.rope_dim
+        if rope_dim > 0:
+            q_rope = query[:, :, :rope_dim]
+            k_rope = key[:, :rope_dim][:, None, :]
+            q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+            if _INDEXER_ROPE_CONCAT:
+                # concat instead of at[].set: avoids a read-modify-write of the
+                # full [T, n_head, head_dim] tensor (values are identical).
+                query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
+                key = jnp.concatenate((k_rope.squeeze(1), key[:, rope_dim:]), axis=-1)
+            else:
+                query = query.at[:, :, :rope_dim].set(q_rope)
+                key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
         weights, _ = self.weights_proj(hidden_states)
+
+        if self.use_kpool:
+            # KPool: the DSA backend pools keys in the paged cache (pools span forwards), so
+            # emit raw keys with their per-dim gate logits (gate + pool-slot APE). Keys are
+            # pooled before any rotation, and the Hadamard is skipped on both sides: it is
+            # orthogonal, so it leaves q.k unchanged and only matters for FP8 index caches.
+            gate, _ = self.index_kpool_compress_gate(hidden_states)  # [T, ihd]
+            # APE of each token's slot in its pool (one-hot matmul: no sharded gather).
+            slot = jax.nn.one_hot(
+                jnp.mod(positions, self.index_kpool), self.index_kpool, dtype=jnp.float32
+            )
+            gate = gate.astype(jnp.float32) + slot @ self.kpool_ape.value.astype(jnp.float32)
+            key = jnp.concatenate([key.astype(jnp.float32), gate], axis=-1).astype(key.dtype)
+            return query, key, weights
+
+        h_matrix = get_hadamard_matrix(self.head_dim) * (self.head_dim**-0.5)
+        query = jnp.einsum("thd,de->the", query, h_matrix)
+        key = jnp.einsum("td,de->te", key, h_matrix)
         return query, key, weights
 
     def __call__(
@@ -193,25 +319,26 @@ class GlmDsaIndexer(nnx.Module):
         key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
-        # Apply RoPE
-        rope_dim = 64
-        q_rope = query[:, :, :rope_dim]
-        k_rope = key[:, :rope_dim]
-        k_rope = k_rope[:, None, :]  # Add head dim for RoPE
+        # Apply RoPE (skipped for NoPE indexers, matching `project`)
+        rope_dim = self.rope_dim
+        if rope_dim > 0:
+            q_rope = query[:, :, :rope_dim]
+            k_rope = key[:, :rope_dim]
+            k_rope = k_rope[:, None, :]  # Add head dim for RoPE
 
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        k_rope = k_rope.squeeze(1)  # Remove head dim
+            q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+            k_rope = k_rope.squeeze(1)  # Remove head dim
 
-        if _INDEXER_ROPE_CONCAT:
-            query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
-            key = jnp.concatenate((k_rope, key[:, rope_dim:]), axis=-1)
-        else:
-            query = query.at[:, :, :rope_dim].set(q_rope)
-            key = key.at[:, :rope_dim].set(k_rope)
+            if _INDEXER_ROPE_CONCAT:
+                query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
+                key = jnp.concatenate((k_rope, key[:, rope_dim:]), axis=-1)
+            else:
+                query = query.at[:, :, :rope_dim].set(q_rope)
+                key = key.at[:, :rope_dim].set(k_rope)
 
         # Apply Hadamard Transform
-        h_matrix = get_hadamard_matrix(128)
-        h_matrix = h_matrix * (128**-0.5)
+        h_matrix = get_hadamard_matrix(self.head_dim)
+        h_matrix = h_matrix * (self.head_dim**-0.5)
 
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
@@ -257,6 +384,14 @@ class Glm5Attention(nnx.Module):
         has_indexer: bool = True,
         indexer_type: str = "full",
         use_dsa_sparse: bool = False,
+        q_lora_rank: int = 2048,
+        kv_lora_rank: int = 512,
+        qk_nope_head_dim: int = 192,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 256,
+        index_head_dim: int = 128,
+        index_n_heads: int = 32,
+        index_kpool: int = 1,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -266,20 +401,24 @@ class Glm5Attention(nnx.Module):
         self.indexer_type = indexer_type
         self.use_dsa_sparse = use_dsa_sparse
 
-        self.qk_nope_head_dim = 192
-        self.qk_rope_head_dim = 64
-        self.qk_head_dim = 256
-        self.v_head_dim = 256
-        self.kv_lora_rank = 512
-        self.q_lora_rank = 2048
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.kv_lora_rank = kv_lora_rank
+        self.q_lora_rank = q_lora_rank
 
-        self.scaling = 256**-0.5
+        self.scaling = self.qk_head_dim**-0.5
 
         self.use_qk_norm = use_qk_norm
 
         if use_qk_norm:
-            self.q_norm = RMSNorm(256, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm")
-            self.k_norm = RMSNorm(256, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm")
+            self.q_norm = RMSNorm(
+                self.qk_nope_head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
+            )
+            self.k_norm = RMSNorm(
+                self.qk_nope_head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm"
+            )
         else:
             self.q_norm = None
             self.k_norm = None
@@ -342,11 +481,13 @@ class Glm5Attention(nnx.Module):
             self.indexer = GlmDsaIndexer(
                 hidden_size=hidden_size,
                 q_lora_rank=self.q_lora_rank,
-                index_head_dim=128,
-                index_n_heads=32,
+                index_head_dim=index_head_dim,
+                index_n_heads=index_n_heads,
                 mesh=mesh,
                 dtype=dtype,
                 scope_name="indexer",
+                rope_dim=self.qk_rope_head_dim,
+                index_kpool=index_kpool,
             )
         else:
             self.indexer = None
@@ -501,7 +642,10 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["dsa_topk_reuse"] = dsa_topk_reuse
             if self.indexer is not None:
                 q_idx, k_idx, idx_w = self.indexer.project(
-                    hidden_states, q_compressed, positions, self.rotary_emb
+                    hidden_states,
+                    q_compressed,
+                    positions,
+                    self.rotary_emb,
                 )
                 dsa_kwargs["q_idx"] = q_idx
                 dsa_kwargs["k_idx"] = k_idx
@@ -516,8 +660,11 @@ class Glm5Attention(nnx.Module):
         compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
         compressed = self.kv_a_layernorm(compressed)
 
-        k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        if self.qk_rope_head_dim > 0:
+            k_rope = k_rope.reshape(-1, 1, self.qk_rope_head_dim)
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        # NoPE (qk_rope_head_dim == 0): q_rope/k_rope stay empty; the absorbed MLA path treats the latent
+        # as the whole of k (GLM-5.3-Flash).
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
@@ -541,10 +688,16 @@ class Glm5MLP(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
         use_fused: bool = True,
+        swiglu_limit: float | None = None,
     ) -> None:
         self.layer_id = layer_id
         self.mesh = mesh
         self.use_fused = use_fused
+        # silu_and_mul_clamp (upstream DeepseekV2MLP): gate <= limit, |up| <= limit. Only the
+        # unfused path applies it.
+        if use_fused and swiglu_limit is not None:
+            raise ValueError("swiglu_limit needs use_fused=False")
+        self.swiglu_limit = None if swiglu_limit is None else float(swiglu_limit)
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -665,6 +818,9 @@ class Glm5MLP(nnx.Module):
         # Fallback non-fused path
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
+        if self.swiglu_limit is not None:
+            a1 = jnp.minimum(a1, self.swiglu_limit)
+            a2 = jnp.clip(a2, -self.swiglu_limit, self.swiglu_limit)
         intermediate_parallel = a2 * self.act_fn(a1)
         if getattr(self.down_proj, "kernel_axes", (None, None))[0] is None:
             # Block-quantized down_proj whose reduce dim does not split into whole
@@ -756,99 +912,17 @@ class Glm5DecoderLayer(nnx.Module):
             self.is_moe_layer = False
             self.moe_gate = None
         else:
-            router_dtype = jnp.float32
-            self.moe_gate = GateLogit(
-                input_size=config.hidden_size,
-                num_experts=config.n_routed_experts,
-                enable_expert_bias=True,
-                weight_dtype=router_dtype,
-                # GLM-5.2 checkpoints ship the gate weight in BF16 and the
-                # e_score_correction_bias in F32: store both checkpoint-native,
-                # keep the router dot in f32 (unchanged numerics).
-                kernel_dtype=jnp.bfloat16,
-                compute_dtype=jnp.float32,
-                bias_dtype=jnp.float32,
-                score_func=getattr(config, "scoring_func", "sigmoid"),
-            )
+            self.moe_gate, self.topk = moe_router(config, mesh, layer_id)
 
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
             self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
             num_shared_experts = getattr(config, "n_shared_experts", 0)
             use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
 
-            self.topk = TopK(
-                topk=config.num_experts_per_tok,
-                renormalize=config.norm_topk_prob,
-                num_expert_group=getattr(config, "n_group", 1),
-                topk_group=getattr(config, "topk_group", 1),
-                routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-                layer_id=layer_id,
-                mesh=mesh,
-            )
-
             if self.moe_backend == MoEBackend.FUSED_V2:
-                self.mlp = FusedEPMoEV2(
-                    hidden_size=config.hidden_size,
-                    num_experts=config.n_routed_experts,
-                    num_experts_per_tok=config.num_experts_per_tok,
-                    intermediate_dim=config.moe_intermediate_size,
-                    mesh=mesh,
-                    ep_size=getattr(config, "ep_size", 1),
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    layer_id=layer_id,
-                    renormalize_topk_logits=config.norm_topk_prob,
-                    routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-                    use_grouped_topk=getattr(config, "n_group", 1) > 1,
-                    num_groups=getattr(config, "n_group", 1),
-                    top_k_groups=getattr(config, "topk_group", 1),
-                    num_shared_experts=num_shared_experts if use_inkernel_se else 0,
-                    moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-                    quantization_config=getattr(config, "quantization_config", None),
+                self.mlp = fused_v2_moe(
+                    config, mesh, layer_id, dtype, num_shared_experts if use_inkernel_se else 0
                 )
-
-                quant_config = getattr(config, "quantization_config", None)
-                weight_block_size = (
-                    getattr(quant_config, "weight_block_size", None) if quant_config else None
-                )
-                if (
-                    use_inkernel_se
-                    and getattr(quant_config, "is_static_checkpoint", False)
-                    and weight_block_size is not None
-                ):
-                    block_n, block_k = map(int, weight_block_size)
-                    shared_intermediate = config.moe_intermediate_size * num_shared_experts
-                    if (
-                        config.hidden_size % block_k
-                        or shared_intermediate % block_n
-                        or config.hidden_size % block_n
-                        or shared_intermediate % block_k
-                    ):
-                        raise ValueError(
-                            "GLM-5.2 shared-expert dimensions must be divisible by "
-                            f"weight_block_size={weight_block_size}"
-                        )
-                    self.mlp.w1_shared_block_scale = nnx.Param(
-                        jnp.zeros(
-                            (shared_intermediate // block_n, config.hidden_size // block_k),
-                            dtype=jnp.float32,
-                        ),
-                        out_sharding=P(None, None),
-                    )
-                    self.mlp.w3_shared_block_scale = nnx.Param(
-                        jnp.zeros(
-                            (shared_intermediate // block_n, config.hidden_size // block_k),
-                            dtype=jnp.float32,
-                        ),
-                        out_sharding=P(None, None),
-                    )
-                    self.mlp.w2_shared_block_scale = nnx.Param(
-                        jnp.zeros(
-                            (config.hidden_size // block_n, shared_intermediate // block_k),
-                            dtype=jnp.float32,
-                        ),
-                        out_sharding=P(None, None),
-                    )
             elif self.use_fused:
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
@@ -1208,8 +1282,10 @@ class Glm5ForCausalLM(nnx.Module):
         is_mlp_layer: bool,
         is_static_quant: bool = False,
         has_indexer: bool = True,
+        hf_prefix: str = "model.layers",
+        unquantized: frozenset[str] = frozenset(),
     ) -> dict:
-        prefix = f"model.layers.{target_idx}"
+        prefix = f"{hf_prefix}.{target_idx}"
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
@@ -1234,7 +1310,7 @@ class Glm5ForCausalLM(nnx.Module):
             block-wise weight_scale_inv sidecar. force_unquant covers modules in
             the FP8 checkpoint's modules_to_not_convert (indexer.weights_proj).
             """
-            if force_unquant or not is_static_quant:
+            if force_unquant or not is_static_quant or tgt in unquantized:
                 mappings[f"{hf}.weight"] = WeightSpec(
                     target_path=f"{tgt}.weight", sharding=sharding_std, transpose=True
                 )

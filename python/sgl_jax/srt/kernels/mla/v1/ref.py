@@ -33,7 +33,12 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from sgl_jax.srt.kernels.mla.v2.kernel import align_to, cdiv, get_dtype_packing
+from sgl_jax.srt.kernels.mla.v2.kernel import (
+    align_rope_dim,
+    align_to,
+    cdiv,
+    get_dtype_packing,
+)
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
@@ -65,7 +70,7 @@ def update_kv_cache(
 ) -> tuple[jax.Array, jax.Array]:
     """Update KV cache with new tokens."""
     actual_r_dim = new_k_pe.shape[-1]
-    r_dim = align_to(actual_r_dim, 128)
+    r_dim = align_rope_dim(actual_r_dim)
     if actual_r_dim != r_dim:
         new_k_pe = jnp.pad(new_k_pe, ((0, 0), (0, r_dim - actual_r_dim)), constant_values=0)
     actual_lkv_dim = new_kv_c.shape[-1]
@@ -166,7 +171,7 @@ def ref_mla_ragged_paged_attention(
             constant_values=0,
         )
     actual_r_dim = q_pe.shape[-1]
-    r_dim = align_to(actual_r_dim, 128)
+    r_dim = align_rope_dim(actual_r_dim)
     if actual_r_dim != r_dim:
         q_pe = jnp.pad(q_pe, ((0, 0), (0, 0), (0, r_dim - actual_r_dim)), constant_values=0)
 
@@ -353,7 +358,7 @@ def static_validate_inputs(
     actual_lkv_dim = ql_nope.shape[2]
     actual_r_dim = q_pe.shape[2]
     lkv_dim = align_to(actual_lkv_dim, 128)
-    r_dim = align_to(actual_r_dim, 128)
+    r_dim = align_rope_dim(actual_r_dim)
 
     (
         _,

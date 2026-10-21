@@ -305,6 +305,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
         TestFile("test/srt/kernels/dsa/test_streamindex_topk.py", 3, runner="pytest"),
+        TestFile("test/srt/kernels/dsa/test_streamindex_live.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/qsa/test_sparse_gqa_parity.py", 1),
     ],
     # CPU-only unit tests — moved off the v6e-1 TPU runner to a dedicated
@@ -317,6 +318,24 @@ suites = {
     "unit-test-cpu": [
         TestFile(
             "test/srt/kernels/dsa/test_compute_topk_pages.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/configs/test_glm5_next_config.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/kernels/dsa/test_kpool_indexer.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/kernels/dsa/test_streamindex_live_batching.py",
             0.1,
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu"},

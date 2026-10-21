@@ -19,8 +19,15 @@ def build_index_share_map(
     indexer_types: list[str] | None,
     skip_offset: int,
     num_layers: int,
+    active_layers: set[int] | None = None,
 ) -> tuple[dict[int, int], dict[int, int], int]:
     """Static IndexShare layer→slot mapping.
+
+    Args:
+      active_layers: if given, only these layer_ids carry an indexer (e.g. the full-attention
+        layers of a KDA + DSA hybrid such as GLM-5.3-Flash). Layers outside the set are skipped
+        entirely (no slot allocated, no entry in the maps). Their indexer entries in
+        ``indexer_types`` are ignored. Default None = every layer participates (GLM-5.x / DeepSeek).
 
     Returns:
       full_slot: layer_id → slot_id for layers with indexer_type == "full"
@@ -36,6 +43,8 @@ def build_index_share_map(
     src_slot: dict[int, int] = {}
     last_slot = -1
     for layer_id, itype in enumerate(indexer_types):
+        if active_layers is not None and layer_id not in active_layers:
+            continue
         if itype == "full":
             last_slot = len(full_slot)
             full_slot[layer_id] = last_slot

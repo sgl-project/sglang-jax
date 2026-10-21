@@ -1583,9 +1583,9 @@ class MLATokenToKVPool(KVCache):
 
     @staticmethod
     def _aligned_latent_dims(kv_lora_rank: int, qk_rope_head_dim: int) -> tuple[int, int]:
-        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
+        from sgl_jax.srt.kernels.mla.v2.kernel import align_rope_dim, align_to
 
-        return align_to(kv_lora_rank, 128), align_to(qk_rope_head_dim, 128)
+        return align_to(kv_lora_rank, 128), align_rope_dim(qk_rope_head_dim)
 
     @staticmethod
     def _aligned_indexer_dim(indexer_key_dim: int) -> int:
@@ -1624,10 +1624,15 @@ class MLATokenToKVPool(KVCache):
     ) -> tuple[int, ...]:
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
+        width = cls._aligned_indexer_dim(indexer_key_dim)
+        # Wider-than-128 layouts (GLM-5.3 KPool: raw key/gate rows + pooled keys) keep a
+        # 128-wide minor dim and add rows per page instead, so the backend's per-page block
+        # views only split major dims (a free bitcast in the TPU tiled layout; changing the
+        # minor dims would force a full relayout copy of every layer's buffer).
         return get_kv_cache_shape(
             total_num_pages=total_num_pages,
-            page_size=page_size,
-            kv_dim=cls._aligned_indexer_dim(indexer_key_dim),
+            page_size=page_size * (width // 128) if width > 128 else page_size,
+            kv_dim=min(width, 128),
             kv_dtype=dtype,
         )
 
@@ -1996,6 +2001,13 @@ class HybridLinearKVPool(KVCache):
 
     def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         return self.full_kv_pool.get_fused_kv_buffer(self._to_physical(layer_id))
+
+    def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
+        """DSA indexer-key cache on the inner MLA pool.
+
+        `slot_id` is the DSA `full_slot`, not a global layer id, so it is forwarded unchanged.
+        """
+        return self.full_kv_pool.get_indexer_key_buffer(slot_id)
 
     def get_kv_buffer(self, layer_id: int):
         return self.full_kv_pool.get_kv_buffer(self._to_physical(layer_id))

@@ -27,6 +27,49 @@ from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttenti
 logger = logging.getLogger(__name__)
 
 
+def kda_attention_mappings(
+    hf_prefix: str, target: str, linear_attn_config: dict, *, a_log_shape=None
+) -> dict:
+    """Weights of one ``KimiDeltaAttention``: ``{hf_prefix}.self_attn.*`` -> ``{target}.*``.
+
+    Conv1d weights are stored (projection_size, 1, conv_size) and live under ``{target}.attn``
+    (RadixLinearAttention). ``a_log_shape`` reshapes a checkpoint A_log stored 1-D.
+    """
+    conv_size = linear_attn_config["short_conv_kernel_size"]
+    projection_size = linear_attn_config["num_heads"] * linear_attn_config["head_dim"]
+    src = f"{hf_prefix}.self_attn"
+    out = {}
+    for name in ("q_proj", "k_proj", "v_proj", "f_b_proj", "b_proj", "g_b_proj"):
+        out[f"{src}.{name}.weight"] = WeightSpec(
+            target_path=f"{target}.{name}.weight", sharding=(None, "tensor"), transpose=True
+        )
+    for name in ("f_a_proj", "g_a_proj"):
+        out[f"{src}.{name}.weight"] = WeightSpec(
+            target_path=f"{target}.{name}.weight", sharding=(None, None), transpose=True
+        )
+    out[f"{src}.o_proj.weight"] = WeightSpec(
+        target_path=f"{target}.o_proj.weight", sharding=("tensor", None), transpose=True
+    )
+    for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
+        out[f"{src}.{name}.weight"] = WeightSpec(
+            target_path=f"{target}.attn.{name}.weight",
+            sharding=("tensor", None),
+            transpose=False,
+            reshape=(projection_size, conv_size),
+        )
+    out[f"{src}.o_norm.weight"] = WeightSpec(
+        target_path=f"{target}.o_norm.weight", sharding=(None,), transpose=False
+    )
+    out[f"{src}.dt_bias"] = WeightSpec(
+        target_path=f"{target}.attn.dt_bias", sharding=("tensor",), transpose=False
+    )
+    a_log = dict(target_path=f"{target}.A_log", sharding=(None, None, "tensor", None))
+    if a_log_shape is not None:
+        a_log["reshape"] = a_log_shape
+    out[f"{src}.A_log"] = WeightSpec(transpose=False, **a_log)
+    return out
+
+
 class KimiMLP(nnx.Module):
     def __init__(
         self,
@@ -85,6 +128,7 @@ class KimiDeltaAttention(nnx.Module):
         layer_idx: int = 0,
         mesh: jax.sharding.Mesh | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
+        v_head_dim: int | None = None,
     ):
         self.mesh = mesh
 
@@ -95,7 +139,7 @@ class KimiDeltaAttention(nnx.Module):
         self.conv_size = linear_config["short_conv_kernel_size"]
         self.head_dim = linear_config["head_dim"]
         self.k_head_dim = self.head_dim
-        self.v_head_dim = getattr(config, "v_head_dim", None) or self.head_dim
+        self.v_head_dim = v_head_dim or getattr(config, "v_head_dim", None) or self.head_dim
         self.num_heads = linear_config["num_heads"]
         self.num_k_heads = self.num_heads
         self.num_v_heads = self.num_heads
@@ -696,59 +740,10 @@ class KimiLinearForCausalLM(nnx.Module):
 
         # --- Attention mappings ---
         if is_kda:
-            attn_target = f"{target_prefix}.self_attn"
-            for proj_name in (
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "f_b_proj",
-                "b_proj",
-                "g_b_proj",
-            ):
-                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightSpec(
-                    target_path=f"{attn_target}.{proj_name}.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
+            mappings.update(
+                kda_attention_mappings(
+                    prefix, f"{target_prefix}.self_attn", self.config.linear_attn_config
                 )
-            for proj_name in ("f_a_proj", "g_a_proj"):
-                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightSpec(
-                    target_path=f"{attn_target}.{proj_name}.weight",
-                    sharding=(None, None),
-                    transpose=True,
-                )
-            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightSpec(
-                target_path=f"{attn_target}.o_proj.weight",
-                sharding=("tensor", None),
-                transpose=True,
-            )
-            # Conv1d weights: HF shape (projection_size, 1, conv_size) -> JAX (conv_size, projection_size) -> (projection_size, conv_size)
-            # These live under self_attn.attn (RadixLinearAttention), not self_attn directly.
-            conv_size = self.config.linear_attn_config["short_conv_kernel_size"]
-            num_heads = self.config.linear_attn_config["num_heads"]
-            head_dim = self.config.linear_attn_config["head_dim"]
-            projection_size = num_heads * head_dim
-            for conv_name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-                mappings[f"{prefix}.self_attn.{conv_name}.weight"] = WeightSpec(
-                    target_path=f"{attn_target}.attn.{conv_name}.weight",
-                    sharding=("tensor", None),
-                    transpose=False,
-                    # transpose_axes=(2, 0, 1),
-                    reshape=(projection_size, conv_size),
-                )
-            mappings[f"{prefix}.self_attn.o_norm.weight"] = WeightSpec(
-                target_path=f"{attn_target}.o_norm.weight",
-                sharding=(None,),
-                transpose=False,
-            )
-            mappings[f"{prefix}.self_attn.dt_bias"] = WeightSpec(
-                target_path=f"{attn_target}.attn.dt_bias",
-                sharding=("tensor",),
-                transpose=False,
-            )
-            mappings[f"{prefix}.self_attn.A_log"] = WeightSpec(
-                target_path=f"{attn_target}.A_log",
-                sharding=(None, None, "tensor", None),
-                transpose=False,
             )
         else:
             # MLA layer — MLAAttention is directly self.self_attn

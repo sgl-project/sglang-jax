@@ -30,7 +30,11 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.mla.v1.ref import ref_mla_ragged_paged_attention
-from sgl_jax.srt.kernels.mla.v2.kernel import align_to, get_dtype_packing
+from sgl_jax.srt.kernels.mla.v2.kernel import (
+    align_rope_dim,
+    align_to,
+    get_dtype_packing,
+)
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -113,7 +117,7 @@ def _build_caches_and_indices(
     """
     kv_packing = get_dtype_packing(dtype)
     nope_dim = align_to(kv_lora_rank, 128)
-    rope_dim = align_to(qk_rope_head_dim, 128)
+    rope_dim = align_rope_dim(qk_rope_head_dim)
     kv_dim = nope_dim + rope_dim
     page_size_per_kv_packing = max(align_to(page_size, kv_packing) // kv_packing, 1)
 
@@ -453,11 +457,13 @@ class TestMLAAttention(CustomTestCase):
         max_total_token_size=200000,
         sliding_window=None,
         soft_cap=None,
+        nope=False,
     ):
         num_heads = num_heads or self.NUM_HEADS
         kv_lora_rank = kv_lora_rank or self.KV_LORA_RANK
         qk_nope_head_dim = qk_nope_head_dim or self.QK_NOPE_DIM
-        qk_rope_head_dim = qk_rope_head_dim or self.QK_ROPE_DIM
+        # nope=True: GLM-5.3-Flash layout, qk_rope_head_dim == 0 (an explicit 0 would hit the `or`).
+        qk_rope_head_dim = 0 if nope else (qk_rope_head_dim or self.QK_ROPE_DIM)
         v_head_dim = v_head_dim or self.V_HEAD_DIM
 
         (
@@ -587,6 +593,13 @@ class TestMLAAttention(CustomTestCase):
 
     def test_prefill_page_size_16(self):
         self.run_test("prefill", self.PREFILL_LENS, page_size=16)
+
+    def test_prefill_nope(self):
+        # GLM-5.3-Flash: qk_rope_head_dim == 0. The cache still reserves an aligned zero block.
+        self.run_test("prefill", self.PREFILL_LENS, page_size=16, nope=True)
+
+    def test_decode_nope(self):
+        self.run_test("decode", self.DECODE_LENS, page_size=16, nope=True)
 
     def test_prefill_page_size_32(self):
         self.run_test("prefill", self.PREFILL_LENS, page_size=32)

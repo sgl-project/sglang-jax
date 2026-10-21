@@ -53,6 +53,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "MiMoV2ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
     }
 )
 

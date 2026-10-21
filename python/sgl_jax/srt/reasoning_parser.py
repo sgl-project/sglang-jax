@@ -215,6 +215,18 @@ class Glm45Detector(BaseReasoningFormatDetector):
         )
 
 
+class Glm53Detector(Glm45Detector):
+    """
+    Detector for GLM-5.3 models.
+
+    The chat template ends the generation prompt with ``<think>``, so the
+    completion starts inside the reasoning block without emitting the start tag.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(stream_reasoning=stream_reasoning, force_reasoning=True)
+
+
 class Gemma4Detector(BaseReasoningFormatDetector):
     """
     Detector for Gemma 4 model.
@@ -329,6 +341,7 @@ class ReasoningParser:
         "mimo": Qwen3Detector,
         "kimi": KimiDetector,
         "glm45": Glm45Detector,
+        "glm53": Glm53Detector,
         "gemma4": Gemma4Detector,
         "ling3": Ling3Detector,
     }
