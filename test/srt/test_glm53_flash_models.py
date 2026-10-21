@@ -14,7 +14,11 @@ import requests
 from run_eval import run_eval
 
 from sgl_jax.srt.utils import kill_process_tree
-from sgl_jax.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, popen_launch_server
+from sgl_jax.test.test_utils import (
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 MODEL = "zai-org/GLM-5.3-Flash"
 
