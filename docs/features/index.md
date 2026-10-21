@@ -9,6 +9,7 @@ Feature docs describe runtime capabilities, operational behavior, and user-visib
 | [Global JIT compile](global_jit_compile.md) | Compilation cache and startup flow. |
 | [LoRA](lora.md) | LoRA adapter serving support. |
 | [Quantization](quantization.md) | Quantized model serving support. |
+| [HiCache](hicache.md) | Device/host prefix KV caching with JAX and Raiden backends. |
 | [Radix cache](radix_cache.md) | Prefix KV cache reuse. |
 | [Run in Pathways](run_in_pathways.md) | Pathways execution notes. |
 | [Server Arguments](server_arguments.md) | Launch flags and runtime configuration entry point. |

@@ -12,6 +12,7 @@ from __future__ import annotations
 import heapq
 import logging
 from collections import defaultdict
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
+from sgl_jax.srt.mem_cache.cache_transfer import DevicePageSpan
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -53,6 +55,9 @@ from sgl_jax.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
+)
+from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
+    CacheTransferPhase,
 )
 
 if TYPE_CHECKING:
@@ -997,14 +1002,24 @@ class UnifiedRadixCache(BasePrefixCache):
         if node.hit_count >= self.write_through_threshold:
             self.write_backup(node)
 
-    def _reserve_host_slots(self, num_pages: int) -> list[int] | None:
+    @property
+    def _direct_hicache(self) -> bool:
+        return bool(getattr(self.hicache_controller, "direct_transfers", False))
+
+    def _prepare_direct_transfer(self) -> None:
+        if self._donation_barrier is not None:
+            self._donation_barrier()
+        self.hicache_controller.prepare_transfer()
+
+    def _reserve_host_slots(self, num_pages: int, dp_rank: int = 0) -> list[int] | None:
         """Alloc host pages, evicting host LRU leaves if short. None if still short."""
-        pages = self.host_pool.alloc(num_pages)
+        rank_args = {"dp_rank": dp_rank} if self._direct_hicache else {}
+        pages = self.host_pool.alloc(num_pages, **rank_args)
         if pages is None:
-            shortfall = num_pages - self.host_pool.available_size()
+            shortfall = num_pages - self.host_pool.available_size(**rank_args)
             if shortfall > 0:
-                self.evict_host(shortfall)
-            pages = self.host_pool.alloc(num_pages)
+                self.evict_host(shortfall, **rank_args)
+            pages = self.host_pool.alloc(num_pages, **rank_args)
         if pages is None:
             return None
         return [int(p) for p in pages]
@@ -1023,7 +1038,11 @@ class UnifiedRadixCache(BasePrefixCache):
         return [int(x) + dp_rank * pages_per_shard for x in local_pages]
 
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
-        """Async D2H backup of a node's device KV to host.
+        """Back up a node's device KV to host.
+
+        The direct Raiden path holds the source lock through native completion
+        and publishes host_value only after success. The JAX path below uses
+        asynchronous host staging.
 
         write_back=True is the eviction-time path: leaf-up eviction guarantees
         ancestors are already backed up, so parent recursion is skipped. The device
@@ -1046,6 +1065,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if device_indices is None or len(device_indices) == 0:
             return 0
 
+        if self._direct_hicache:
+            return self._write_backup_direct(node)
+
         PS = self.page_size
         device_tokens = np.asarray(device_indices)
         assert (
@@ -1065,6 +1087,27 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_lock_ref(node, lock_result.to_dec_params())
         self.ongoing_write[future] = (node, host_pages)
         return num_pages
+
+    def _write_backup_direct(self, node) -> int:
+        component = self.components[BASE_COMPONENT_TYPE]
+        phase = CacheTransferPhase.BACKUP_HOST
+        (transfer,) = component.build_hicache_transfers(node, phase)
+        handles = self._reserve_host_slots(len(transfer.device.pages), transfer.device.dp_rank)
+        if handles is None:
+            return 0
+        transfer = replace(transfer, host_handles=tuple(handles))
+        lock = self.inc_lock_ref(node)
+        try:
+            self._prepare_direct_transfer()
+            self.hicache_controller.submit_backup(transfer.device, handles).wait()
+            component.commit_hicache_transfer(node, phase, transfers=[transfer])
+        except Exception:
+            if not self.host_pool.failed:
+                self.host_pool.free(handles)
+                self.dec_lock_ref(node, lock.to_dec_params())
+            raise
+        self.dec_lock_ref(node, lock.to_dec_params())
+        return len(handles)
 
     def _free_host_pages(self, node: UnifiedTreeNode) -> None:
         """Recursively free every node's host_value pages back to host_pool."""
@@ -1107,11 +1150,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Non-blocking poll of in-flight D2H writes (scheduler hook)."""
         if self.hicache_enabled:
+            if self._direct_hicache:
+                self.hicache_controller.check_write_status()
             self.writing_check()
 
     def flush_write_through_acks(self) -> None:
         """Settle finished D2H writes mid-step to free device locks early."""
         if self.hicache_enabled:
+            if self._direct_hicache:
+                self.hicache_controller.check_write_status()
             self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
@@ -1211,12 +1258,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     ##### HiCache (L1<->L2) Host Eviction #####
 
-    def evict_host(self, num_pages: int) -> int:
+    def evict_host(self, num_pages: int, dp_rank: int | None = None) -> int:
         """Free at least num_pages host slots by evicting host-tier LRU leaves."""
         if not self.hicache_enabled:
             return 0
         num_freed = 0
-        heap = list(self.evictable_host_leaves)
+        heap = [
+            n
+            for n in self.evictable_host_leaves
+            if dp_rank is None or (n.key.dp_rank or 0) == dp_rank
+        ]
         heapq.heapify(heap)
         while num_freed < num_pages and heap:
             node = heapq.heappop(heap)
@@ -1256,7 +1307,10 @@ class UnifiedRadixCache(BasePrefixCache):
         host_hit_length: int,
         mem_quota: int | None = None,
     ) -> tuple[np.ndarray, UnifiedTreeNode, list[tuple[list[int], list[int]]]]:
-        """Start async reload of a host-only prefix onto device (H2D).
+        """Reload a host-only prefix onto device (H2D).
+
+        The direct Raiden path completes DMA before publishing the chain and
+        returns an empty flush plan. The JAX path below stages an async reload.
 
         Walks the tombstone chain from last_host_node up to the device boundary,
         allocates device slots, and submits async stage_load for each node.
@@ -1291,6 +1345,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if last_host_node.key and last_host_node.key.dp_rank is not None
             else 0
         )
+
+        if self._direct_hicache:
+            return self._load_back_direct(selected, attach_boundary, total, dp_rank)
 
         # Lock attach_boundary across eviction so it isn't demoted (it's the
         # device leaf whose sole child is the tombstone we're reloading).
@@ -1327,6 +1384,59 @@ class UnifiedRadixCache(BasePrefixCache):
         self._update_evictable_leaf_sets(selected[0].parent)
 
         return device_indices_all, selected[-1], flush_plan
+
+    def _load_back_direct(self, selected, boundary, total, dp_rank):
+        # Pin the source chain before device eviction: write-back eviction may
+        # itself require host eviction. Publish the whole chain after one Await.
+        handles = [
+            int(h) for n in selected for h in n.component_data[BASE_COMPONENT_TYPE].host_value
+        ]
+        self.host_pool.pin(handles)
+        lock = self.inc_lock_ref(boundary)
+        indices = None
+        try:
+            self._prepare_direct_transfer()
+            allocator = self.token_to_kv_pool_allocator
+            available = allocator.available_size(dp_rank)
+            if available < total:
+                self.evict(EvictParams(num_tokens=total - available, dp_rank=dp_rank))
+            indices = allocator.alloc(total, dp_rank=dp_rank)
+            if indices is None:
+                self.host_pool.unpin(handles)
+                self.dec_lock_ref(boundary, lock.to_dec_params())
+                return np.empty((0,), dtype=np.int32), selected[-1], []
+            component = self.components[BASE_COMPONENT_TYPE]
+            phase = CacheTransferPhase.LOAD_BACK
+            transfers = []
+            offset = 0
+            for node in selected:
+                host = tuple(map(int, node.component_data[BASE_COMPONENT_TYPE].host_value))
+                count = len(host) * self.page_size
+                (transfer,) = component.build_hicache_transfers(
+                    node, phase, device_indices=indices[offset : offset + count]
+                )
+                transfers.append(replace(transfer, host_handles=host))
+                offset += count
+            pages = tuple(p for transfer in transfers for p in transfer.device.pages)
+            self.hicache_controller.submit_restore(handles, DevicePageSpan(dp_rank, pages)).wait()
+        except Exception:
+            if not self.host_pool.failed:
+                if indices is not None:
+                    self.token_to_kv_pool_allocator.free(indices, dp_rank=dp_rank)
+                self.host_pool.unpin(handles)
+                self.dec_lock_ref(boundary, lock.to_dec_params())
+            raise
+        for node, transfer in zip(selected, transfers):
+            component.commit_hicache_transfer(node, phase, transfers=[transfer])
+            self.component_evictable_size_[BASE_COMPONENT_TYPE][dp_rank] += len(
+                transfer.device_tokens
+            )
+        self.host_pool.unpin(handles)
+        self.dec_lock_ref(boundary, lock.to_dec_params())
+        for node in selected:
+            self._update_evictable_leaf_sets(node)
+        self._update_evictable_leaf_sets(boundary)
+        return indices, selected[-1], []
 
     def finish_load_back(self, flush_plan: list[tuple[list[int], list[int]]]) -> None:
         """Complete the H2D scatter into kv_buffer. Must run donation-safe."""

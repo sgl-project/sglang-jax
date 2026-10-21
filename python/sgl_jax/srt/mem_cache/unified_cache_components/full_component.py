@@ -4,12 +4,16 @@ import heapq
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
 )
+from sgl_jax.srt.mem_cache.cache_transfer import DevicePageSpan, FullKVTransfer
 from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
+    CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
@@ -83,6 +87,35 @@ class FullComponent(TreeComponent):
 
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
+
+    def build_hicache_transfers(self, node, phase, *, device_indices=None, **kwargs):
+        cd = node.component_data[self.component_type]
+        tokens = cd.value if device_indices is None else device_indices
+        if tokens is None:
+            return None
+        tokens = np.asarray(tokens, dtype=np.int64)
+        ps = self.cache.page_size
+        if len(tokens) % ps:
+            raise ValueError("HiCache FULL transfer must contain complete pages")
+        pages = tokens[::ps] // ps
+        if len(tokens) and not np.array_equal(
+            tokens.reshape(-1, ps), pages[:, None] * ps + np.arange(ps)
+        ):
+            raise ValueError("HiCache FULL tokens must be aligned and contiguous within pages")
+        rank = node.key.dp_rank if node.key.dp_rank is not None else 0
+        return [
+            FullKVTransfer(DevicePageSpan(rank, tuple(map(int, pages))), tuple(map(int, tokens)))
+        ]
+
+    def commit_hicache_transfer(self, node, phase, transfers=(), **kwargs):
+        (transfer,) = transfers
+        cd = node.component_data[self.component_type]
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            cd.host_value = np.asarray(transfer.host_handles, dtype=np.int64)
+        elif phase == CacheTransferPhase.LOAD_BACK:
+            cd.value = np.asarray(transfer.device_tokens, dtype=np.int32)
+        else:
+            raise ValueError(f"Unsupported FULL local transfer phase: {phase}")
 
     def drive_eviction(self, params: EvictParams, tracker: dict[ComponentType, int]) -> None:
         request = params.num_tokens
