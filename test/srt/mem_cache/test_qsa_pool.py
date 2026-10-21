@@ -215,6 +215,7 @@ class TestQSAPoolInsideTheHybridWrapper(CustomTestCase):
             page_size=PAGE_SIZE,
             kv_cache_dtype=jnp.bfloat16,
             mesh=_mesh(),
+            _has_dsa_indexer=False,
         )
         wrap = ModelRunnerKVCacheMixin._maybe_wrap_hybrid_kv_pool
         pool = wrap(runner, QSATokenToKVPool, **self.QSA_KWARGS)
@@ -222,6 +223,27 @@ class TestQSAPoolInsideTheHybridWrapper(CustomTestCase):
         self.assertIsInstance(pool.full_kv_pool, QSATokenToKVPool)
         with self.assertRaisesRegex(AssertionError, "dsa_sparse"):
             wrap(runner, MLATokenToKVPool, num_indexer_layers=1)
+
+    def test_the_factory_wraps_dsa_with_an_indexer(self):
+        """A hybrid model with its own DSA indexer (GLM-5.3-Flash) gets the wrapped MLA pool."""
+        runner = SimpleNamespace(
+            linear_recurrent_config=SimpleNamespace(full_attention_layer_ids=self.FULL_LAYERS),
+            max_total_num_tokens=PAGE_SIZE * 8,
+            page_size=PAGE_SIZE,
+            kv_cache_dtype=jnp.bfloat16,
+            mesh=_mesh(),
+            _has_dsa_indexer=True,
+        )
+        pool = ModelRunnerKVCacheMixin._maybe_wrap_hybrid_kv_pool(
+            runner,
+            MLATokenToKVPool,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            indexer_key_dim=IDX_DIM,
+            num_indexer_layers=1,
+        )
+        self.assertIsInstance(pool, HybridLinearKVPool)
+        self.assertIsInstance(pool.full_kv_pool, MLATokenToKVPool)
 
 
 if __name__ == "__main__":
