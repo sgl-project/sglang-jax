@@ -75,17 +75,19 @@ class ScMoePermuteKernelTest(parameterized.TestCase):
             np.asarray(ref[start:end].astype(jnp.float32)),
         )
 
-    @parameterized.product(T=(64, 1024, 4096, 8192), weight_dtype=(jnp.float32, jnp.bfloat16))
-    def test_combine_matches_reference_and_masks_nonlocal_rows(self, T, weight_dtype):
+    @parameterized.product(
+        T=(64, 1024, 4096, 8192), weight_dtype=(jnp.float32, jnp.bfloat16), top_k=(8, 6)
+    )
+    def test_combine_matches_reference_and_masks_nonlocal_rows(self, T, weight_dtype, top_k):
         rng = np.random.default_rng(2)
-        topk_ids, w, sorted_sel, revert, group_sizes = _routing(T, NUM_EXPERTS, TOPK, seed=T + 7)
+        topk_ids, w, sorted_sel, revert, group_sizes = _routing(T, NUM_EXPERTS, top_k, seed=T + 7)
         flat = topk_ids.ravel()
         local = (flat >= LOCAL_EXPERTS) & (flat < 2 * LOCAL_EXPERTS)
         offsets = np.concatenate([[0], np.cumsum(group_sizes)])
         start, end = int(offsets[LOCAL_EXPERTS]), int(offsets[2 * LOCAL_EXPERTS])
         # gmm output sorted by expert. Production zero-fills non-local rows; here we
         # deliberately put garbage there so the test proves the mask is honoured.
-        x = rng.standard_normal((T * TOPK, HIDDEN)).astype(np.float32) * 1e3
+        x = rng.standard_normal((T * top_k, HIDDEN)).astype(np.float32) * 1e3
         x[start:end] = rng.standard_normal((end - start, HIDDEN)).astype(np.float32)
         x = jnp.asarray(x).astype(jnp.bfloat16)
         x_clean = x.at[:start].set(0).at[end:].set(0)
@@ -93,8 +95,8 @@ class ScMoePermuteKernelTest(parameterized.TestCase):
         revert_j = jnp.asarray(revert.astype(np.int32))
         mask = jnp.asarray(local)
 
-        ref = reference_combine(x_clean, revert_j, weights, TOPK)
-        out = sc_combine(x, revert_j, weights, mask, TOPK)
+        ref = reference_combine(x_clean, revert_j, weights, top_k)
+        out = sc_combine(x, revert_j, weights, mask, top_k)
         self.assertEqual(out.shape, (T, HIDDEN))
         self.assertEqual(out.dtype, jnp.bfloat16)
         ref32 = np.asarray(ref.astype(jnp.float32))
