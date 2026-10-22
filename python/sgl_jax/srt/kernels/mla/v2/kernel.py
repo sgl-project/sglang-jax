@@ -289,7 +289,8 @@ def _mla_ragged_paged_attention_kernel(
     bq_nope_x2_ref,  # [2, batch_size, bq_sz, num_q_heads_per_q_packing, q_packing, lkv_dim]
     bq_rope_x2_ref,  # [2, batch_size, bq_sz, num_q_heads_per_q_packing, q_packing, r_dim]
     bo_x2_ref,  # [2, batch_size, bq_sz, num_q_heads_per_q_packing, q_packing, lkv_dim]
-    sems,  # [4, batch_size, 2]
+    btile_ref,  # [num_q_heads, tile_rows, lkv_dim] boundary-tile RMW buffer (q_head_major), else a dummy
+    sems,  # [5, batch_size, 2]
     l_ref,  # [batch_size, bq_sz * num_q_heads, 128],
     m_ref,  # [batch_size, bq_sz * num_q_heads, 128],
     acc_ref,  # [batch_size, bq_sz * num_q_heads, lkv_dim],
@@ -306,6 +307,12 @@ def _mla_ragged_paged_attention_kernel(
     bq_sz,
     batch_size: int = 1,
     debug_mode: bool = False,
+    # q/o HBM contract is head-major [num_q_heads, max_num_tokens, d]
+    # (the producer dot_general(batch=head) layout) instead of the packed
+    # token-major [max_num_tokens, h // p, p, d]. Rows inside a block are
+    # (head, query) instead of (query, head); the DMA is one strided copy per
+    # block. Prefill / mixed only (bq_sz must fill whole sublane tiles).
+    q_head_major: bool = False,
 ):
     assert ql_nope_hbm_ref.shape == o_hbm_ref.shape
     # Validation checks on the dimensions
@@ -313,9 +320,24 @@ def _mla_ragged_paged_attention_kernel(
     pe_dim = q_pe_hbm_ref.shape[-1]
     assert nope_dim + pe_dim == cache_kv_hbm_ref.shape[-1]
 
-    _, num_q_heads_per_q_packing, q_packing, lkv_dim = ql_nope_hbm_ref.shape
+    if q_head_major:
+        num_q_heads, _, lkv_dim = ql_nope_hbm_ref.shape
+        q_packing = get_dtype_packing(ql_nope_hbm_ref.dtype)
+        assert num_q_heads % q_packing == 0, (num_q_heads, q_packing)
+        num_q_heads_per_q_packing = num_q_heads // q_packing
+        # Head-major: the token axis is the second-minor (tiled) axis of q/o, so every
+        # DMA slice along it must be whole sublane tiles. Blocks run on a tile-aligned
+        # grid per sequence; rows outside [q_start, q_end) are junk (never written);
+        # the two partial boundary tiles are written read-modify-write.
+        hm_tile = 8 * q_packing
+        assert bq_sz % hm_tile == 0, (bq_sz, q_packing)
+        assert static_q_len is None, "q_head_major: static_q_len unsupported"
+        assert batch_size == 1, "q_head_major: batch_size must be 1 (prefill / mixed)"
+    else:
+        hm_tile = None
+        _, num_q_heads_per_q_packing, q_packing, lkv_dim = ql_nope_hbm_ref.shape
+        num_q_heads = num_q_heads_per_q_packing * q_packing
     r_dim = q_pe_hbm_ref.shape[-1]
-    num_q_heads = num_q_heads_per_q_packing * q_packing
     total_num_pages, page_size_per_kv_packing, kv_packing, _ = cache_kv_hbm_ref.shape
     num_page_indices = page_indices_ref.shape[0]
 
@@ -402,7 +424,17 @@ def _mla_ragged_paged_attention_kernel(
             q_end = cu_q_lens_ref[seq_idx + 1]
             q_len = q_end - q_start
             kv_len = kv_lens_ref[seq_idx]
-            q_span = kv_len - q_len + bq_idx * bq_sz + q_row_offset
+            if q_head_major:
+                # Rows are (head, query): row % a_bq = query, counted from the
+                # tile-aligned block grid start (blk0 <= q_start); rows before
+                # q_start / past q_end are junk and are never written back.
+                row_iota = lax.broadcasted_iota(jnp.int32, s.shape[1:], 0)
+                row_q = row_iota % (s.shape[1] // num_q_heads)
+                blk0 = (q_start // hm_tile) * hm_tile
+                q_span = kv_len - q_len + (blk0 - q_start) + bq_idx * bq_sz + row_q
+            else:
+                # Rows are (query, head): row // num_q_heads = query (hoisted q_row_offset).
+                q_span = kv_len - q_len + bq_idx * bq_sz + q_row_offset
             mask = q_span < k_span
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
@@ -935,6 +967,13 @@ def _mla_ragged_paged_attention_kernel(
             q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
             q_end = cu_q_lens_ref[seq_idx + 1]
             sz = jnp.minimum(bq_sz, q_end - q_len_start)
+            if q_head_major:
+                # tile-aligned grid: [blk0 + k * bq_sz, ...) up to ceil_tile(q_end)
+                blk0 = (cu_q_lens_ref[seq_idx] // hm_tile) * hm_tile
+                q_len_start = pl.multiple_of(blk0 + bq_idx * bq_sz, hm_tile)
+                sz = pl.multiple_of(
+                    jnp.minimum(bq_sz, cdiv(q_end, hm_tile) * hm_tile - q_len_start), hm_tile
+                )
 
             debug_print(
                 "[RPA debug]" f" -----------{'wait' if wait else 'start'}_fetch_bq-----------"
@@ -954,19 +993,34 @@ def _mla_ragged_paged_attention_kernel(
                 bq_rope_vmem_ref=bq_rope_vmem_ref,
                 sem=sem,
             ):
-                _async_copy(
-                    ql_nope_hbm_ref.at[pl.ds(q_len_start, sz)],
-                    bq_nope_vmem_ref.at[pl.ds(0, sz)],
-                    sem,
-                    wait,
-                )
+                if q_head_major:
+                    # One strided DMA per block: [h, sz, d] out of [h, T, d].
+                    _async_copy(
+                        ql_nope_hbm_ref.at[:, pl.ds(q_len_start, sz)],
+                        bq_nope_vmem_ref.at[:, pl.ds(0, sz)],
+                        sem,
+                        wait,
+                    )
+                    _async_copy(
+                        q_pe_hbm_ref.at[:, pl.ds(q_len_start, sz)],
+                        bq_rope_vmem_ref.at[:, pl.ds(0, sz)],
+                        sem,
+                        wait,
+                    )
+                else:
+                    _async_copy(
+                        ql_nope_hbm_ref.at[pl.ds(q_len_start, sz)],
+                        bq_nope_vmem_ref.at[pl.ds(0, sz)],
+                        sem,
+                        wait,
+                    )
 
-                _async_copy(
-                    q_pe_hbm_ref.at[pl.ds(q_len_start, sz)],
-                    bq_rope_vmem_ref.at[pl.ds(0, sz)],
-                    sem,
-                    wait,
-                )
+                    _async_copy(
+                        q_pe_hbm_ref.at[pl.ds(q_len_start, sz)],
+                        bq_rope_vmem_ref.at[pl.ds(0, sz)],
+                        sem,
+                        wait,
+                    )
 
     def _send_bo(batch_start_seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         for b in range(batch_size):
@@ -988,6 +1042,10 @@ def _mla_ragged_paged_attention_kernel(
             debug_print("[RPA debug] q_end={}", q_end)
             debug_print("[RPA debug] sz={}", sz)
 
+            if q_head_major:
+                _send_bo_head_major(seq_idx, b, bo_idx, bo_sem_idx, vmem_ref, sem, wait)
+                continue
+
             @pl.when(sz > 0)
             def _copy(vmem_ref=vmem_ref, sz=sz, q_len_start=q_len_start, sem=sem):
                 _async_copy(
@@ -996,6 +1054,71 @@ def _mla_ragged_paged_attention_kernel(
                     sem,
                     wait,
                 )
+
+    def _send_bo_head_major(seq_idx, b, bo_idx, bo_sem_idx, vmem_ref, sem, wait):
+        """Write back block ``bo_idx`` of ``seq_idx`` under the head-major contract.
+
+        The block covers tokens [bs, bs + bq_sz) of the tile-aligned grid; only
+        [lo, hi) = that range clipped to [q_start, q_end) belongs to the
+        sequence. Whole tiles inside [lo, hi) go out as one strided DMA (tracked
+        by ``sem`` like the token-major send); a partial first / last tile is
+        merged with what is already in HBM (the previous sequence's tail, or
+        the next sequence's still-unread q rows, which are written back
+        unchanged) and written synchronously, so consecutive sequences sharing
+        a tile never race.
+        """
+        TL = hm_tile
+        q_start = cu_q_lens_ref[seq_idx]
+        q_end = cu_q_lens_ref[seq_idx + 1]
+        blk0 = (q_start // TL) * TL
+        bs = blk0 + bo_idx * bq_sz
+        lo = jnp.maximum(bs, q_start)
+        hi = jnp.minimum(bs + bq_sz, q_end)
+        a0 = cdiv(lo, TL) * TL
+        a1 = (hi // TL) * TL
+        n_int = jnp.maximum(a1 - a0, 0)
+
+        @pl.when(n_int > 0)
+        def _interior():
+            _async_copy(
+                vmem_ref.at[:, pl.ds(pl.multiple_of(a0 - bs, TL), pl.multiple_of(n_int, TL))],
+                o_hbm_ref.at[:, pl.ds(pl.multiple_of(a0, TL), pl.multiple_of(n_int, TL))],
+                sem,
+                wait,
+            )
+
+        if wait or debug_mode:
+            return
+
+        def rmw(t0):
+            t0 = pl.multiple_of(t0, TL)
+            rd = pltpu.make_async_copy(o_hbm_ref.at[:, pl.ds(t0, TL)], btile_ref, sems.at[4, b, 0])
+            rd.start()
+            rd.wait()
+            ours = vmem_ref[:, pl.ds(pl.multiple_of(t0 - bs, TL), TL), :]
+            row = t0 + lax.broadcasted_iota(jnp.int32, (1, TL, 1), 1)
+            keep = jnp.logical_and(row >= lo, row < hi)
+            btile_ref[...] = jnp.where(keep, ours, btile_ref[...])
+            wr = pltpu.make_async_copy(btile_ref, o_hbm_ref.at[:, pl.ds(t0, TL)], sems.at[4, b, 0])
+            wr.start()
+            wr.wait()
+
+        head_t = (lo // TL) * TL
+        tail_t = (hi // TL) * TL
+        has_rows = lo < hi
+        need_head = jnp.logical_and(has_rows, lo % TL != 0)
+        need_tail = jnp.logical_and(
+            jnp.logical_and(has_rows, hi % TL != 0),
+            jnp.logical_not(jnp.logical_and(need_head, tail_t == head_t)),
+        )
+
+        @pl.when(need_head)
+        def _head():
+            rmw(head_t)
+
+        @pl.when(need_tail)
+        def _tail():
+            rmw(tail_t)
 
     def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
@@ -1049,7 +1172,22 @@ def _mla_ragged_paged_attention_kernel(
                 bkv_update_ids_ref[b, bkv_sem_idx + 4] = 0
                 _update_kv_cache(start_seq_idx, b, bkv_sem_idx, offset, update_sz, wait=True)
 
+    def load_bq_head_major(bq_sem_idx, *, actual_bq_sz=bq_sz):
+        # VMEM block [batch, h, bq_sz, d] -> rows (head, query); the query
+        # slice is a whole number of sublane tiles (bq_sz % (8 * packing) == 0).
+        q_nope_val = bq_nope_x2_ref.at[bq_sem_idx][...]
+        q_nope_vec = q_nope_val[:, :, :actual_bq_sz].reshape(
+            batch_size, num_q_heads * actual_bq_sz, lkv_dim
+        )
+        q_rope_val = bq_rope_x2_ref.at[bq_sem_idx][...]
+        q_rope_vec = q_rope_val[:, :, :actual_bq_sz].reshape(
+            batch_size, num_q_heads * actual_bq_sz, r_dim
+        )
+        return q_nope_vec, q_rope_vec
+
     def load_bq(bq_sem_idx, *, actual_bq_sz=bq_sz):
+        if q_head_major:
+            return load_bq_head_major(bq_sem_idx, actual_bq_sz=actual_bq_sz)
         if num_q_heads_per_q_packing > 1:
             q_nope_ref = (
                 bq_nope_x2_ref.bitcast(jnp.uint32)
@@ -1134,6 +1272,11 @@ def _mla_ragged_paged_attention_kernel(
         if static_q_len is None:
             actual_bq_sz = bq_sz
             num_bq = cdiv(q_len_max, actual_bq_sz)
+            if q_head_major:
+                q_start0 = cu_q_lens_ref[batch_start_seq_idx]
+                q_end0 = cu_q_lens_ref[batch_start_seq_idx + 1]
+                span = cdiv(q_end0, hm_tile) * hm_tile - (q_start0 // hm_tile) * hm_tile
+                num_bq = cdiv(span, actual_bq_sz)
         else:
             actual_bq_sz = min(bq_sz, static_q_len)
             num_bq = cdiv(static_q_len, actual_bq_sz)
@@ -1261,11 +1404,14 @@ def _mla_ragged_paged_attention_kernel(
             wait_send_bo(bo_sem_idx)
 
             # Store output from acc to bo.
-            bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                batch_size,
-                bq_sz * num_q_heads_per_q_packing,
-                lkv_dim,
-            )[...] = pltpu.bitcast(out, jnp.int32)
+            if q_head_major:
+                bo_x2_ref.at[bo_sem_idx][...] = out.reshape(batch_size, num_q_heads, bq_sz, lkv_dim)
+            else:
+                bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
+                    batch_size,
+                    bq_sz * num_q_heads_per_q_packing,
+                    lkv_dim,
+                )[...] = pltpu.bitcast(out, jnp.int32)
 
             # Send cur bo
             start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
@@ -1345,6 +1491,43 @@ def prepare_q_inputs(
     return q
 
 
+def prepare_q_inputs_head_major(
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+):
+    """Head-major q contract: [num_q_heads, max_num_tokens, align_to(d, 128)].
+
+    The transpose comes first so that, when the producer is a
+    ``dot_general(batch=head)`` followed by ``transpose(1, 0, 2)``, the two
+    transposes cancel and no relayout copy is materialized.
+    """
+    max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
+    q_packing = get_dtype_packing(q.dtype)
+    if max_num_tokens % (8 * q_packing) != 0:
+        raise ValueError(
+            f"q_head_major needs max_num_tokens % {8 * q_packing} == 0; got {max_num_tokens}"
+        )
+    num_q_heads = align_to(actual_num_q_heads, q_packing)
+    head_dim = align_to(actual_head_dim, 128)
+    q = jnp.pad(
+        q.transpose(1, 0, 2),
+        (
+            (0, num_q_heads - actual_num_q_heads),
+            (0, 0),
+            (0, head_dim - actual_head_dim),
+        ),
+        constant_values=0,
+    )
+    return jax.lax.optimization_barrier(q)
+
+
+def prepare_outputs_head_major(
+    out,  # [num_q_heads, max_num_tokens, head_dim]
+    actual_num_q_heads: int,
+    actual_head_dim: int,
+):
+    return out[:actual_num_q_heads, :, :actual_head_dim].transpose(1, 0, 2)
+
+
 def prepare_kv_inputs(kv: jax.Array):
     max_num_tokens, actual_head_dim = kv.shape
     kv_packing = get_dtype_packing(kv.dtype)
@@ -1394,6 +1577,8 @@ def prepare_outputs(
         "vmem_limit_bytes",
         "decode_batch_size",
         "mixed_static_q_len",
+        "skip_decode_cases",
+        "q_head_major",
         "debug_mode",
     ),
     donate_argnames=("cache_kv",),
@@ -1432,6 +1617,15 @@ def mla_ragged_paged_attention(
     # Ignored (tuned block kept) when the resulting block is not in the
     # validated sub-tile family for the shard's head count.
     mixed_static_q_len: int | None = None,
+    # head-major q/o HBM contract (see _mla_ragged_paged_attention_kernel).
+    # Requires skip_decode_cases (the decode blocks do not fill a sublane tile).
+    q_head_major: bool = False,
+    # Caller guarantees distribution[0] == 0 (no decode sequences, e.g. grouped
+    # speculative verify where every pseudo-sequence is MIXED): do not emit the
+    # BATCHED_DECODE / DECODE pallas_calls at all. With empty ranges they do no
+    # work, but each custom call still pays its launch tax (scalar-prefetch DMA
+    # and the fence on preceding HBM writes) and lengthens the cache alias chain.
+    skip_decode_cases: bool = False,
     # Debug params.
     debug_mode: bool = False,
 ) -> tuple[
@@ -1572,10 +1766,20 @@ def mla_ragged_paged_attention(
 
     _, actual_num_q_heads, actual_lkv_dim = ql_nope.shape
 
-    ql_nope = prepare_q_inputs(
-        ql_nope
-    )  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, lkv_dim]
-    q_pe = prepare_q_inputs(q_pe)  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, r_dim]
+    if q_head_major:
+        if not skip_decode_cases:
+            raise ValueError("q_head_major requires skip_decode_cases=True (prefill/mixed only)")
+        if mixed_static_q_len is not None:
+            raise ValueError("q_head_major does not support mixed_static_q_len")
+        ql_nope = prepare_q_inputs_head_major(ql_nope)  # [num_q_heads, max_num_tokens, lkv_dim]
+        q_pe = prepare_q_inputs_head_major(q_pe)  # [num_q_heads, max_num_tokens, r_dim]
+    else:
+        ql_nope = prepare_q_inputs(
+            ql_nope
+        )  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, lkv_dim]
+        q_pe = prepare_q_inputs(
+            q_pe
+        )  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, r_dim]
     new_kv_c = prepare_kv_inputs(new_kv_c)  # [max_num_tokens_per_kv_packing, kv_packing, lkv_dim]
     new_k_pe = prepare_kv_inputs(new_k_pe)  # [max_num_tokens_per_kv_packing, kv_packing, r_dim]
     lkv_dim = new_kv_c.shape[-1]
@@ -1583,8 +1787,13 @@ def mla_ragged_paged_attention(
 
     _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
-    _, num_q_heads_per_q_packing, q_packing, _ = ql_nope.shape
-    num_q_heads = num_q_heads_per_q_packing * q_packing
+    if q_head_major:
+        num_q_heads = ql_nope.shape[0]
+        q_packing = get_dtype_packing(ql_nope.dtype)
+        num_q_heads_per_q_packing = num_q_heads // q_packing
+    else:
+        _, num_q_heads_per_q_packing, q_packing, _ = ql_nope.shape
+        num_q_heads = num_q_heads_per_q_packing * q_packing
 
     if mixed_static_q_len is not None:
         # Mosaic rejects a q/o window whose packed rows do not fill whole
@@ -1664,17 +1873,36 @@ def mla_ragged_paged_attention(
             (2, batch_size, bkv_buf_sz_per_kv_packing, kv_packing, r_dim),
             cache_kv.dtype,
         )
-        bq_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, bq_sz, num_q_heads_per_q_packing, q_packing, lkv_dim),
-            ql_nope.dtype,
-        )
+        if q_head_major:
+            if bq_sz % (8 * q_packing) != 0:
+                raise ValueError(
+                    f"q_head_major needs bq_sz % {8 * q_packing} == 0; got case={case} bq_sz={bq_sz}"
+                )
+            bq_nope_double_buf = pltpu.VMEM(
+                (2, batch_size, num_q_heads, bq_sz, lkv_dim),
+                ql_nope.dtype,
+            )
+            bq_rope_double_buf = pltpu.VMEM(
+                (2, batch_size, num_q_heads, bq_sz, r_dim),
+                q_pe.dtype,
+            )
+        else:
+            bq_nope_double_buf = pltpu.VMEM(
+                (2, batch_size, bq_sz, num_q_heads_per_q_packing, q_packing, lkv_dim),
+                ql_nope.dtype,
+            )
 
-        bq_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, bq_sz, num_q_heads_per_q_packing, q_packing, r_dim),
-            q_pe.dtype,
-        )
+            bq_rope_double_buf = pltpu.VMEM(
+                (2, batch_size, bq_sz, num_q_heads_per_q_packing, q_packing, r_dim),
+                q_pe.dtype,
+            )
 
         bo_double_buf = bq_nope_double_buf
+        btile_buf = (
+            pltpu.VMEM((num_q_heads, 8 * q_packing, lkv_dim), ql_nope.dtype)
+            if q_head_major
+            else pltpu.VMEM((8, 128), jnp.bfloat16)
+        )
 
         l_scratch = pltpu.VMEM(
             (batch_size, bq_sz * num_q_heads, 128),
@@ -1693,8 +1921,10 @@ def mla_ragged_paged_attention(
             bq_nope_double_buf,
             bq_rope_double_buf,
             bo_double_buf,  # Double buffering for output block.
-            # Semaphores for double buffering of bkv, bq, bo and bkv_update.
-            pltpu.SemaphoreType.DMA((4, batch_size, 2)),
+            btile_buf,  # head-major boundary-tile RMW buffer (q_head_major), else a dummy.
+            # Semaphores for double buffering of bkv, bq, bo and bkv_update, plus the
+            # head-major boundary-tile RMW (row 4).
+            pltpu.SemaphoreType.DMA((5, batch_size, 2)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
@@ -1732,6 +1962,7 @@ def mla_ragged_paged_attention(
                     bkv_p=bkv_p,
                     batch_size=batch_size,
                     debug_mode=debug_mode,
+                    q_head_major=q_head_major,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -1765,45 +1996,60 @@ def mla_ragged_paged_attention(
             cache_kv,
         )
 
-    batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+    if skip_decode_cases:
+        # distribution[0] == 0 by caller contract: no decode sequences, skip
+        # the two empty decode custom calls (launch tax + alias-chain link).
+        updated_kv = cache_kv
+        batch_distribution = jnp.array(0, dtype=jnp.int32)
+    else:
+        batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+
     # Batched decode
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        cache_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=jnp.array(0),
-        end_seq_idx=batch_distribution,
-        static_q_len=1,
-        batch_size=decode_batch_size,
-        case=MlaCase.BATCHED_DECODE,
+    ql_nope, updated_kv = (
+        (ql_nope, updated_kv)
+        if skip_decode_cases
+        else run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            cache_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=jnp.array(0),
+            end_seq_idx=batch_distribution,
+            static_q_len=1,
+            batch_size=decode_batch_size,
+            case=MlaCase.BATCHED_DECODE,
+        )
     )
 
     # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=batch_distribution,
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        batch_size=1,
-        case=MlaCase.DECODE,
+    ql_nope, updated_kv = (
+        (ql_nope, updated_kv)
+        if skip_decode_cases
+        else run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            case=MlaCase.DECODE,
+        )
     )
     # TODO: evaluate if chunk-prefill-only branch is needed
 
@@ -1825,8 +2071,11 @@ def mla_ragged_paged_attention(
         static_q_len=mixed_static_q_len,
         case=MlaCase.MIXED,
     )
-    output = prepare_outputs(
-        ql_nope, actual_num_q_heads, actual_lkv_dim
-    )  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
+    if q_head_major:
+        output = prepare_outputs_head_major(ql_nope, actual_num_q_heads, actual_lkv_dim)
+    else:
+        output = prepare_outputs(
+            ql_nope, actual_num_q_heads, actual_lkv_dim
+        )  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
 
     return output, updated_kv

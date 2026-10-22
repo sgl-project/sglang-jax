@@ -108,6 +108,63 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8192): (8, 256),
     },
     "TPU v7": {
+        # GLM-5.2 tp8 a2a-DP decode attend (request-sharded: every rank holds all 64
+        # q heads, per-rank mnt = decode bs / 8), page_size 128, MIXED slot. Swept
+        # 2026-09-29 on tpu7x-8 at kv 2048 and 8192 (rows within 3.5% of the best at
+        # both). The (1,16) fallback is 30 ms (kv 2048) / 111 ms (kv 8192) per layer
+        # set vs 6-25 ms tuned: it made tp8 DP decode run at ~1 s/step. The existing
+        # decode rows (16,1,2) for 64 heads are within 2% of the best at mnt 4/8.
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (16, 1),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (16, 1),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (16, 4),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 8): (16, 8),
+        # GLM-5.2 tp8/ep8 (8 q heads per shard, page_size 128), swept 2026-09-29 on
+        # tpu7x-8 (jax 0.11.1 / libtpu 0.0.46.1) at kv 2048 AND 8192 with
+        # benchmark/kernels/mla/get_block_spec_config_mla.py; each row is within 3% of
+        # the best at both lengths (the key has no kv field). vs fallback (3,1,4)/(1,16):
+        # decode mnt 8 -17%, mnt 64 -24% (kv 2048) / -20% (kv 8192); mixed mnt 8 -58%,
+        # mnt 64 -82%. (32,1,2) is 85% slower than (16,1,4) at kv 2048 for mnt 64, so the
+        # GLM-5.1 page-256 rows must not be borrowed here. mnt 1/2 unmeasured; 4/16/32 below (v9).
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (16, 1, 4),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (16, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (16, 64),
+        # GLM-5.2 tp8 DSA exact-dense PREFILL arm (8 q heads per shard, page 128): every sequence
+        # q = kv = 1024, no prefix (the 1k insert and the 4x/8x1k batched prefill of cc64 1k/1k).
+        # Swept 2026-10-07 on tpu7x 2x2x1 (jax 0.11.1 / libtpu 0.0.46.1, tree 944ceec03,
+        # dpwork/kbench/mla_dense_prefill_kbench.py, min-of-10, one subprocess per candidate):
+        # mnt 1024 (S=1) fallback (16,32) 117.2 us -> (8,128) 41.5 (runner-up (8,256) 43.0);
+        # mnt 4096 (S=4) 459 -> 154.7 (runner-up (4,512) 156.0); mnt 8192 (S=8) 916 -> 306.4
+        # ((4,512) 305.6, within noise). (8,512)/(16,512)/(32,256)/(32,512) exceed the 57.6 MiB
+        # scoped VMEM. mnt 512 / 2048 are interpolated (same regime, not timed).
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 2048): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 4096): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8192): (8, 128),
+        # GLM-5.2 tp8 MTP (NextN 3/1/4) verify buckets, page_size 128: sparse_mla_via_dense runs
+        # bs<8 verify as T one-row decode sequences (decode rows, mnt 4/16) and bs>=8 verify grouped
+        # (mixed rows, mnt/4 sequences of exactly 4 query rows, mixed_static_q_len=4 so bq is
+        # clamped to 4); the 64-head rows are the a2a-DP verify (DSA_DP_DECODE_BS=64, mnt 32 =
+        # 256 draft tokens / 8 ranks). Swept 2026-09-30 on tpu7x 2x2x1 (jax 0.11.1 / libtpu
+        # 0.0.46.1, image dc84c171-base, tree 976b11f2b) with benchmark/kernels/mla/
+        # get_block_spec_config_mla.py --mixed-group 4 at per-sequence kv 1024 AND 4096 (the
+        # kernel sees only the DSA top-k pages: index_topk 4096 -> <= 33 pages), two independent
+        # runs (spot 2x2x1 + nap 1x1x1) within 1%. Rows are the minimax pick over both lengths:
+        # regret <= 1.05 (decode) / <= 1.17 (mixed at kv 4096, but 1.45-1.5x better than the
+        # alternative at kv 1024, which is where 1k/1k serving lives). vs the production miss path
+        # (decode (3,1,4); mixed fallback (16,32)->bq 4 for 8 heads, (1,16)->bq 4 for 64 heads):
+        # decode mnt 4/16/32 -8..-22%, mixed 8-head -20..-34%, mixed 64-head -62..-66%.
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 4): (8, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (8, 1, 4),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 4): (8, 4),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (8, 4),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (8, 4),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 16): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 32): (8, 1, 4),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 16): (8, 4),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 128, 32): (8, 4),
         # ===== Ling-2.6-1T (kv_lora_rank=512, qk_rope_head_dim=64) =====
         # Production deploy: --tp-size 32 --dp-size 4 --page-size 256
         # → attention_tp = tp/dp = 8 → per-shard num_q_heads = 64/8 = 8.

@@ -283,11 +283,11 @@ class SpecTokenSlotsTest(unittest.TestCase):
         self.assertFalse(pallas_always_fits(8192, default_run_capacity(8192, PAGE_SIZE)))
         self.assertEqual(default_run_capacity(8192, PAGE_SIZE), 2 * (8192 // PAGE_SIZE) + 130)
 
-    def test_spec_rows_skip_cond_large_T_keeps_cond(self):
-        # Spec verify / draft-extend rows (T=4, r_cap=130 by default) must not go
-        # through lax.cond (both branches hand back a whole pool: the branch_1_fun
-        # pool copies seen in fused_verify / fused_draft_extend); a T that exceeds
-        # r_cap must still reach the runtime cond + scatter fallback.
+    def test_spec_rows_never_cond(self):
+        # paged_write_back never goes through lax.cond (both branches hand back a whole
+        # pool: the branch_1_fun pool copies seen in fused_verify / fused_draft_extend);
+        # the run-table kernel is taken unconditionally, also when r_cap is below the
+        # worst case (production behaviour since 2026-10-03, formerly DSA_WRITEBACK_NOCOND=1).
         import sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock as qb
 
         pk, pages, dv = 2, 6, 8
@@ -319,20 +319,20 @@ class SpecTokenSlotsTest(unittest.TestCase):
             out = paged_write_back(cache, rows, loc, page_size=PAGE_SIZE)
             self.assertEqual(calls, {"cond": 0, "pallas": 1})
             np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
-            # T=4 rows but r_cap=2: static guarantee gone -> runtime cond (scatter branch taken).
+            # T=4 rows but r_cap=2: still no cond (kernel unconditional)
             out2 = paged_write_back(cache, rows, loc, page_size=PAGE_SIZE, r_cap=2)
-            self.assertEqual(calls["cond"], 1)
+            self.assertEqual(calls, {"cond": 0, "pallas": 2})
             np.testing.assert_array_equal(np.asarray(out2), np.asarray(ref))
 
     def test_default_capacity_static_dispatch_by_rows(self):
         # Decode-form spec verify rows (T = requests x draft tokens: 256 at cc64,
-        # up to 1024) must dispatch statically with the default r_cap even when
-        # every row starts its own run (n_raw == T); 4096 rows keep the cond.
+        # up to 1024) and 4096-row prefill windows all dispatch the kernel without a
+        # cond, even when every row starts its own run (n_raw == T).
         import sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock as qb
 
         pk, dv = 2, 8
         real_cond = qb.jax.lax.cond
-        for T, want_cond in ((256, 0), (512, 0), (1024, 0), (4096, 1)):
+        for T, want_cond in ((256, 0), (512, 0), (1024, 0), (4096, 0)):
             pages = 2 * T // PAGE_SIZE + 2
             cache = jnp.zeros((pages, PAGE_SIZE // pk, pk, dv), jnp.float32)
             rows = jnp.arange(T * dv, dtype=jnp.float32).reshape(T, dv) + 1.0

@@ -46,7 +46,9 @@ def _sets(a):
 
 
 class VerifyIdxBatchedDispatchTest(unittest.TestCase):
-    def _case(self, base_lens, pps, k_pages, q_group, min_bs=1, max_kv=1 << 20, on=True):
+    def _case(
+        self, base_lens, pps, k_pages, q_group, min_bs=1, max_kv=1 << 20, on=True, identity=False
+    ):
         S = len(base_lens)
         T = S * G
         seq_lens, pi, cu_q, cu_kv, dist = _meta(base_lens, pps)
@@ -69,6 +71,8 @@ class VerifyIdxBatchedDispatchTest(unittest.TestCase):
             _IDX_VERIFY_BATCHED_MIN_BS=min_bs,
             _IDX_VERIFY_BATCHED_MAX_KV=max_kv,
             _INDEXER_KERNEL_PREFILL=False,
+            # identity shortcut (default: buckets <= 32 pages) would skip the scoring dispatch
+            _PAGE_TOPK_IDENTITY_MAX_PAGES=0 if identity else -1,
             streamindex_page_topk_ref_grouped=spy,
         ):
             got = _prefill_page_topk(*args, q_group=q_group, **kw)
@@ -85,6 +89,12 @@ class VerifyIdxBatchedDispatchTest(unittest.TestCase):
     def test_k_pages_above_table_width_is_clamped_and_padded(self):
         calls = self._case([5, 2], pps=3, k_pages=8, q_group=G)
         self.assertEqual(calls, [G])
+
+    def test_identity_shortcut_skips_scoring_when_budget_covers_bucket(self):
+        # k_pages >= pages_per_seq with the identity shortcut allowed (production default for
+        # buckets <= DSA_PAGE_TOPK_IDENTITY_MAX_PAGES): no grouped scoring call, same page sets
+        calls = self._case([5, 2], pps=3, k_pages=8, q_group=G, identity=True)
+        self.assertEqual(calls, [])
 
     def test_not_used_without_q_group(self):
         calls = self._case([3, 9], pps=4, k_pages=2, q_group=None)
