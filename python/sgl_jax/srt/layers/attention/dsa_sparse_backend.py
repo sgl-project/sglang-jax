@@ -898,8 +898,16 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md,
         page_share_group: int = 1,
         group_queries: bool = False,
+        prewrite_md=None,
     ):
         has_pages = topk_pages is not None
+        # Metadata for the replica-consistent pre-write of ALL T new rows on the DP-attend
+        # path. Spec verify hands the kernel per-token pseudo-decode metadata (one query
+        # per pseudo-sequence); the slab merge in _scatter_paged_inplace needs the ORIGINAL
+        # request bounds, otherwise two tokens of one request that share a packed slab
+        # become two read-modify-writes of the same slab and one row is reverted (stale
+        # KV for every rank that does not attend that request this step).
+        pm = prewrite_md if prewrite_md is not None else md
         if not has_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
         tp_size = self.mesh.shape["tensor"]
@@ -918,10 +926,31 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),
             P(dpa),
             P(dpa),
+            P(dpa),  # pre-write metadata: seq_lens
+            P(dpa),  # pre-write metadata: page_indices
+            P(dpa),  # pre-write metadata: cu_q_lens
+            P(dpa),  # pre-write metadata: cu_kv_lens
         )
         out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
 
-        def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, tpages_, seq_lens_, pi_, cuq_, cukv_, dist_):
+        def _run(
+            ql_,
+            qpe_,
+            kvc_,
+            kpe_,
+            cache_,
+            topk_,
+            tpages_,
+            seq_lens_,
+            pi_,
+            cuq_,
+            cukv_,
+            dist_,
+            psl_,
+            ppi_,
+            pcuq_,
+            pcukv_,
+        ):
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             k_pages_max = (
@@ -943,8 +972,17 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 new_full = jnp.pad(new_full, ((0, 0), (0, kv_dim - new_full.shape[1])))
                 # 4D-native in-place scatter: the cache must never be
                 # reshaped here — every 3D/2D view is a full relayout copy.
+                # Landing slots come from the REQUEST metadata (prewrite_md), not the
+                # kernel's per-token pseudo-sequences, so same-slab rows of one request
+                # are merged into a single read-modify-write (see prewrite_md above).
                 cache_ = _scatter_paged_inplace(
-                    cache_, new_full, seq_lens_, pi_, cuq_, cukv_, pages_per_seq
+                    cache_,
+                    new_full,
+                    psl_,
+                    ppi_,
+                    pcuq_,
+                    pcukv_,
+                    ppi_.shape[0] // psl_.shape[0],
                 )
                 # head-TP -> request-sharded (rank r owns rows [off, off+Tl))
                 ql_ = jax.lax.all_to_all(ql_, "tensor", split_axis=0, concat_axis=1, tiled=True)
@@ -999,6 +1037,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.distribution,
+            pm.seq_lens,
+            pm.page_indices,
+            pm.cu_q_lens,
+            pm.cu_kv_lens,
         )
 
     def _maybe_index_prefill_pages(
@@ -1035,7 +1077,16 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             return idx_cache, None
         k_pages = (self.index_topk + self.page_size - 1) // self.page_size
         tp_size = self.mesh.shape["tensor"]
-        tshard = tp_size > 1 and q_idx.shape[0] % tp_size == 0
+        # Shard the query rows over the tensor axis only when every rank's window holds
+        # whole verify groups: the batched grouped page-topk treats a request whose local
+        # q_len != q_group as padding (all pages -1), so e.g. tp16 with 8 requests x 4
+        # tokens (2 rows per rank) must stay replicated.
+        t_local = q_idx.shape[0] // tp_size if tp_size > 1 else q_idx.shape[0]
+        tshard = (
+            tp_size > 1
+            and q_idx.shape[0] % tp_size == 0
+            and (q_group is None or t_local % int(q_group) == 0)
+        )
         in_specs = (
             P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] replicated
             P(dpa, None),  # k_idx    [T, D_idx]
@@ -1060,17 +1111,19 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 k_.shape[0], page_size, seq_lens_, pi_, cuq_, cukv_
             )
             loc_ = jnp.where(valid_, page_ * page_size + off_, -1).astype(jnp.int32)
-            # explicit run capacity like the KV write: the default
-            # 2*(T//ps)+130 grows the SMEM run table to [3*r_cap, 4] int32,
-            # which Mosaic pads to 512 B per row -> 1.5 MiB at r_cap=1024
-            # tokens here are
-            # contiguous per sequence so runs <= pages touched + seqs
+            # explicit run capacity, the same bound the KV write uses
+            # (sparse_mla_prefill_qblock: <= ceil(q / ps) + 1 runs per sequence,
+            # i.e. T // ps + 2 * S + 2 in total): the default 2*(T//ps)+130 grows
+            # the SMEM run table to [3*r_cap, 4] int32, which Mosaic pads to
+            # 512 B per row -> 1.5 MiB at r_cap=1024, while a smaller cap
+            # silently drops runs once many sequences cross a page boundary
+            # (the run-table path has no overflow fallback).
             cache4d = paged_write_back(
                 cache_,
                 k_.astype(cache_.dtype),
                 loc_,
                 page_size=page_size,
-                r_cap=k_.shape[0] // page_size + seq_lens_.shape[0] + 34,
+                r_cap=k_.shape[0] // page_size + 2 * seq_lens_.shape[0] + 2,
                 interpret=jax.default_backend() == "cpu",
                 # 10-06 (closed-levers review): the verify step writes <=256 indexer rows
                 # per layer here; the run-table kernel's per-run DMAs are latency-bound at
@@ -1303,6 +1356,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             pmd,
             page_share_group=page_share_group,
             group_queries=group_queries,
+            # replica pre-write on the DP-attend path: merge same-slab rows per REQUEST
+            prewrite_md=md,
         )
         return o, DSAFusedCache(
             kv=kv_cache,

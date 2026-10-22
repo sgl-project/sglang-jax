@@ -322,3 +322,52 @@ def test_k5b_shared_slab_rows_all_landed():
     seq_lens = [8, 12, 20, 36, 4]
     out = _check_verify(rng, seq_lens, [4] * 5, T_pad=20)
     assert out.shape == (40, V_S, PACK, D)
+
+
+def test_verify_pseudo_decode_metadata_defeats_merge_request_metadata_lands_all():
+    """#1811 review (DP-attend grouped verify): the decode-form verify path hands the kernel
+    per-token pseudo-decode metadata (every token its own one-query sequence). Fed to
+    ``_scatter_paged_inplace`` that metadata makes every token a slab owner, so the two tokens
+    of one request sharing a packed slab become two read-modify-writes of that slab and one
+    row is reverted. The replica pre-write therefore has to use the ORIGINAL request
+    metadata (``_run_sparse(prewrite_md=md)``), which merges them and lands every row."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+        _spec_pseudo_decode_metadata,
+    )
+
+    rng = np.random.default_rng(17)
+    seq_lens = [8, 12, 20, 36, 4, 9, 15, 33]
+    G = 4
+    T_pad = 32
+    cache4d, new_tokens, sl, pi, cu_q, cu_kv = _mk_verify_batch(
+        rng, seq_lens, [G] * len(seq_lens), T_pad, V_PAGE_SIZE, 4, 40
+    )
+    page, off, valid = _paged_landing(T_pad, V_PAGE_SIZE, sl, pi, cu_q, cu_kv)
+    p, o, v = (np.asarray(a) for a in (page, off, valid))
+    rows = np.asarray(new_tokens)
+
+    def landed(out):
+        return sum(
+            np.array_equal(out[p[i], o[i] // PACK, o[i] % PACK], rows[i])
+            for i in range(T_pad)
+            if v[i]
+        )
+
+    kv_len, pcu_q, pcu_kv, ppi, _ = _spec_pseudo_decode_metadata(
+        sl, cu_q, cu_kv, pi, T_pad, V_PAGE_SIZE
+    )
+    # same landing slots either way ...
+    pp, po, pv = (
+        np.asarray(a) for a in _paged_landing(T_pad, V_PAGE_SIZE, kv_len, ppi, pcu_q, pcu_kv)
+    )
+    np.testing.assert_array_equal(pp[v], p[v])
+    np.testing.assert_array_equal(po[v], o[v])
+    np.testing.assert_array_equal(pv, v)
+    # ... but the pseudo-sequences carry no request bounds: rows are lost
+    out_pseudo = np.asarray(
+        _scatter_paged_inplace(cache4d, new_tokens, kv_len, ppi, pcu_q, pcu_kv, 0)
+    )
+    assert landed(out_pseudo) < int(v.sum()), "per-token metadata unexpectedly landed every row"
+    # the request metadata merges same-slab rows and lands all of them
+    out_req = np.asarray(_scatter_paged_inplace(cache4d, new_tokens, sl, pi, cu_q, cu_kv, 4))
+    assert landed(out_req) == int(v.sum())
