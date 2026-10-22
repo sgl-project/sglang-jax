@@ -388,6 +388,7 @@ class CompilationManager:
     def compiler_options(backend, batch=None, overrides=None):
         from sgl_jax.srt.model_executor.aot_dispatch import (
             decode_no_sc_gather_compiler_options_fn,
+            prefill_compiler_options_fn,
         )
         from sgl_jax.srt.utils.common_utils import get_bool_env_var
         from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
@@ -399,6 +400,9 @@ class CompilationManager:
             decode_options = decode_no_sc_gather_compiler_options_fn()
             if decode_options is not None:
                 options.update(decode_options((batch,)) or {})
+            prefill_options = prefill_compiler_options_fn()
+            if prefill_options is not None:
+                options.update(prefill_options((batch,)) or {})
         options.update(overrides or {})
         return options
 

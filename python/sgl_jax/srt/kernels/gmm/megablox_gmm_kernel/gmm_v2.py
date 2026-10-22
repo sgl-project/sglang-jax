@@ -10,6 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.tuned_tile_sizes import (
     get_tuned_gmm_v2_tile_sizes,
 )
@@ -73,6 +74,32 @@ class GmmConfigs:
     out_dtype: jnp.dtype
     acc_dtype: jnp.dtype
     zero_init: bool
+    skip_prefix: bool = False  # metadata scan starts at group_offset (EP rank-independent cost)
+    # SwiGLU epilogue: rhs columns are interleaved in chunks [gate(chunk) | up(chunk)] ...;
+    # the kernel writes silu(gate) * up, so the output is size_n // 2 wide.
+    glu_chunk: int | None = None
+
+    @property
+    def out_tile_n(self) -> int:
+        return self.tiles.tile_n // 2 if self.glu_chunk else self.tiles.tile_n
+
+
+def glu_from_interleaved(x: jax.Array, chunk: int, compute_dtype=jnp.float32) -> jax.Array:
+    """silu(gate) * up over a last axis laid out as [gate_0 | up_0 | gate_1 | up_1 | ...]
+    (chunk columns each). Math in ``compute_dtype`` with one rounding at the caller's cast,
+    i.e. the same contraction XLA's fused ``silu(w0) * w1`` performs on the un-interleaved
+    outputs. Returns half the input width."""
+    n = x.shape[-1]
+    if n % (2 * chunk) != 0:
+        raise ValueError(
+            f"glu_from_interleaved: width {n} is not a multiple of 2*chunk={2 * chunk}"
+        )
+    outs = []
+    for c in range(0, n, 2 * chunk):
+        g = x[..., c : c + chunk].astype(compute_dtype)
+        u = x[..., c + chunk : c + 2 * chunk].astype(compute_dtype)
+        outs.append(g * jax.nn.sigmoid(g) * u)
+    return jnp.concatenate(outs, axis=-1)
 
 
 TileFn = Callable[[jnp.dtype, jnp.dtype, Dimensions, int], TileSizes]
@@ -173,7 +200,7 @@ def generate_block_specs(
     )
 
     out_block_spec = pl.BlockSpec(
-        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n),
+        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.out_tile_n),
         index_map.out_index_map,
     )
 
@@ -195,6 +222,7 @@ def inner_kernel(
     partial_out_ref: jax.Array,  # [size_lhs_sublane, tile_n]
     acc_ref: jax.Array,  # [tile_m, tile_n]
     metadata_ref: MetadataRef,
+    glu_pre_ref: jax.Array | None = None,  # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
     *,
     cfgs: GmmConfigs,
 ):
@@ -298,6 +326,13 @@ def inner_kernel(
                     # Convert lhs into quantized dtype.
                     block_lhs_q = (block_lhs / block_scale).astype(lhs_q_dtype)
 
+                    if jnp.issubdtype(lhs_q_dtype, jnp.floating) and not jnp.issubdtype(
+                        block_rhs.dtype, jnp.floating
+                    ):
+                        # Integer weights on the fp8 MXU (W4A8 on chips without an
+                        # int8 MXU): int4 values are exact in e4m3, so upcast the
+                        # weight tile in-kernel. See select_lhs_quant_dtype.
+                        block_rhs = block_rhs.astype(lhs_q_dtype)
                     block_acc = jnp.matmul(
                         block_lhs_q,
                         block_rhs,
@@ -340,10 +375,14 @@ def inner_kernel(
 
             iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
             mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
-            acc_masked = jnp.where(mask, acc, 0).reshape(tiled_out_ref.shape)
+            # With the GLU epilogue the full-width pre-activation tile lives in
+            # glu_pre_ref (so the partial-row carry below stays pre-activation) and
+            # only the activated half-width tile reaches tiled_out_ref.
+            dst_ref = glu_pre_ref if cfgs.glu_chunk else tiled_out_ref
+            acc_masked = jnp.where(mask, acc, 0).reshape(dst_ref.shape)
 
             # Write the final output to the output ref.
-            tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype)
+            dst_ref[...] = acc_masked.astype(dst_ref.dtype)
 
             # If this is the first tile for grid[n_id, :, :], we initialize the
             # partial out to zeros. Otherwise, partial out from last tile of
@@ -351,7 +390,7 @@ def inner_kernel(
             partial_out_zeros = jnp.zeros_like(partial_out_ref)
 
             # Accumulate the partial output from the previous step.
-            tiled_out_ref[0] += jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
+            dst_ref[0] += jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
 
             # Consider following case where size_lhs_sublane = 4, number denotes group
             # id and | denotes boundaries between sublanes:
@@ -367,8 +406,12 @@ def inner_kernel(
             partial_out_ref[...] = jnp.where(
                 m_end_local % cfgs.dims.size_lhs_sublane == 0,
                 partial_out_zeros,
-                tiled_out_ref[last_row],
+                dst_ref[last_row],
             )
+            if cfgs.glu_chunk:
+                tiled_out_ref[...] = glu_from_interleaved(dst_ref[...], cfgs.glu_chunk).astype(
+                    tiled_out_ref.dtype
+                )
         else:
             acc_ref[...] = acc
 
@@ -411,12 +454,20 @@ def inner_kernel(
     )
 
 
+# The metadata scan starts at group_offset instead of group 0 unless the caller passes
+# skip_prefix_groups=False. Under EP the scan over the non-local groups is pure overhead that
+# grows linearly with the EP rank (rank 7 of 8 scans 224 extra groups per call, ~65 ns each on
+# v7x -> ~15 us per layer), which every other rank then waits for at the next all-reduce.
+_SKIP_PREFIX_GROUPS = True
+
+
 def fill_metadata(
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    m_start_ref: jax.Array | None = None,  # int32[1]: rows before group_offset (skip-prefix mode)
 ) -> jax.Array:
     """Fills the metadata for the given lhs group sizes and group offset.
 
@@ -495,7 +546,13 @@ def fill_metadata(
 
         return next_num_gm, end_m_offset
 
-    num_gm, _ = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
+    if m_start_ref is not None:
+        # groups before group_offset contribute only their row count, precomputed by the wrapper
+        num_gm, _ = lax.fori_loop(
+            group_offset, max_num_group, outer_group_loop, (0, m_start_ref[0])
+        )
+    else:
+        num_gm, _ = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
     return num_gm
 
 
@@ -537,7 +594,7 @@ def zero_out_start(
         dma_size = dma_end - dma_start
 
         # Static loop. Will be unrolled during compile time.
-        for n_start in range(0, dims.size_n, num_lanes):
+        for n_start in range(0, out_ref.shape[-1], num_lanes):
             n_end = n_start + num_lanes
             pltpu.make_async_copy(
                 src_ref=zero_dma.at[pl.ds(0, dma_size)],
@@ -579,6 +636,23 @@ def kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
+    *rest,
+    cfgs: GmmConfigs,
+):
+    """Entry point; unpacks the optional third scalar prefetch (skip-prefix row start)."""
+    if cfgs.skip_prefix:
+        m_start_ref, rest = rest[0], rest[1:]
+    else:
+        m_start_ref = None
+    return _kernel_main(
+        lhs_group_sizes_ref, group_offset_ref, *rest, cfgs=cfgs, m_start_ref=m_start_ref
+    )
+
+
+def _kernel_main(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
     # In
     lhs_ref: jax.Array,  # [size_m, size_k]
     rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
@@ -590,8 +664,10 @@ def kernel_main(
     metadata_ref: MetadataRef,
     zero_ref: jax.Array | None,  # [tile_zero_m, num_lanes]
     semaphore_ref: jax.Array | None,  # [1]
+    glu_pre_ref: jax.Array | None = None,  # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
     *,
     cfgs: GmmConfigs,
+    m_start_ref: jax.Array | None = None,
 ):
     """Entry point for GMM kernel.
 
@@ -629,6 +705,7 @@ def kernel_main(
         group_offset_ref,
         metadata_ref,
         cfgs=cfgs,
+        m_start_ref=m_start_ref,
     )
 
     in_specs, out_specs = generate_block_specs(metadata_ref, cfgs)
@@ -656,6 +733,8 @@ def kernel_main(
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
+    if cfgs.glu_chunk:
+        scratches.append(glu_pre_ref)
     pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
 
     if cfgs.zero_init:
@@ -824,6 +903,37 @@ def get_scope_name(dims: Dimensions, tiles: TileSizes) -> str:
     )
 
 
+def select_lhs_quant_dtype(rhs_quant_dtype: jnp.dtype, tpu_info: pltpu.TpuInfo) -> jnp.dtype | None:
+    """Picks the activation (lhs) quant dtype for a quantized rhs on this chip.
+
+    Returns None when the chip has no MXU mode that can consume the rhs dtype
+    group directly; the kernel then runs unquantized (bf16) activations.
+
+      * float rhs (fp8): e4m3 on chips with an fp8 MXU.
+      * int8 rhs: int8 on chips with an int8 MXU.
+      * int4 rhs: int8 on chips with an int8 MXU; otherwise e4m3 on chips with
+        an fp8 MXU (W4A8). Every int4 value is exactly representable in e4m3,
+        so the kernel upcasts the weight tile and the result matches an int8
+        MXU bit-for-bit up to the activation rounding, which is the same e4m3
+        rounding the fp8 checkpoints already use. ``SGLANG_JAX_GMM_INT4_A8=0``
+        disables this fallback and keeps bf16 activations (W4A16).
+    """
+    rhs_quant_dtype = jnp.dtype(rhs_quant_dtype)
+    if jnp.issubdtype(rhs_quant_dtype, jnp.floating):
+        if tpu_info.fp8_ops_per_second > 0:
+            return jnp.dtype(jnp.float8_e4m3fn)
+        return None
+    if tpu_info.int8_ops_per_second > 0:
+        return jnp.dtype(jnp.int8)
+    if (
+        rhs_quant_dtype == jnp.dtype(jnp.int4)
+        and tpu_info.fp8_ops_per_second > 0
+        and envs.SGLANG_JAX_GMM_INT4_A8.get()
+    ):
+        return jnp.dtype(jnp.float8_e4m3fn)
+    return None
+
+
 def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -838,6 +948,8 @@ def make_gmm_configs(
     acc_dtype: jnp.dtype | None,
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
+    skip_prefix: bool = False,
+    glu_chunk: int | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -862,16 +974,7 @@ def make_gmm_configs(
 
     lhs_q_dtype = None
     if maybe_quantize_lhs and rhs_quant_dtype is not None:
-        # Choose lhs quantization dtype based on TPU hardware support.
-        is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
-        tpu_info = pltpu.get_tpu_info()
-        # Check if there is hardware compute support for rhs dtype group.
-        if is_rhs_float:
-            if tpu_info.fp8_ops_per_second > 0:
-                lhs_q_dtype = jnp.float8_e4m3fn.dtype
-        else:
-            if tpu_info.int8_ops_per_second > 0:
-                lhs_q_dtype = jnp.int8.dtype
+        lhs_q_dtype = select_lhs_quant_dtype(rhs_quant_dtype, pltpu.get_tpu_info())
 
     # Default lhs quantization block: input quantization involves reading all
     # elements in a block to compute the scale value. Since this operation is
@@ -883,6 +986,18 @@ def make_gmm_configs(
         # rescaled by its own rhs scale before accumulation, so the lhs quant
         # granularity must match the rhs block grid exactly.
         lhs_quant_block_size = block_size
+    elif lhs_q_dtype is not None and envs.SGLANG_JAX_GMM_LHS_QBLOCK.get() > 0:
+        # Per-channel (or unscaled) rhs: the lhs block is free to choose.
+        lhs_quant_block_size = envs.SGLANG_JAX_GMM_LHS_QBLOCK.get()
+    elif lhs_q_dtype is not None and rhs_quant_dtype == jnp.dtype(jnp.int4):
+        # Per-channel int4 weights (W4A8, new in this change; fp8 and int8 rhs
+        # keep the 512 default above): default to the FP8 W8A8 path's
+        # 128-element activation granularity so the only numerical difference
+        # from the FP8 baseline is the weight quantization itself. Larger blocks
+        # trade accuracy for throughput (GLM-5.2 tp8, 2026-09-29: 512 -> gsm8k
+        # p1-200 0.930 vs 0.955, cc64 +44%); set SGLANG_JAX_GMM_LHS_QBLOCK to
+        # opt into 256/512 when throughput matters more than parity.
+        lhs_quant_block_size = 128
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
@@ -901,7 +1016,18 @@ def make_gmm_configs(
     else:
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
         tiles = tile_info(lhs_q_dtype, rhs.dtype, dims, vmem_limit_bytes)
+        if glu_chunk:
+            # The auto-tiler only sizes tile_n for VMEM (bf16 k=6144 n=4096 -> 1408 on v6e/v7x);
+            # snap it down to whole [gate | up] chunk pairs so the epilogue tiles line up. Rounding
+            # down only shrinks the rhs buffer, so the VMEM budget still holds. Explicit TileSizes
+            # are the caller's contract and stay strictly validated below.
+            tiles = dataclasses.replace(
+                tiles,
+                tile_n=align_glu_tile_n(tile_n=tiles.tile_n, size_n=dims.size_n, chunk=glu_chunk),
+            )
 
+    if glu_chunk:
+        validate_glu_chunk(tile_n=tiles.tile_n, size_n=dims.size_n, chunk=glu_chunk)
     return GmmConfigs(
         dims=dims,
         tiles=tiles,
@@ -910,7 +1036,27 @@ def make_gmm_configs(
         out_dtype=out_dtype,
         acc_dtype=acc_dtype,
         zero_init=zero_initialize,
+        skip_prefix=skip_prefix,
+        glu_chunk=int(glu_chunk) if glu_chunk else None,
     )
+
+
+def validate_glu_chunk(*, tile_n: int, size_n: int, chunk: int) -> None:
+    """The interleaved [gate | up] chunk pairs must tile both the rhs width and tile_n."""
+    if chunk <= 0 or chunk % 128 != 0:
+        raise ValueError(f"glu_chunk={chunk} must be a positive multiple of 128 lanes")
+    if size_n % (2 * chunk) != 0:
+        raise ValueError(f"glu_chunk={chunk}: size_n={size_n} is not a multiple of 2*chunk")
+    if tile_n % (2 * chunk) != 0:
+        raise ValueError(f"glu_chunk={chunk}: tile_n={tile_n} is not a multiple of 2*chunk")
+
+
+def align_glu_tile_n(*, tile_n: int, size_n: int, chunk: int) -> int:
+    """Largest multiple of ``2 * chunk`` that is <= ``tile_n`` (never below one pair, never above
+    ``size_n``), i.e. the auto-tiler's VMEM-driven width snapped to whole interleaved chunk pairs.
+    """
+    pair = 2 * chunk
+    return min(max(pair, (tile_n // pair) * pair), size_n)
 
 
 def get_metadata(cfgs: GmmConfigs):
@@ -935,6 +1081,8 @@ def get_metadata(cfgs: GmmConfigs):
         "acc_dtype",
         "maybe_quantize_lhs",
         "zero_initialize",
+        "skip_prefix_groups",
+        "glu_chunk",
     ]
 )
 def gmm_v2(
@@ -952,6 +1100,10 @@ def gmm_v2(
     acc_dtype: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
+    skip_prefix_groups: bool | None = None,
+    glu_chunk: (
+        int | None
+    ) = None,  # SwiGLU epilogue over interleaved [gate|up] chunks; out = size_n // 2
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1002,6 +1154,8 @@ def gmm_v2(
         acc_dtype=acc_dtype,
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
+        skip_prefix=_SKIP_PREFIX_GROUPS if skip_prefix_groups is None else bool(skip_prefix_groups),
+        glu_chunk=glu_chunk,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1062,16 +1216,34 @@ def gmm_v2(
         ]
     else:
         scratch_shapes += [None, None]
+    if cfgs.glu_chunk:
+        scratch_shapes.append(
+            pltpu.VMEM(
+                (tiles.tile_m // dims.size_lhs_sublane, dims.size_lhs_sublane, tiles.tile_n),
+                cfgs.out_dtype,
+            )
+        )
+    else:
+        scratch_shapes.append(None)
 
     aligned_n = align_to(dims.size_n, num_lanes)
+    if cfgs.glu_chunk:
+        aligned_n //= 2
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+
+    prefetch = [group_sizes, group_offset]
+    if cfgs.skip_prefix:
+        # rows that belong to the groups before group_offset (their tiles are never processed)
+        gidx = jnp.arange(group_sizes.shape[0], dtype=jnp.int32)
+        m_start = jnp.sum(jnp.where(gidx < group_offset[0], group_sizes, 0)).astype(jnp.int32)[None]
+        prefetch.append(m_start)
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=len(prefetch),
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 WeightsRef(
@@ -1090,7 +1262,7 @@ def gmm_v2(
         name=get_scope_name(dims, tiles),
         cost_estimate=get_cost_estimate(lhs, rhs_weights, out_init.dtype, dims),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:, : dims.size_n]
+    )(*prefetch, lhs, rhs_weights)[:, : dims.size_n]
 
 
 def is_supported_by_gmm_v2(

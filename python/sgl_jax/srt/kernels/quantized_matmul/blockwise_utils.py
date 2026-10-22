@@ -395,11 +395,17 @@ def get_safe_blockwise_tuned_value(
     # nearest power-of-two multiple for TPU alignment.
     out_block_size = _next_multiple(max(int(tuned.out_block_size), compute_tile_n), compute_tile_n)
     out_block_size = min(out_block_size, _floor_multiple(int(n_out), compute_tile_n))
-    out_block_size = _nearest_power_of_two_multiple(
-        out_block_size,
-        compute_tile_n,
-        _floor_multiple(int(n_out), compute_tile_n),
-    )
+    # Keep a tuned out block that already divides N exactly (e.g. 768 for
+    # N=768, 1536 for N=1536): it is compute-tile aligned and the kernel
+    # wrapper then never pads the weight; snapping it to a power of two
+    # (768 -> 512, 1536 -> 1024) re-introduces a per-call weight pad and
+    # silently discards the swept value (GLM-5.2 v7x rows).
+    if out_block_size <= 0 or int(n_out) % out_block_size != 0:
+        out_block_size = _nearest_power_of_two_multiple(
+            out_block_size,
+            compute_tile_n,
+            _floor_multiple(int(n_out), compute_tile_n),
+        )
     # in (K): must be a multiple of the quantization block_size_in so that
     # each tile boundary aligns with a scale-block boundary.
     in_block_size = max(int(tuned.in_block_size), int(block_size_in))

@@ -195,6 +195,11 @@ class ModelConfig:
         # Only set when non-None: HuggingFace's to_dict() calls
         # self.quantization_config.to_dict() without a None guard, so assigning
         # None here would crash any repr() on the config (e.g. inside JAX tracing).
+        # Keep the checkpoint's raw quantization dict: the unified config
+        # replaces it below, but model hooks (e.g. the GLM NextN draft under a
+        # user yaml) still need its modules_to_not_convert.
+        raw_hf_quant = getattr(self.hf_config, "quantization_config", None)
+        self.hf_quantization_config_raw = raw_hf_quant if isinstance(raw_hf_quant, dict) else None
         if self.quantization_config is not None:
             self.hf_config.quantization_config = self.quantization_config
 

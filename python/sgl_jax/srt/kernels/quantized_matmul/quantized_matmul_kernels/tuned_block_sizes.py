@@ -647,6 +647,16 @@ TUNED_BLOCK_SIZES_RAW = {
     # out_block must stay a multiple of the 256-lane MXU column. Validated
     # on v7x 2026-08-09. n_out=128 shapes keep the fallback path.
     (7, 1, 2048, 6144, "bfloat16", "float8_e4m3fn"): (1, 2048, 2048),
+    # GLM-5.2 fused input projection (q_a + kv_a + indexer.wk = 2752, zero-padded to 3072):
+    # the out block must be a power-of-two multiple of 256 that divides N, or the wrapper
+    # pads the weight on every call; 1024 keeps the per-call pad out of the graph.
+    (7, 1, 3072, 6144, "bfloat16", "float8_e4m3fn"): (1, 1024, 2048),
+    (7, 8, 3072, 6144, "bfloat16", "float8_e4m3fn"): (8, 1024, 2048),
+    (7, 32, 3072, 6144, "bfloat16", "float8_e4m3fn"): (32, 1024, 2048),
+    (7, 64, 3072, 6144, "bfloat16", "float8_e4m3fn"): (64, 1024, 2048),
+    (7, 512, 3072, 6144, "bfloat16", "float8_e4m3fn"): (64, 1024, 6144),
+    (7, 1024, 3072, 6144, "bfloat16", "float8_e4m3fn"): (128, 1024, 6144),
+    (7, 8192, 3072, 6144, "bfloat16", "float8_e4m3fn"): (256, 1024, 6144),
     (7, 8, 2048, 6144, "bfloat16", "float8_e4m3fn"): (8, 2048, 2048),
     (7, 32, 2048, 6144, "bfloat16", "float8_e4m3fn"): (32, 2048, 2048),
     (7, 64, 2048, 6144, "bfloat16", "float8_e4m3fn"): (64, 2048, 2048),
@@ -697,6 +707,54 @@ TUNED_BLOCK_SIZES_RAW = {
     (7, 8192, 4096, 2048, "bfloat16", "float8_e4m3fn"): (512, 2048, 2048),
     (7, 8192, 6144, 1024, "bfloat16", "float8_e4m3fn"): (1024, 2048, 1024),
     (7, 8192, 6144, 128, "bfloat16", "float8_e4m3fn"): (2048, 2048, 128),
+    # GLM-5.2 v7x tp8/ep8 per-shard prefill shapes (m=8192 chunk, m=1024 short
+    # prompt), swept 2026-09-29 on tpu7x-8 (jax 0.11.1 / libtpu 0.0.46.1, sglang-jax
+    # GLM-5.2 production tree) with 32 rotating weight copies, min-of-3; kernel-time
+    # regime (50-650 us). Borrowed nearest-shape values were 19-84% slower
+    # (dense_down 8192: 653 -> 354 us; shared_down 1024: 171 -> 51 us). Out blocks
+    # 1536 rely on the exact-divisor rule in blockwise_utils.get_safe_blockwise_tuned_value.
+    (7, 1024, 1536, 6144, "bfloat16", "float8_e4m3fn"): (256, 1536, 2048),
+    (7, 8192, 1536, 6144, "bfloat16", "float8_e4m3fn"): (1024, 1536, 1024),
+    (7, 1024, 6144, 1536, "bfloat16", "float8_e4m3fn"): (1024, 2048, 1536),
+    (7, 8192, 6144, 1536, "bfloat16", "float8_e4m3fn"): (1024, 2048, 1536),
+    (7, 1024, 6144, 256, "bfloat16", "float8_e4m3fn"): (256, 2048, 256),
+    (7, 8192, 6144, 256, "bfloat16", "float8_e4m3fn"): (1024, 1024, 256),
+    (7, 1024, 256, 6144, "bfloat16", "float8_e4m3fn"): (256, 256, 6144),
+    (7, 8192, 256, 6144, "bfloat16", "float8_e4m3fn"): (1024, 256, 2048),
+    # tp8 decode buckets (m = 1/8/16/32/64) and m=1024, device-timed 2026-09-29 (32 kernel calls
+    # per dispatch on rotating weight copies): shared_down borrowed (m/256/128) 10.5 us -> 4.2 us,
+    # dense_gateup 27.5 -> 15.8 us, dense_down 20 -> 14.8 us, o_proj m=32/64 24.6/22.7 -> 19.6 us;
+    # rows equal to the previous nearest-shape borrow are kept explicit so table growth cannot
+    # change what they resolve to.
+    (7, 1024, 2048, 2048, "bfloat16", "float8_e4m3fn"): (256, 2048, 2048),
+    (7, 32, 6144, 2048, "bfloat16", "float8_e4m3fn"): (32, 2048, 2048),
+    (7, 64, 6144, 2048, "bfloat16", "float8_e4m3fn"): (64, 2048, 2048),
+    (7, 1, 1536, 6144, "bfloat16", "float8_e4m3fn"): (8, 1536, 2048),
+    (7, 1, 6144, 1536, "bfloat16", "float8_e4m3fn"): (8, 2048, 1536),
+    (7, 1, 6144, 256, "bfloat16", "float8_e4m3fn"): (8, 2048, 256),
+    (7, 1, 256, 6144, "bfloat16", "float8_e4m3fn"): (8, 256, 2048),
+    (7, 1, 128, 6144, "bfloat16", "float8_e4m3fn"): (8, 256, 2048),
+    (7, 8, 1536, 6144, "bfloat16", "float8_e4m3fn"): (8, 1536, 2048),
+    (7, 8, 6144, 1536, "bfloat16", "float8_e4m3fn"): (8, 2048, 1536),
+    (7, 8, 6144, 256, "bfloat16", "float8_e4m3fn"): (8, 2048, 256),
+    (7, 8, 256, 6144, "bfloat16", "float8_e4m3fn"): (8, 256, 2048),
+    (7, 8, 128, 6144, "bfloat16", "float8_e4m3fn"): (8, 256, 2048),
+    (7, 16, 1536, 6144, "bfloat16", "float8_e4m3fn"): (16, 1536, 2048),
+    (7, 16, 6144, 1536, "bfloat16", "float8_e4m3fn"): (16, 2048, 1536),
+    (7, 16, 6144, 256, "bfloat16", "float8_e4m3fn"): (16, 2048, 256),
+    (7, 16, 256, 6144, "bfloat16", "float8_e4m3fn"): (16, 256, 2048),
+    (7, 16, 128, 6144, "bfloat16", "float8_e4m3fn"): (16, 256, 2048),
+    (7, 32, 1536, 6144, "bfloat16", "float8_e4m3fn"): (32, 1536, 2048),
+    (7, 32, 6144, 1536, "bfloat16", "float8_e4m3fn"): (32, 2048, 1536),
+    (7, 32, 6144, 256, "bfloat16", "float8_e4m3fn"): (32, 2048, 256),
+    (7, 32, 256, 6144, "bfloat16", "float8_e4m3fn"): (32, 256, 2048),
+    (7, 32, 128, 6144, "bfloat16", "float8_e4m3fn"): (32, 256, 2048),
+    (7, 64, 1536, 6144, "bfloat16", "float8_e4m3fn"): (64, 1536, 2048),
+    (7, 64, 6144, 1536, "bfloat16", "float8_e4m3fn"): (64, 2048, 1536),
+    (7, 64, 6144, 256, "bfloat16", "float8_e4m3fn"): (64, 2048, 256),
+    (7, 64, 256, 6144, "bfloat16", "float8_e4m3fn"): (64, 256, 2048),
+    (7, 64, 128, 6144, "bfloat16", "float8_e4m3fn"): (64, 256, 2048),
+    (7, 1024, 128, 6144, "bfloat16", "float8_e4m3fn"): (256, 256, 6144),
     (7, 8192, 6144, 768, "bfloat16", "float8_e4m3fn"): (1024, 2048, 768),
     (7, 8192, 768, 6144, "bfloat16", "float8_e4m3fn"): (256, 768, 6144),
     # go/keep-sorted end

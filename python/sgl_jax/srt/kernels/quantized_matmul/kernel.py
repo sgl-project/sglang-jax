@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from sgl_jax.srt.kernels.collectives.oneshot_allreduce import maybe_oneshot_psum
 from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
     get_blockwise_kernel,
     get_safe_blockwise_tuned_value,
@@ -148,6 +149,6 @@ def xla_quantized_matmul_local(
                 out, axis_name=reduce_axis, scatter_dimension=output_scatter_dimension, tiled=True
             )
         else:
-            out = lax.psum(out, axis_name=reduce_axis)
+            out = maybe_oneshot_psum(out, reduce_axis, site="qmm")
 
     return out

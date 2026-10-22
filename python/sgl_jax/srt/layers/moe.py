@@ -1,5 +1,6 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
+import logging
 import math
 from functools import partial
 
@@ -11,7 +12,15 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+from sgl_jax.srt.kernels.collectives.oneshot_allreduce import (
+    fused_moe_enabled,
+    maybe_oneshot_psum,
+    reduce_deferred,
+)
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2_fused_glu import (
+    gmm_v2_fused_glu,
+)
 from sgl_jax.srt.kernels.sparse_core.moe_permute import (
     moe_sc_permute_enabled_by_env,
     sc_combine,
@@ -23,12 +32,99 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
 from sgl_jax.srt.model_loader.weights import WeightSpec
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
-    is_int4_dtype,
     quantize_tensor,
     quantize_tensor_simple,
 )
+
+logger = logging.getLogger(__name__)
+
+# For tokens * topk <= PERMUTE_KERNEL_MAX_ROWS the routing indices (stable argsort / bincount /
+# inverse) come from one small Pallas call instead of three XLA sort/reduce programs (bs1 census
+# 10-05: 0.53 ms/step of 1.7-2.4 us ops). Bit-exact.
+from sgl_jax.srt.kernels.moe_permute_small.kernel import (  # noqa: E402
+    PERMUTE_KERNEL_MAX_ROWS as _PERMUTE_KERNEL_MAX_ROWS,
+)
+from sgl_jax.srt.kernels.moe_permute_small.kernel import (  # noqa: E402
+    permute_indices_small as _permute_indices_small,
+)
+
+# fuse_gate_up() interleaves gate/up columns in 256-wide pairs and GEMM1 applies silu(gate) * up
+# in the gmm_v2 epilogue (output already [tokens, N]); removes the XLA activation fusion between
+# GEMM1 and GEMM2 (silu activation only).
+_GLU_EPILOGUE_CHUNK = 256
+_GLU_LOGGED: list = []
+
+
+def glu_epilogue_chunk(activation: str, intermediate_per_device: int) -> int:
+    """Interleave chunk for the gmm_v2 SwiGLU epilogue, or 0 (plain gate|up concat, activation
+    applied by XLA) when the activation is not silu or the per-device intermediate width is not
+    a multiple of the chunk (``validate_glu_chunk`` needs ``2N % (2 * chunk) == 0``)."""
+    if activation != "silu" or intermediate_per_device % _GLU_EPILOGUE_CHUNK != 0:
+        return 0
+    return _GLU_EPILOGUE_CHUNK
+
+
+def _explicit_spec(x: jax.Array):
+    """The operand's PartitionSpec padded to its rank when it carries an explicit-axes
+    sharding (reshapes of a sharded dim then need ``out_sharding``), else None."""
+    try:
+        sharding = jax.typeof(x).sharding
+    except Exception:  # noqa: BLE001 - concrete arrays without a typed sharding
+        return None
+    spec = getattr(sharding, "spec", None)
+    mesh = getattr(sharding, "mesh", None)
+    if spec is None or mesh is None or getattr(mesh, "empty", True):
+        return None
+    if not all(t == jax.sharding.AxisType.Explicit for t in mesh.axis_types):
+        return None
+    spec = tuple(spec) + (None,) * (x.ndim - len(spec))
+    return spec
+
+
+def interleave_gate_up(w0: jax.Array, w1: jax.Array, chunk: int) -> jax.Array:
+    """[..., N] x2 -> [..., 2N] laid out as [w0[:chunk] | w1[:chunk] | w0[chunk:2chunk] | ...].
+    Pairs with ``gmm_v2(glu_chunk=chunk)`` / ``glu_from_interleaved``. Under explicit sharding
+    the split / merged last dim keeps the operand's own axis (a size-1 ``tensor`` axis is still
+    an annotation the reshape has to be told about)."""
+    n = w0.shape[-1]
+    if w1.shape != w0.shape or n % chunk != 0:
+        raise ValueError(f"interleave_gate_up: shapes {w0.shape}/{w1.shape}, chunk {chunk}")
+    lead = w0.shape[:-1]
+    spec = _explicit_spec(w0)
+    if spec is None:
+        a = w0.reshape(*lead, n // chunk, 1, chunk)
+        b = w1.reshape(*lead, n // chunk, 1, chunk)
+        return jnp.concatenate([a, b], axis=-2).reshape(*lead, 2 * n)
+    split_spec = P(*spec[:-1], spec[-1], None, None)
+    a = w0.reshape(*lead, n // chunk, 1, chunk, out_sharding=split_spec)
+    b = w1.reshape(*lead, n // chunk, 1, chunk, out_sharding=split_spec)
+    return jnp.concatenate([a, b], axis=-2).reshape(*lead, 2 * n, out_sharding=P(*spec))
+
+
+# The down-projection memset is skipped on the SparseCore-combine path (dispatch set
+# ``local_range`` / ``valid_mask``, i.e.
+# should_use_sparse_core() was true for this batch): there the combine is sc_combine ->
+# ragged_gather_reduce, which gathers only valid rows (SC kernel: stable partition of valid rows;
+# TC fallback: jnp.where after the multiply), so the unvisited 7/8 of out[M_total, K] is never
+# read. The XLA combine (small batches, no SparseCore) keeps the memset: its einsum multiplies
+# every gathered row by its weight and a stale NaN row would poison the sum.
+# Kernel benchmark (v7x, 8k two-window shape m_32768): down gmm 198.1 -> 152.4 us (-23 %),
+# visited rows bitwise identical. Two-call (prefill) path only; the fused GLU+down path is untouched.
+_MOE_DOWN_ZERO_INIT_SKIP_LOGGED = False
+# Fused GLU+down: gate_up -> SwiGLU -> down as ONE pallas_call
+# (kernels/gmm/megablox_gmm_kernel/gmm_v2_fused_glu.py) when the GLU-epilogue gmm_v2 path is active,
+# activations are quantized and both halves would tile with one grid step per expert (GLM-5.2 v7x int4
+# W4A8 decode). Bit-identical to the two calls; saves one pallas_call + one grid step per expert + the
+# HBM round trip of the intermediate. Falls back to the two-call path whenever the fused wrapper declines
+# the shapes. Row cap (rows per device after dispatch): decode/verify batches on GLM-5.2 2x2x1 are
+# <= 2048 rows (cc64 x 4 draft x top-8); prefill is far above it and keeps the two-call path.
+_MOE_FUSED_GLU_DOWN_MAX_ROWS = 2048
+# Row tile for the fused GLU+down kernel, applied when M > tile_m (decode shapes: one grid step per
+# expert at 32 rows; kernel default would be min(M, 128)).
+_MOE_FUSED_TILE_M = 32
 
 
 class EPMoE(nnx.Module):
@@ -59,6 +155,11 @@ class EPMoE(nnx.Module):
         )
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
+        # set by fuse_gate_up(): wi_0 / wi_0_scale hold [E, K, 2N] (gate ++ up), wi_1 unused
+        self.fused_gate_up = False
+        # set by fuse_gate_up() (silu experts): chunk width of the
+        # interleaved [gate | up] layout; GEMM1 then returns silu(gate) * up directly
+        self.glu_chunk = 0
         self.moe_dp_size = moe_dp_size
         self.replicate_experts = self.moe_dp_size > 1
 
@@ -87,9 +188,12 @@ class EPMoE(nnx.Module):
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
-        self.weight_block_size = (
-            getattr(quantization_config, "weight_block_size", None) if quantization_config else None
-        )
+        if quantization_config is None:
+            self.weight_block_size = None
+        elif hasattr(quantization_config, "get_moe_weight_block_size"):
+            self.weight_block_size = quantization_config.get_moe_weight_block_size()
+        else:
+            self.weight_block_size = getattr(quantization_config, "weight_block_size", None)
 
         if self.moe_dp_size < 1:
             raise ValueError(f"moe_dp_size must be at least 1, got {self.moe_dp_size}")
@@ -188,6 +292,61 @@ class EPMoE(nnx.Module):
             return can_use_ragged, primary_device
         except Exception as _:
             return False, "cpu"
+
+    def fuse_gate_up(self) -> bool:
+        """Concatenate the gate (wi_0) and up (wi_1) expert weights along the output dim so the
+        forward runs one grouped matmul [E, K, 2N] instead of two [E, K, N] calls per layer.
+        Per-channel / block scales concatenate the same way (kernel-ready layout). Only for
+        moe_mesh tensor == 1 (the output dim is not sharded) and static weights."""
+        if self.fused_gate_up or self.wi_1 is None:
+            return False
+        moe_tp = int(self.moe_mesh.shape.get("tensor", 1))
+        if moe_tp != 1:
+            return False
+        if self.weight_block_size is not None:
+            # block-scaled experts (FP8 block-wise checkpoints) keep the two-call path: the fused
+            # [E, K, 2N] weight / scale layouts are only built for per-channel or unquantized experts
+            return False
+        w0, w1 = self.wi_0.value, self.wi_1.value
+        # scale normalisation and the concat need the moe mesh context (PartitionSpec use)
+        with jax.set_mesh(self.moe_mesh), jax.sharding.use_abstract_mesh(self.updated_mesh):
+            s0 = self._normalize_scale_for_gmm(
+                self.wi_0_scale.value if self.wi_0_scale is not None else None,
+                w0,
+                scale_name="wi_0_scale",
+            )
+            s1 = self._normalize_scale_for_gmm(
+                self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                w1,
+                scale_name="wi_1_scale",
+            )
+            glu_chunk = glu_epilogue_chunk(self.activation, int(w0.shape[-1]))
+            if glu_chunk:
+                fused = interleave_gate_up(w0, w1, glu_chunk)
+            else:
+                fused = jnp.concatenate([w0, w1], axis=-1)
+            # replicated experts (moe_dp_size > 1) have no "expert" mesh axis: keep the layout
+            # the unfused parameters were created with
+            ex = None if self.replicate_experts else "expert"
+            self.wi_0 = nnx.Param(fused, out_sharding=P(ex, None, "tensor"))
+            self.wi_1 = None
+            if s0 is not None and s1 is not None:
+                if glu_chunk:
+                    fs = interleave_gate_up(s0, s1, glu_chunk)
+                else:
+                    fs = jnp.concatenate([s0, s1], axis=-1)
+                self.wi_0_scale = nnx.Param(fs, out_sharding=P(ex, None, None, "tensor"))
+                self.wi_1_scale = None
+        self.fused_gate_up = True
+        self.glu_chunk = glu_chunk
+        if glu_chunk and not _GLU_LOGGED:
+            _GLU_LOGGED.append(True)
+            logger.info(
+                "EPMoE GLU epilogue active: gate/up interleaved in "
+                "%d-column chunks, GEMM1 emits silu(gate)*up from the gmm_v2 epilogue",
+                glu_chunk,
+            )
+        return True
 
     def _get_wo_scale_sharding(
         self, scale: jax.Array | None = None, is_block: bool | None = None
@@ -384,7 +543,12 @@ class EPMoE(nnx.Module):
                 wi_scale_sharding = P("expert", None, None, "tensor")
                 wo_scale_sharding = self._get_wo_scale_sharding(is_block=(k_blocks_wo > 1))
                 is_abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
-                scale_dtype = self.dtype if is_int4_dtype(self.quantized_dtype) else jnp.float32
+                # Per-channel / block scales stay f32 regardless of the weight dtype: the
+                # gmm kernels consume f32 scales, so a bf16 scale parameter costs one
+                # convert + copy per expert layer per step (3 per MoE layer in the AOT
+                # programs) and rounds the loaded scale. This also applies to int4
+                # checkpoints, whose placeholders #1637 created in the model dtype.
+                scale_dtype = jnp.float32
 
                 def _make_param(shape, dtype, sharding_spec):
                     if is_abstract:
@@ -539,11 +703,14 @@ class EPMoE(nnx.Module):
                 self.wi_0.value,
                 scale_name="wi_0_scale",
             )
-            w1_scale = self._normalize_scale_for_gmm(
-                self.wi_1_scale.value if self.wi_1_scale is not None else None,
-                self.wi_1.value,
-                scale_name="wi_1_scale",
-            )
+            if self.fused_gate_up:
+                w1_scale = w0_scale  # placeholder: the fused forward ignores the w1 operands
+            else:
+                w1_scale = self._normalize_scale_for_gmm(
+                    self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                    self.wi_1.value,
+                    scale_name="wi_1_scale",
+                )
             wo_scale = self._normalize_scale_for_gmm(
                 self.wo_scale.value if self.wo_scale is not None else None,
                 self.wo.value,
@@ -577,7 +744,7 @@ class EPMoE(nnx.Module):
                 topk_weights_reshard,
                 topk_ids_reshard,
                 self.wi_0.value,
-                self.wi_1.value,
+                self.wi_0.value if self.fused_gate_up else self.wi_1.value,
                 self.wo.value,
                 w0_scale,
                 w1_scale,
@@ -633,7 +800,7 @@ class EPMoE(nnx.Module):
                 topk_weights,
                 topk_ids,
                 self.wi_0[...],
-                self.wi_1[...],
+                self.wi_0[...] if self.fused_gate_up else self.wi_1[...],
                 self.wo[...],
             )
 
@@ -661,9 +828,27 @@ class EPMoE(nnx.Module):
             if self.replicate_experts
             else jax.lax.axis_index("expert")
         )
+        disp = self._dispatch_local(hidden_states, topk_ids, expert_shard_id)
+        return self._experts_local(
+            disp,
+            topk_weights,
+            w0_weights,
+            w1_weights,
+            wo_weights,
+            w0_kernel_scale,
+            w1_kernel_scale,
+            wo_kernel_scale,
+            w0_kernel_bias,
+            w1_kernel_bias,
+            wo_kernel_bias,
+            scatter_on_tensor=scatter_on_tensor,
+        )
 
-        inputs_2d, token_indices, sorted_selected_experts, group_sizes = self._permute(
-            hidden_states, topk_ids
+    def _dispatch_local(self, hidden_states, topk_ids, expert_shard_id):
+        """Per-device first half of ``_forward``: token sort, expert-shard offsets and (SparseCore
+        path) the local row range / valid mask. Returns a dict consumed by ``_experts_local``."""
+        inputs_2d, token_indices, sorted_selected_experts, group_sizes, permute_inverse = (
+            self._permute(hidden_states, topk_ids)
         )
 
         group_sizes = group_sizes.astype(jnp.int32)
@@ -688,30 +873,76 @@ class EPMoE(nnx.Module):
             valid_mask = (flat_experts >= group_offset) & (
                 flat_experts < group_offset + self.experts_per_device
             )
+        return dict(
+            inputs_2d=inputs_2d,
+            token_indices=token_indices,
+            sorted_selected_experts=sorted_selected_experts,
+            permute_inverse=permute_inverse,
+            group_sizes=group_sizes,
+            group_offset=group_offset,
+            local_range=local_range,
+            valid_mask=valid_mask,
+            x_gathered=None,
+        )
 
+    def _experts_local(
+        self,
+        disp,
+        topk_weights,
+        w0_weights,
+        w1_weights,
+        wo_weights,
+        w0_kernel_scale=None,
+        w1_kernel_scale=None,
+        wo_kernel_scale=None,
+        w0_kernel_bias=None,
+        w1_kernel_bias=None,
+        wo_kernel_bias=None,
+        *,
+        scatter_on_tensor: bool = False,
+        combine_pin=None,
+    ):
+        """Per-device second half of ``_forward``: grouped matmuls, unpermute (SparseCore
+        combine on the SC path) and the tensor/expert reductions. ``combine_pin`` (micro-batch
+        PIN=4) adds a zero-valued data edge from a scalar to the combine input so the SparseCore
+        combine cannot be scheduled ahead of that scalar's producer."""
         intermediate_output = self._gmm_compute(
-            inputs_2d,
-            token_indices,
-            group_sizes,
+            disp["inputs_2d"],
+            disp["token_indices"],
+            disp["group_sizes"],
             w0_weights,
             w1_weights,
             wo_weights,
-            group_offset,
+            disp["group_offset"],
             w0_kernel_scale,
             w1_kernel_scale,
             wo_kernel_scale,
             w0_kernel_bias,
             w1_kernel_bias,
             wo_kernel_bias,
-            local_range=local_range,
+            local_range=disp["local_range"],
+            x_gathered=disp["x_gathered"],
         )
+        if combine_pin is not None:
+            tiny = combine_pin.astype(jnp.float32).reshape(-1)[0]
+            zero = jnp.where(jnp.isfinite(tiny), tiny * 0, 0.0)
+            # The zero-valued edge goes on the routing weights ([tokens, top_k], a direct operand
+            # of the SparseCore combine), not on intermediate_output ([tokens*top_k, hidden]):
+            # that add could not fuse into the combine custom call and ran as its own pass
+            # (4k trace: a broadcast_add_fusion bf16[16384,6144] cost 9.6 ms/chunk).
+            topk_weights = topk_weights + zero.astype(topk_weights.dtype)
 
         output = self._unpermute(
             intermediate_output,
-            sorted_selected_experts,
+            disp["sorted_selected_experts"],
             topk_weights,
-            valid_mask=valid_mask,
+            valid_mask=disp["valid_mask"],
+            inverse=disp.get("permute_inverse"),
         )
+        return self._reduce_expert_output(output, scatter_on_tensor)
+
+    def _reduce_expert_output(self, output, scatter_on_tensor):
+        """Tail of ``_experts_local`` after the combine: tensor-axis RS/AR and the expert-axis reduce."""
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
         # for SP layout on the token dim, AR (psum) otherwise. The matching
@@ -720,11 +951,236 @@ class EPMoE(nnx.Module):
             if scatter_on_tensor:
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
             else:
-                output = jax.lax.psum(output, "tensor")
+                # inside the moe_mesh shard_map: the kernel indexes the ("expert", "tensor") axes
+                output = maybe_oneshot_psum(output, "tensor", self.moe_mesh.axis_names, site="moe")
         if self.ep_size > 1:
             output = self._combine(output)
 
         return output
+
+    # ── two-stage call (prefill micro-batch PIN=4) ────────────────────────────
+    # dispatch_stage() runs the permute and the SparseCore dispatch gather as its own
+    # shard_map and hands back the per-device gathered rows plus a tiny anchor derived
+    # from them; experts_stage() finishes the layer. The model uses the anchor to pin
+    # the OTHER window's all-reduce operand (so that all-reduce enters the SparseCore
+    # stream after this window's dispatch gather) and ``combine_pin`` to keep this
+    # window's SparseCore combine behind the other window's all-reduce result. Values
+    # are identical to __call__ (same ops per device, only split across two calls).
+    def _stage_specs(self, wo_scale=None):
+        return (
+            # weights [g, k, n]
+            P("expert", None, "tensor"),
+            P("expert", None, "tensor"),
+            P("expert", "tensor", None),
+            # scales [g, k_blocks, 1, n]: the wo scale is K-sharded when it is block-scaled
+            # (same rule as __call__; the per-channel form is replicated)
+            P("expert", None, None, "tensor"),
+            P("expert", None, None, "tensor"),
+            self._get_wo_scale_sharding(wo_scale),
+            # biases [g, 1, n] (unused)
+            P("expert", None, "tensor"),
+            P("expert", None, "tensor"),
+            P("expert", None, None),
+        )
+
+    def _stage_weights(self):
+        w0_scale = self._normalize_scale_for_gmm(
+            self.wi_0_scale.value if self.wi_0_scale is not None else None,
+            self.wi_0.value,
+            scale_name="wi_0_scale",
+        )
+        if self.fused_gate_up:
+            w1_scale = w0_scale
+        else:
+            w1_scale = self._normalize_scale_for_gmm(
+                self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                self.wi_1.value,
+                scale_name="wi_1_scale",
+            )
+        wo_scale = self._normalize_scale_for_gmm(
+            self.wo_scale.value if self.wo_scale is not None else None,
+            self.wo.value,
+            scale_name="wo_scale",
+        )
+        return (
+            self.wi_0.value,
+            self.wi_0.value if self.fused_gate_up else self.wi_1.value,
+            self.wo.value,
+            w0_scale,
+            w1_scale,
+            wo_scale,
+            None,
+            None,
+            None,
+        )
+
+    def _sc_stage(self, num_tokens: int) -> bool:
+        return bool(
+            self.use_sc_permute
+            and should_use_sparse_core(
+                num_tokens * self.num_experts_per_tok, self.hidden_size, self.dtype
+            )
+        )
+
+    def _dispatch_stage_local(self, hidden_states, topk_ids, *, sc: bool):
+        expert_shard_id = jax.lax.axis_index("expert")
+        disp = self._dispatch_local(hidden_states, topk_ids, expert_shard_id)
+        inputs_2d, token_indices = disp["inputs_2d"], disp["token_indices"]
+        if sc and disp["local_range"] is not None:
+            x = sc_dispatch_gather(inputs_2d, token_indices, *disp["local_range"])
+            start, end = disp["local_range"]
+        else:
+            x = inputs_2d[token_indices]
+            start = end = jnp.zeros((), jnp.int32)
+        x = x.astype(self.dtype)
+        valid_mask = disp["valid_mask"]
+        if valid_mask is None:
+            valid_mask = jnp.ones((token_indices.shape[0],), jnp.bool_)
+        offs = jnp.stack([disp["group_offset"].astype(jnp.int32), start, end])
+        # anchor: one element of the gathered rows (a data edge on the dispatch gather's done)
+        anchor = x[:1, :1].astype(jnp.float32)
+        return (
+            x[None],
+            token_indices[None],
+            disp["sorted_selected_experts"][None],
+            disp["group_sizes"][None],
+            offs[None],
+            valid_mask[None],
+            anchor,
+        )
+
+    def dispatch_stage(self, hidden_states, topk_ids):
+        """Stage 1 of the two-stage call: returns ``(state, anchor)``; ``state`` holds the
+        per-device gathered rows and routing metadata (leading ``expert`` axis), ``anchor`` is a
+        replicated ``f32[1, 1]`` on the model mesh that depends on the dispatch gather."""
+        if self.replicate_experts:
+            raise NotImplementedError("dispatch_stage requires expert parallelism (ep_size > 1)")
+        sc = self._sc_stage(hidden_states.shape[0])
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            hs = jax.sharding.reshard(hidden_states, P(None))
+            ti = jax.sharding.reshard(topk_ids, P(None))
+            outs = shard_map(
+                partial(self._dispatch_stage_local, sc=sc),
+                mesh=self.moe_mesh,
+                in_specs=(P(None), P(None)),
+                out_specs=(
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P(None),
+                ),
+                check_vma=False,
+            )(hs, ti)
+        state = dict(
+            zip(("x", "token_indices", "sorted", "group_sizes", "offs", "valid_mask"), outs[:6])
+        )
+        state["sc"] = sc
+        anchor = jax.sharding.reshard(
+            outs[6], jax.sharding.NamedSharding(self.mesh, P(*([None] * outs[6].ndim)))
+        )
+        return state, anchor
+
+    def _experts_stage_local(
+        self,
+        x,
+        token_indices,
+        sorted_selected_experts,
+        group_sizes,
+        offs,
+        valid_mask,
+        topk_weights,
+        combine_pin,
+        *weights,
+        sc: bool,
+        scatter_on_tensor: bool,
+    ):
+        x, token_indices, sorted_selected_experts, group_sizes, offs, valid_mask = (
+            x[0],
+            token_indices[0],
+            sorted_selected_experts[0],
+            group_sizes[0],
+            offs[0],
+            valid_mask[0],
+        )
+        disp = dict(
+            inputs_2d=x,  # unused once x_gathered is given (shape/dtype only)
+            token_indices=token_indices,
+            sorted_selected_experts=sorted_selected_experts,
+            group_sizes=group_sizes,
+            group_offset=offs[0],
+            local_range=(offs[1], offs[2]) if (sc and self.ep_size > 1) else None,
+            valid_mask=valid_mask if sc else None,
+            x_gathered=x,
+        )
+        return self._experts_local(
+            disp,
+            topk_weights,
+            *weights,
+            scatter_on_tensor=scatter_on_tensor,
+            combine_pin=combine_pin,
+        )
+
+    def experts_stage(
+        self,
+        state,
+        topk_weights,
+        *,
+        combine_pin=None,
+        out_sharding: jax.sharding.NamedSharding | None = None,
+    ):
+        """Stage 2 of the two-stage call (same output as ``__call__``). ``combine_pin``: any array
+        on the model mesh; its first element pins the SparseCore combine (zero-valued edge)."""
+        if out_sharding is None:
+            out_sharding = jax.sharding.NamedSharding(self.mesh, P(None, None))
+        out_specs = P(
+            *[
+                ("tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None)
+                for s in out_sharding.spec
+            ]
+        )
+        scatter_on_tensor = "tensor" in out_specs
+        pin_src = (
+            combine_pin[tuple(slice(0, 1) for _ in range(combine_pin.ndim))].astype(jnp.float32)
+            if combine_pin is not None
+            else jnp.zeros((1, 1), jnp.float32)
+        )
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            tw = jax.sharding.reshard(topk_weights, P(None))
+            pin = jax.sharding.reshard(pin_src, P(None))
+            stage_weights = self._stage_weights()
+            result = shard_map(
+                partial(
+                    self._experts_stage_local, sc=state["sc"], scatter_on_tensor=scatter_on_tensor
+                ),
+                mesh=self.moe_mesh,
+                in_specs=(
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P(None),
+                    P(None),
+                )
+                + self._stage_specs(stage_weights[5]),
+                out_specs=out_specs,
+                check_vma=False,
+            )(
+                state["x"],
+                state["token_indices"],
+                state["sorted"],
+                state["group_sizes"],
+                state["offs"],
+                state["valid_mask"],
+                tw,
+                pin,
+                *stage_weights,
+            )
+        return jax.sharding.reshard(result, out_sharding)
 
     def _gmm_compute(
         self,
@@ -742,6 +1198,7 @@ class EPMoE(nnx.Module):
         w1_kernel_bias=None,
         wo_kernel_bias=None,
         local_range=None,
+        x_gathered=None,
     ):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
@@ -750,7 +1207,10 @@ class EPMoE(nnx.Module):
         # so XLA can fuse the gather with the matmul and avoid materializing
         # the full [M*top_k, D] sorted_inputs tensor at peak memory.
         pre_gather_q = getattr(self, "pre_gather_quant_dtype", None)
-        if pre_gather_q is not None:
+        if x_gathered is not None:
+            # dispatch_stage() already gathered the sorted rows (two-stage micro-batch path)
+            x = x_gathered.astype(self.dtype)
+        elif pre_gather_q is not None:
             x_q, x_scale = quantize_tensor_simple(inputs_2d, pre_gather_q, dim=-1)
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
@@ -782,28 +1242,68 @@ class EPMoE(nnx.Module):
             acc_dtype=jnp.float32,
         )
 
+        if (
+            x.shape[0] <= _MOE_FUSED_GLU_DOWN_MAX_ROWS
+            and self.fused_gate_up
+            and self.glu_chunk
+            and act_q_dtype is not None
+            and w0_kernel_bias is None
+            and wo_kernel_bias is None
+            and is_tpu_runtime()
+        ):
+            fused_out = self._gmm_fused_glu_down(
+                x,
+                w0_kernel,
+                w0_kernel_scale,
+                wo_kernel,
+                wo_kernel_scale,
+                group_sizes,
+                group_offset,
+            )
+            if fused_out is not None:
+                return fused_out
+
         # === GEMM1: x @ w0 and x @ w1 ===
-        layer_w0 = gmm(
-            lhs=x,
-            rhs=w0_kernel,
-            rhs_scale=w0_kernel_scale,
-            rhs_bias=w0_kernel_bias,
-            zero_initialize=False,
-            activation_quantized_dtype=act_q_dtype,
-            **gmm_kwargs,
-        )
-        layer_w1 = gmm(
-            lhs=x,
-            rhs=w1_kernel,
-            rhs_scale=w1_kernel_scale,
-            rhs_bias=w1_kernel_bias,
-            zero_initialize=False,
-            activation_quantized_dtype=act_q_dtype,
-            **gmm_kwargs,
-        )
+        if self.fused_gate_up:
+            # one [E, K, 2N] grouped matmul (gate ++ up), see fuse_gate_up()
+            layer_w01 = gmm(
+                lhs=x,
+                rhs=w0_kernel,
+                rhs_scale=w0_kernel_scale,
+                rhs_bias=w0_kernel_bias,
+                zero_initialize=False,
+                activation_quantized_dtype=act_q_dtype,
+                glu_chunk=self.glu_chunk or None,
+                **gmm_kwargs,
+            )
+            if not self.glu_chunk:
+                half = layer_w01.shape[-1] // 2
+                layer_w0, layer_w1 = layer_w01[:, :half], layer_w01[:, half:]
+        else:
+            layer_w0 = gmm(
+                lhs=x,
+                rhs=w0_kernel,
+                rhs_scale=w0_kernel_scale,
+                rhs_bias=w0_kernel_bias,
+                zero_initialize=False,
+                activation_quantized_dtype=act_q_dtype,
+                **gmm_kwargs,
+            )
+            layer_w1 = gmm(
+                lhs=x,
+                rhs=w1_kernel,
+                rhs_scale=w1_kernel_scale,
+                rhs_bias=w1_kernel_bias,
+                zero_initialize=False,
+                activation_quantized_dtype=act_q_dtype,
+                **gmm_kwargs,
+            )
 
         # === Activation ===
-        if self.activation == "silu":
+        if self.glu_chunk:
+            # silu(gate) * up was applied in the gmm_v2 epilogue (interleaved layout)
+            intermediate_layer = layer_w01
+        elif self.activation == "silu":
             intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
         elif self.activation == "gelu":
             intermediate_layer = jax.nn.gelu(layer_w0) * layer_w1
@@ -820,10 +1320,61 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            zero_initialize=True,
+            zero_initialize=self._down_zero_initialize(local_range, intermediate_layer.dtype),
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
+
+    @staticmethod
+    def _down_zero_initialize(local_range, dtype) -> bool:
+        """zero_initialize for the two-call down gmm: False on the SparseCore-combine path
+        (see the note above). The TensorCore fallback of ``sc_combine`` (non-bf16
+        intermediates) masks the weights, not the products, so it keeps the memset."""
+        global _MOE_DOWN_ZERO_INIT_SKIP_LOGGED
+        if local_range is not None and dtype == jnp.bfloat16:
+            if not _MOE_DOWN_ZERO_INIT_SKIP_LOGGED:
+                _MOE_DOWN_ZERO_INIT_SKIP_LOGGED = True
+                logger.info(
+                    "EPMoE down gmm: zero_initialize skipped on the SparseCore-combine path"
+                )
+            return False
+        return True
+
+    def _gmm_fused_glu_down(
+        self,
+        x,
+        w0_kernel,
+        w0_kernel_scale,
+        wo_kernel,
+        wo_kernel_scale,
+        group_sizes,
+        group_offset,
+    ):
+        """gate_up -> SwiGLU -> down in one pallas_call; None when the shapes do not qualify (caller falls back).
+        Mirrors the megablox backend's 32-row alignment padding / un-padding around gmm_v2."""
+        m = x.shape[0]
+        pad_size = (-m) % 32
+        lhs = x
+        if pad_size:
+            lhs = jax.lax.pad(x, jnp.zeros((), dtype=x.dtype), ((0, pad_size, 0), (0, 0, 0)))
+            group_sizes = group_sizes.at[-1].add(pad_size)
+        out = gmm_v2_fused_glu(
+            lhs,
+            w0_kernel,
+            w0_kernel_scale,
+            wo_kernel,
+            wo_kernel_scale,
+            group_sizes,
+            group_offset,
+            glu_chunk=int(self.glu_chunk),
+            preferred_element_type=self.dtype,
+            acc_dtype=jnp.float32,
+            zero_initialize=True,
+            tile_m=_MOE_FUSED_TILE_M if lhs.shape[0] > _MOE_FUSED_TILE_M else None,
+        )
+        if out is None:
+            return None
+        return out[:m] if pad_size else out
 
     def _dispatch(self, group_sizes, expert_shard_id):
         if self.ep_size <= 1:
@@ -850,6 +1401,8 @@ class EPMoE(nnx.Module):
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
     def _combine(self, data):
+        if reduce_deferred() and fused_moe_enabled():
+            return data  # partial; the model reduces routed+shared with one fused_all_reduce
         return jax.lax.psum(data, "expert")
 
     def _permute(self, inputs, top_k_indices):
@@ -866,6 +1419,12 @@ class EPMoE(nnx.Module):
                 f"{expected_indices_shape}, got shape {top_k_indices.shape}"
             )
 
+        n_rows = inputs.shape[0] * self.num_experts_per_tok
+        if 0 < n_rows <= _PERMUTE_KERNEL_MAX_ROWS:
+            sorted_selected_experts, token_indices, group_sizes, inverse = _permute_indices_small(
+                top_k_indices, self.num_experts
+            )
+            return inputs, token_indices, sorted_selected_experts, group_sizes, inverse
         flatten_selected_experts = jnp.ravel(top_k_indices)
         sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
         # token_indices: maps each sorted position to the original token index.
@@ -880,9 +1439,12 @@ class EPMoE(nnx.Module):
             token_indices,
             sorted_selected_experts,
             group_sizes,
+            None,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights, valid_mask=None):
+    def _unpermute(
+        self, intermediate, sorted_selected_experts, weights, valid_mask=None, inverse=None
+    ):
         top_k = self.num_experts_per_tok
         if weights.ndim != 2 or weights.shape[1] != top_k:
             raise ValueError(
@@ -907,11 +1469,12 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        argsort_indices = (
-            jnp.zeros(expected_tokens, dtype=jnp.int32)
-            .at[sorted_selected_experts]
-            .set(jnp.arange(expected_tokens, dtype=jnp.int32))
-        )
+        # Un-permute map: the small-batch routing-index kernel output (bit-exact) or the inverse
+        # permutation via a second sort -- XLA lowers the equivalent 1-D scatter
+        # (zeros.at[sorted].set(arange)) to ~6 select fusions per layer (10 ms per 4k prefill
+        # on v7x); an int32 key sort of the same length is ~8x cheaper and yields the identical
+        # permutation (keys are unique).
+        argsort_indices = inverse if inverse is not None else jnp.argsort(sorted_selected_experts)
         if self.use_sc_permute and valid_mask is not None:
             # SparseCore fused gather + top-k weighted reduce (falls back to XLA when
             # SparseCore is absent or the problem is too small to benefit).
@@ -929,7 +1492,9 @@ class EPMoE(nnx.Module):
         # per-k gather overhead; large (prefill) batches avoid the fp32
         # (tokens, top_k, hidden) intermediate. Benchmarks in the PR description.
         if weights.shape[0] <= 256:
-            unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
+            # argsort_indices is a permutation of range(expected_tokens): skip the
+            # gather's bounds-mask fusions (compare_and / select), keep the gather.
+            unsort_intermediate = intermediate.at[argsort_indices].get(mode="promise_in_bounds")
             reshaped_intermediate = jnp.reshape(
                 unsort_intermediate,
                 (weights.shape[0], top_k, -1),

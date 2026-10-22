@@ -39,8 +39,44 @@ from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_topk,
 )
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
-from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
+from sgl_jax.srt.layers.attention.mla_backend import (
+    MLAAttentionBackend,
+    MLAAttentionMetadata,
+)
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+# Prefill micro-batch PIN=7 (10-03): XLA scheduling group for "window B's MoE all-reduce under
+# window A's next-layer attend" (internal ref dsa_sparse_mla.py:533 pipelines SC gather(i+1)
+# with TC attend(i) the same way). The model sets PREFILL_SCHED_GROUP around window A's
+# attention call; the attend kernel custom-call is traced inside set_xla_metadata with that
+# id, and the model tags B's all-reduce of the previous layer with the same id.
+# Only the attend pallas_call carries the tag (kernels/dsa/sparse_mla_prefill_qblock
+# _attend_sched_tagged); tagging the paged write-back as well created a write-back -> copies ->
+# attend chain inside one group, which the TPU scheduler rejects ('annotation groups with gaps').
+PREFILL_SCHED_GROUP: int | None = None
+# The exact-dense attend kernel stays OUT of the PIN=7 scheduling group (the pin edges stay):
+# the dense wrapper issues three chained pallas_calls with the cache threaded through, and the
+# TPU scheduler rejects the group ("annotation groups with gaps") on the second one even with
+# every traced op tagged (CPU AOT replicas of the 1k two-window program), so the
+# untagged variant is the only way to run two windows at 1k with pins.
+# Head-major q/o contract for the exact-dense
+# MLA v2 attend on EXTEND batches (distribution[0] == 0 there, so the two empty
+# decode kernels are skipped). Decode / verify keep the token-major path.
+
+
+def _sched_tagged(fn):
+    """Call ``fn`` inside ``set_xla_metadata(_scheduling_group_id=PREFILL_SCHED_GROUP)`` when set."""
+
+    def _call(*a, **k):
+        if PREFILL_SCHED_GROUP is None:
+            return fn(*a, **k)
+        from jax.experimental import xla_metadata
+
+        with xla_metadata.set_xla_metadata(_scheduling_group_id=int(PREFILL_SCHED_GROUP)):
+            return fn(*a, **k)
+
+    return _call
+
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -241,7 +277,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         return obj
 
     @named_scope
-    def __call__(
+    def __call__(self, q, k, v, layer, forward_batch, token_to_kv_pool, **kwargs):
+        return self._call_impl(q, k, v, layer, forward_batch, token_to_kv_pool, **kwargs)
+
+    def _call_impl(
         self,
         q: jax.Array,
         k: jax.Array,
@@ -1456,6 +1495,126 @@ def _fixed_stride_pages(
     return page_indices[gidx].reshape(-1)
 
 
+def dense_arm_metadata(md):
+    """Metadata for the exact-dense attend kernel (``mla_ragged_paged_attention``, MIXED case).
+
+    The mixed kernel sizes each sequence's KV loop by ``kv_len`` and its query-block pipeline by the
+    query rows, so a sequence with ``q_len == 0`` but ``kv_len > 0`` is a shape it never handles
+    (see ``sparse_mla.py``: the next sequence is never prefetched -> device hang). Such sequences
+    exist only in prefill micro-batch windows (``window_forward_metadata``: a request whose rows all
+    lie *before* the window keeps ``kv_len`` = its prefix with ``q_len == 0``); the single-window
+    batch only has ``q_len == kv_len == 0`` padding. Zero ``kv_len`` for every ``q_len == 0``
+    sequence: the kernel then skips it, and it has no rows to attend or write anyway. (knife 1 V2,
+    2026-10-07: the 8 x 1k two-window exact-dense program hung at the first batch on three arms.)
+    """
+    cuq = getattr(md, "cu_q_lens", None)
+    seq_lens = getattr(md, "seq_lens", None)
+    if cuq is None or seq_lens is None or cuq.shape[0] != seq_lens.shape[0] + 1:
+        return md
+    q_lens = cuq[1:] - cuq[:-1]
+    out = MLAAttentionMetadata()
+    for name in ("cu_q_lens", "cu_kv_lens", "page_indices"):
+        setattr(out, name, getattr(md, name))
+    out.seq_lens = jnp.where(q_lens > 0, seq_lens, 0).astype(seq_lens.dtype)
+    # The MIXED case iterates sequences [distribution[1], distribution[2]); sequences[distribution[0]:distribution[1]]
+    # ("chunked-prefill-only" slot) are never launched. A window's sequences with rows are contiguous, so hand the
+    # kernel exactly that range: it then never sees a q_len == 0 sequence at all (leading ones in window B, trailing
+    # ones in window A, bs padding). Masking kv_len alone was not enough: 8 x 1k two-window still hung (gp785 2026-10-08,
+    # py-spy: scheduler waiting on the fused-prefill output) while 4 x 1k passed.
+    has_q = q_lens > 0
+    any_q = jnp.any(has_q)
+    first = jnp.argmax(has_q).astype(jnp.int32)
+    last = (has_q.shape[0] - 1 - jnp.argmax(has_q[::-1])).astype(jnp.int32)
+    dist = getattr(md, "distribution", None)
+    if dist is not None and dist.shape == (3,):
+        # arithmetic on the original array keeps its (Explicit-mesh, P(data)) sharding; a freshly stacked array is
+        # replicated and fails _run_dense's shard_map in_specs=P(data) (seen on the 8 x 1k two-window shape8), and .at[].set needs an
+        # explicit out_sharding under Explicit axes
+        idx = jnp.arange(3, dtype=dist.dtype)
+        vals = jnp.where(idx == 1, first, jnp.where(idx == 2, last + 1, 0)).astype(dist.dtype)
+        vals = jnp.where(any_q, vals, 0).astype(dist.dtype)
+        out.distribution = dist * 0 + vals
+    else:
+        out.distribution = dist
+    return out
+
+
+def window_forward_metadata(md, offset: int, length: int):
+    """Attention metadata for the query-row window ``[offset, offset + length)``
+    of a ragged EXTEND batch (prefill micro-batching: the chunk's rows are run
+    as consecutive micro-batches inside one forward).
+
+    ``cu_kv_lens`` / ``page_indices`` / ``distribution`` are kept, so every
+    sequence's pages stay where the full-chunk metadata put them; ``cu_q_lens``
+    is clipped to the window and each sequence's kv_len shrinks by the number
+    of its query rows that fall *after* the window. Then
+    ``q_pos = kv_len - q_len + row`` (the convention of ``_paged_landing``, the
+    indexer scorer and the qblock kernels) is the same absolute position for
+    every window row as in the full chunk, a request cut by the window boundary
+    becomes an ordinary chunked-prefill continuation in the later window, and a
+    request with no rows in the window has ``q_len == 0`` (kv_len == its prefix,
+    or the full length once written) -- the shape the per-rank (token-sharded)
+    metadata already produces. ``dp_size`` must be 1 (flat [S+1] / [S] arrays).
+    """
+    cuq = md.cu_q_lens
+    seq_lens = md.seq_lens
+    if cuq.shape[0] != seq_lens.shape[0] + 1:
+        raise ValueError(
+            "window_forward_metadata needs dp_size == 1 metadata: "
+            f"cu_q_lens {cuq.shape} vs seq_lens {seq_lens.shape}"
+        )
+    q_lens = cuq[1:] - cuq[:-1]
+    rows_after = jnp.minimum(jnp.maximum(cuq[1:] - (offset + length), 0), q_lens)
+    out = MLAAttentionMetadata()
+    out.cu_q_lens = jnp.clip(cuq - offset, 0, length).astype(cuq.dtype)
+    out.seq_lens = jnp.maximum(seq_lens - rows_after, 0).astype(seq_lens.dtype)
+    out.cu_kv_lens = md.cu_kv_lens
+    out.page_indices = md.page_indices
+    out.distribution = md.distribution
+    return out
+
+
+def _paged_landing(
+    T: int,
+    page_size: int,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+):
+    """(page, offset, valid) landing slots for the T new tail tokens.
+
+    For seq i with q tokens cu_q_lens[i]..[i+1), token j lands at absolute
+    position seq_lens[i] - (q_end - q_start) + j.
+    """
+    page, offset, valid, _, _ = _paged_landing_bounds(
+        T, page_size, seq_lens, page_indices, cu_q_lens, cu_kv_lens
+    )
+    return page, offset, valid
+
+
+def _paged_landing_bounds(
+    T: int,
+    page_size: int,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+):
+    """``_paged_landing`` plus each token's request bounds ``(q_start, q_end)``."""
+    S = seq_lens.shape[0]
+    t = jnp.arange(T)
+    seq_id = jnp.searchsorted(cu_q_lens[1:], t, side="right")
+    seq_id = jnp.clip(seq_id, 0, S - 1)
+    q_start = cu_q_lens[seq_id]
+    q_end = cu_q_lens[seq_id + 1]
+    kv_len = seq_lens[seq_id]
+    abs_pos = jnp.maximum(kv_len - (q_end - q_start) + (t - q_start), 0)
+    valid = (t >= q_start) & (t < q_end) & (kv_len > 0)
+    page = page_indices[cu_kv_lens[seq_id] // page_size + abs_pos // page_size]
+    return page, abs_pos % page_size, valid, q_start, q_end
+
+
 def _scatter_paged(
     cache3d: jax.Array,
     new_tokens: jax.Array,
@@ -1468,25 +1627,12 @@ def _scatter_paged(
     """Write new_tokens[t] into cache at (page, offset) for each seq's tail slots.
 
     Jit-compatible reference for the paged cache write that the Pallas kernel
-    does via input_output_aliases. For seq i with q tokens cu_q_lens[i]..[i+1),
-    token j lands at absolute position seq_lens[i] - (q_end - q_start) + j.
+    does via input_output_aliases.
     """
     page_size = cache3d.shape[1]
-    T = new_tokens.shape[0]
-    S = seq_lens.shape[0]
-
-    t = jnp.arange(T)
-    seq_id = jnp.searchsorted(cu_q_lens[1:], t, side="right")
-    seq_id = jnp.clip(seq_id, 0, S - 1)
-    q_start = cu_q_lens[seq_id]
-    q_end = cu_q_lens[seq_id + 1]
-    kv_len = seq_lens[seq_id]
-    abs_pos = jnp.maximum(kv_len - (q_end - q_start) + (t - q_start), 0)
-    valid = (t >= q_start) & (t < q_end) & (kv_len > 0)
-
-    page_local = abs_pos // page_size
-    offset = abs_pos % page_size
-    page = page_indices[cu_kv_lens[seq_id] // page_size + page_local]
+    page, offset, valid = _paged_landing(
+        new_tokens.shape[0], page_size, seq_lens, page_indices, cu_q_lens, cu_kv_lens
+    )
 
     # Padding rows must land on the reserved page: the allocator hands out
     # local pages 1..pages_per_rank and keeps page 0 (reads through it are

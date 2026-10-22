@@ -39,6 +39,7 @@ import os
 import jax
 from jax._src.lib import xla_client as _xc
 
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
@@ -63,33 +64,215 @@ def aot_dispatch_enabled(num_flat_args: int) -> bool:
     return _ENV == "1"
 
 
-def decode_no_sc_gather_compiler_options_fn():
-    """Temporary XLA workaround for the jax 0.11.1 SparseCore gather-offload
-    decode regression on TPU v7x (#1613, jax-ml/jax#40553).
+_SC_ALL_REDUCE_MIN_BYTES_ENV = "SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES"
 
-    When SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD is set on TPU, returns a
-    ``compiler_options_fn`` that compiles decode-shaped executables with the
-    offload pass disabled while prefill keeps the default (the offload is
-    profitable for large prefill gathers, and a process-global
-    LIBTPU_INIT_ARGS disable costs ~+12% on 110k prefill). Returns ``None``
-    when the workaround is not requested. Only effective together with
-    SGLANG_JAX_AOT_DISPATCH since it hooks the per-shape AOT compile path.
-    Remove once the upstream cost-model fix ships.
+
+def sc_all_reduce_min_bytes_compiler_options():
+    """Per-executable XLA option that keeps all-reduces smaller than
+    ``SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES`` bytes on the TensorCore (0 = off, the default).
+
+    On TPU v7x XLA hands every all-reduce of roughly 96 KB and above to the
+    SparseCore. For the [bs, hidden] bf16 all-reduces of a tensor-parallel
+    decode step (96 KB to a few MB at bs 8..64) the SparseCore path is
+    measured 21..26 us slower per call than the TensorCore path, and a step
+    issues one such all-reduce per layer (~150 per step here). The offload
+    only pays for all-reduces of ~48 MB and above (prefill chunks), so the
+    32 MiB threshold keeps prefill on its current path. 0 leaves XLA's cost
+    model alone. The option must be passed per executable; putting it in
+    LIBTPU_INIT_ARGS has no effect.
     """
-    if not (is_tpu_runtime() and get_bool_env_var("SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD")):
+    if not is_tpu_runtime():
+        return None
+    try:
+        value = envs.SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES.get()
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; ignored",
+            _SC_ALL_REDUCE_MIN_BYTES_ENV,
+            os.environ.get(_SC_ALL_REDUCE_MIN_BYTES_ENV),
+        )
+        return None
+    if value <= 0:
+        return None
+    return {"xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes": str(value)}
+
+
+def decode_compiler_options():
+    """The opt-in XLA options for decode-shaped executables, or ``None``.
+
+    Combines the SparseCore gather-offload workaround
+    (``SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD``) with the all-reduce
+    size threshold (``SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES``). Shared by the
+    AOT decode path and the speculative decode-shaped executables so both
+    paths compile with the same options.
+    """
+    options = {}
+    if is_tpu_runtime() and get_bool_env_var("SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD"):
+        options.update(
+            {
+                "xla_tpu_offload_gather_to_sparsecore": "false",
+                "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+            }
+        )
+    all_reduce = sc_all_reduce_min_bytes_compiler_options()
+    if all_reduce:
+        options.update(all_reduce)
+    # Generic escape hatch for decode-shaped executables only:
+    # SGLANG_JAX_DECODE_XLA_OPTIONS="xla_flag=value,other_flag=value". Lets an
+    # XLA option be A/B tested on decode / spec verify without a process-global
+    # LIBTPU_INIT_ARGS (which would also change prefill). Default: empty.
+    options.update(_xla_options_from_env(_DECODE_XLA_OPTIONS_ENV))
+    return options or None
+
+
+_DECODE_XLA_OPTIONS_ENV = "SGLANG_JAX_DECODE_XLA_OPTIONS"
+_PREFILL_XLA_OPTIONS_ENV = "SGLANG_JAX_PREFILL_XLA_OPTIONS"
+
+
+def _xla_options_from_env(env_name: str) -> dict:
+    """Parse ``flag=value,other_flag=value`` from the registered ``env_name`` (empty -> {})."""
+    options = {}
+    extra = getattr(envs, env_name).get()
+    for item in (part.strip() for part in extra.split(",")):
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"{env_name} entry {item!r} is not of the form flag=value")
+        options[key.strip()] = value.strip()
+    return options
+
+
+def is_prefill_shaped(mode) -> bool:
+    """EXTEND / MIXED: the chunk-sized executables. Speculative TARGET_VERIFY /
+    DRAFT_EXTEND are decode-shaped and keep the decode options."""
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+    return bool(mode == ForwardMode.EXTEND or mode == ForwardMode.MIXED)
+
+
+def prefill_compiler_options():
+    """The opt-in XLA options for prefill-shaped executables, or ``None``.
+
+    SGLANG_JAX_PREFILL_XLA_OPTIONS="xla_flag=value,other_flag=value" is the
+    prefill-side twin of SGLANG_JAX_DECODE_XLA_OPTIONS: per-executable options
+    for the EXTEND / MIXED executables only, so a flag that only pays off on
+    the 50 MB prefill collectives (e.g. ``xla_jf_crs_combiner_threshold_in_bytes``
+    to keep the two micro-batches' all-reduces apart, or the SparseCore dense
+    all-to-all offload) does not touch decode / spec verify. Passing it through
+    LIBTPU_INIT_ARGS would be process-global. Default: the GLM-5.2 v7x production
+    set (environ.py); empty string = none.
+    """
+    options = _xla_options_from_env(_PREFILL_XLA_OPTIONS_ENV)
+    return options or None
+
+
+_PREFILL_XLA_OPTIONS_MIN_TOKENS_ENV = "SGLANG_JAX_PREFILL_XLA_OPTIONS_MIN_TOKENS"
+
+
+def prefill_xla_options_min_tokens() -> int:
+    """SGLANG_JAX_PREFILL_XLA_OPTIONS only applies to prefill executables whose (padded)
+    token count is at least this (0 = every prefill executable). Lets an option that only
+    pays off on the micro-batched buckets (e.g. splitting multi-output fusions) stay off
+    the small buckets where it is pure cost (measured +3% on the 1k bucket with it on everywhere). Default 2048.
+    """
+    try:
+        min_tokens = max(0, envs.SGLANG_JAX_PREFILL_XLA_OPTIONS_MIN_TOKENS.get())
+    except ValueError:
+        logger.warning("%s is not an integer; ignored", _PREFILL_XLA_OPTIONS_MIN_TOKENS_ENV)
+        return 0
+    return _clamp_to_microbatch_threshold(min_tokens)
+
+
+_MICROBATCH_GUARD_LOGGED: list = []
+
+
+def _clamp_to_microbatch_threshold(min_tokens: int) -> int:
+    """A micro-batched prefill executable that carries _scheduling_group_id tags
+    (DSA_PREFILL_MICROBATCH >= 2) must be compiled with the prefill XLA options
+    (producer_consumer_multi_output_fusion=false, crs combiner threshold); without them
+    XLA merges fusions across the two windows and the compile fails with 'annotation
+    groups with gaps' (seen when an option threshold of 2048 left the 1024-token
+    executable without the options). Clamp the option threshold down to the micro-batch
+    threshold so both always travel together."""
+    try:
+        parts = envs.DSA_PREFILL_MICROBATCH.get()
+        mb_min = envs.DSA_PREFILL_MICROBATCH_MIN_TOKENS.get()
+    except ValueError:
+        return min_tokens
+    if parts >= 2 and mb_min > 0 and min_tokens > mb_min:
+        if not _MICROBATCH_GUARD_LOGGED:
+            _MICROBATCH_GUARD_LOGGED.append(True)
+            logger.warning(
+                "%s=%d > DSA_PREFILL_MICROBATCH_MIN_TOKENS=%d with DSA_PREFILL_MICROBATCH=%d: "
+                "clamping the prefill XLA-options threshold to %d so scheduling-group executables "
+                "always carry producer_consumer_multi_output_fusion=false",
+                _PREFILL_XLA_OPTIONS_MIN_TOKENS_ENV,
+                min_tokens,
+                mb_min,
+                parts,
+                mb_min,
+            )
+        return mb_min
+    return min_tokens
+
+
+def prefill_options_apply(forward_batch) -> bool:
+    """Whether SGLANG_JAX_PREFILL_XLA_OPTIONS applies to this batch: prefill-shaped and at
+    least ``prefill_xla_options_min_tokens`` tokens (unknown token count -> apply)."""
+    if not is_prefill_shaped(forward_batch.forward_mode):
+        return False
+    min_tokens = prefill_xla_options_min_tokens()
+    if min_tokens <= 0:
+        return True
+    ids = getattr(forward_batch, "input_ids", None)
+    num_tokens = getattr(ids, "shape", (None,))[0] if ids is not None else None
+    return num_tokens is None or int(num_tokens) >= min_tokens
+
+
+def prefill_compiler_options_fn():
+    """Per-batch form of :func:`prefill_compiler_options` (``None`` when unset):
+    returns the options for prefill-shaped batches (above the min-token threshold)
+    and ``None`` otherwise."""
+    options = prefill_compiler_options()
+    if options is None:
         return None
     logger.info(
-        "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD: decode executables "
-        "will be compiled with SparseCore gather offload disabled."
+        "prefill executables (>= %d tokens) will be compiled with XLA options %s",
+        prefill_xla_options_min_tokens(),
+        options,
     )
 
     def _compiler_options_fn(dyn_args):
         forward_batch = dyn_args[0]
+        if prefill_options_apply(forward_batch):
+            return dict(options)
+        return None
+
+    return _compiler_options_fn
+
+
+def decode_no_sc_gather_compiler_options_fn():
+    """XLA options applied to decode-shaped executables only.
+
+    Historically the jax 0.11.1 SparseCore gather-offload decode regression
+    workaround on TPU v7x (#1613, jax-ml/jax#40553); now also carries the
+    all-reduce size threshold (see ``decode_compiler_options``). Prefill keeps
+    the default (the gather offload is profitable for large prefill gathers,
+    and a process-global LIBTPU_INIT_ARGS disable costs ~+12% on 110k
+    prefill). Returns ``None`` when nothing is requested. Only effective
+    together with SGLANG_JAX_AOT_DISPATCH since it hooks the per-shape AOT
+    compile path.
+    """
+    options = decode_compiler_options()
+    if options is None:
+        return None
+    logger.info("decode executables will be compiled with XLA options %s", options)
+
+    def _compiler_options_fn(dyn_args):
+        forward_batch = dyn_args[0]
         if forward_batch.forward_mode.is_decode():
-            return {
-                "xla_tpu_offload_gather_to_sparsecore": "false",
-                "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
-            }
+            return dict(options)
         return None
 
     return _compiler_options_fn

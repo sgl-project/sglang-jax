@@ -93,6 +93,31 @@ class TestGlm5NextNWeightMappings(unittest.TestCase):
             )
         )
 
+    def _routed_expert_scale_sources(self, quant_config):
+        cfg = _tiny_config()
+        model_config = SimpleNamespace(hf_config=cfg, quantization_config=quant_config)
+        mappings = GlmMoeDsaForCausalLMNextN._create_weight_mappings(model_config)
+        sources = []
+        for spec in mappings.values():
+            for src in spec.sources or ():
+                if ".mlp.experts." in src and "_scale" in src:
+                    sources.append(src)
+        self.assertTrue(sources)
+        return sources
+
+    def test_routed_expert_scales_follow_the_quant_config_suffix(self):
+        # The MTP block shares the main model's expert mapping: FP8 block
+        # checkpoints carry ``weight_scale_inv``, int4 per-channel expert
+        # checkpoints carry ``weight_scale``. A hard-coded suffix boots FP8
+        # only and KeyErrors on an int4 checkpoint.
+        fp8 = SimpleNamespace(is_static_checkpoint=True, moe_weight_dtype=None)
+        for src in self._routed_expert_scale_sources(fp8):
+            self.assertTrue(src.endswith(".weight_scale_inv"), src)
+        int4 = SimpleNamespace(is_static_checkpoint=True, moe_weight_dtype=jnp.int4)
+        for src in self._routed_expert_scale_sources(int4):
+            self.assertTrue(src.endswith(".weight_scale"), src)
+            self.assertFalse(src.endswith(".weight_scale_inv"), src)
+
     def test_dummy_load_fills_every_declared_parameter(self):
         cfg = _tiny_config()
         mesh = _mesh()
