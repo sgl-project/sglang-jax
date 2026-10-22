@@ -72,6 +72,91 @@ class GluEpilogueLayoutTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_glu_chunk(tile_n=4096, size_n=4096 + 256, chunk=256)
 
+    def test_auto_tiler_tile_n_snaps_to_glu_pairs(self):
+        # Review repro (#1810): bf16 SiLU experts, MoE TP=1, hidden 6144, intermediate 2048 pass
+        # the width check but the auto-tiler picks tile_n=1408 (3 n tiles) on v6e/v7x, which
+        # validate_glu_chunk rejected before compilation. make_gmm_configs now snaps an
+        # auto-selected tile_n down to whole chunk pairs; explicit TileSizes stay strict.
+        from unittest import mock
+
+        from jax._src.tpu_info import ChipVersion
+        from jax.experimental.pallas import tpu as pltpu
+
+        import sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 as gmm_v2_mod
+        from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
+            Dimensions,
+            TileSizes,
+            align_glu_tile_n,
+            calculate_tiling,
+            make_gmm_configs,
+        )
+
+        self.assertEqual(align_glu_tile_n(tile_n=1408, size_n=4096, chunk=256), 1024)
+        self.assertEqual(align_glu_tile_n(tile_n=4096, size_n=4096, chunk=256), 4096)
+        self.assertEqual(align_glu_tile_n(tile_n=512, size_n=4096, chunk=256), 512)
+        self.assertEqual(align_glu_tile_n(tile_n=384, size_n=4096, chunk=256), 512)
+        self.assertEqual(align_glu_tile_n(tile_n=1536, size_n=1024, chunk=256), 1024)
+
+        S = jax.ShapeDtypeStruct
+        g, k, n2 = 8, 6144, 2 * 2048
+        # v7x: 64 MiB VMEM -> 3 n tiles of 1408; v6e: 128 MiB -> 2 tiles of 2048 (already aligned)
+        for chip, raw_tile_n, glu_tile_n in (
+            (ChipVersion.TPU_7X, 1408, 1024),
+            (ChipVersion.TPU_V6E, 2048, 2048),
+        ):
+            info = pltpu.get_tpu_info_for_chip(chip, 1)
+            vmem = int(info.vmem_capacity_bytes * 0.9)
+            with (
+                mock.patch.object(gmm_v2_mod.pltpu, "get_tpu_info", return_value=info),
+                mock.patch(
+                    "sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.tuned_tile_sizes.get_device_name",
+                    return_value="TPU v7",
+                ),
+            ):
+                dims = Dimensions(4096, k, n2, g, g, 16)
+                raw = calculate_tiling(jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.bfloat16), dims, vmem)
+                self.assertEqual(raw.tile_n, raw_tile_n)
+
+                def cfg(rows, tile_info, dtype=jnp.bfloat16):
+                    return make_gmm_configs(
+                        S((rows, k), jnp.bfloat16),
+                        S((g, k, n2), dtype),
+                        None,
+                        None,
+                        S((g,), jnp.int32),
+                        S((1,), jnp.int32),
+                        tile_info=tile_info,
+                        vmem_limit_bytes=vmem,
+                        out_dtype=None,
+                        acc_dtype=None,
+                        maybe_quantize_lhs=False,
+                        zero_initialize=False,
+                        glu_chunk=256,
+                    )
+
+                for rows in (4096, 32):
+                    c = cfg(rows, calculate_tiling)
+                    self.assertEqual((c.tiles.tile_k, c.tiles.tile_n), (k, glu_tile_n))
+                    self.assertEqual(c.out_tile_n, glu_tile_n // 2)
+                with self.assertRaises(ValueError):
+                    cfg(4096, TileSizes(128, k, 1408))
+                # no glu_chunk: the auto-tiler's choice is untouched
+                c0 = make_gmm_configs(
+                    S((4096, k), jnp.bfloat16),
+                    S((g, k, n2), jnp.bfloat16),
+                    None,
+                    None,
+                    S((g,), jnp.int32),
+                    S((1,), jnp.int32),
+                    tile_info=calculate_tiling,
+                    vmem_limit_bytes=vmem,
+                    out_dtype=None,
+                    acc_dtype=None,
+                    maybe_quantize_lhs=False,
+                    zero_initialize=False,
+                )
+                self.assertEqual(c0.tiles.tile_n, raw_tile_n)
+
     def test_interleave_under_explicit_sharding(self):
         # EP=4 / MoE TP=1: the size-1 "tensor" annotation on the last dim used to make the
         # reshape raise ShardingTypeError; EP=2 / TP=2 shards the interleaved dim for real.

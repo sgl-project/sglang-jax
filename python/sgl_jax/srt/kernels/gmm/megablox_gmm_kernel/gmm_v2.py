@@ -1016,6 +1016,15 @@ def make_gmm_configs(
     else:
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
         tiles = tile_info(lhs_q_dtype, rhs.dtype, dims, vmem_limit_bytes)
+        if glu_chunk:
+            # The auto-tiler only sizes tile_n for VMEM (bf16 k=6144 n=4096 -> 1408 on v6e/v7x);
+            # snap it down to whole [gate | up] chunk pairs so the epilogue tiles line up. Rounding
+            # down only shrinks the rhs buffer, so the VMEM budget still holds. Explicit TileSizes
+            # are the caller's contract and stay strictly validated below.
+            tiles = dataclasses.replace(
+                tiles,
+                tile_n=align_glu_tile_n(tile_n=tiles.tile_n, size_n=dims.size_n, chunk=glu_chunk),
+            )
 
     if glu_chunk:
         validate_glu_chunk(tile_n=tiles.tile_n, size_n=dims.size_n, chunk=glu_chunk)
@@ -1040,6 +1049,14 @@ def validate_glu_chunk(*, tile_n: int, size_n: int, chunk: int) -> None:
         raise ValueError(f"glu_chunk={chunk}: size_n={size_n} is not a multiple of 2*chunk")
     if tile_n % (2 * chunk) != 0:
         raise ValueError(f"glu_chunk={chunk}: tile_n={tile_n} is not a multiple of 2*chunk")
+
+
+def align_glu_tile_n(*, tile_n: int, size_n: int, chunk: int) -> int:
+    """Largest multiple of ``2 * chunk`` that is <= ``tile_n`` (never below one pair, never above
+    ``size_n``), i.e. the auto-tiler's VMEM-driven width snapped to whole interleaved chunk pairs.
+    """
+    pair = 2 * chunk
+    return min(max(pair, (tile_n // pair) * pair), size_n)
 
 
 def get_metadata(cfgs: GmmConfigs):
