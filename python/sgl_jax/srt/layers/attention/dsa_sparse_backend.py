@@ -953,9 +953,16 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         ):
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            k_pages_max = (
-                min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
-            )
+            # Attend page budget per REQUEST. On the spec decode-form path ``seq_lens_``
+            # holds T = S x G one-query pseudo-sequences over the S requests' page table,
+            # so ``pages_per_seq`` is G times smaller than a request's page span; sizing
+            # the budget from it cut every verify attend to budget/G pages (8 of 32 at
+            # G=4), and with the identity page-topk (ascending ids, taken when the
+            # per-request span == the budget) the kept window was the OLDEST pages --
+            # the dp8 p64 "answers a few-shot example" signature (10-26). The pre-write
+            # metadata is the original request-level metadata, so derive it there.
+            pages_per_req = ppi_.shape[0] // psl_.shape[0]
+            k_pages_max = _attend_k_pages_max(pages_per_req)
             if has_pages:
                 # Page lists from the prefill-form indexer (spec decode-form path)
                 # are index_topk/page_size wide; the page-level wrapper expects
@@ -1940,7 +1947,12 @@ def _prefill_page_topk(
         and seq_lens_.shape[0] >= _IDX_VERIFY_BATCHED_MIN_BS
         and pages_per_seq * page_size <= _IDX_VERIFY_BATCHED_MAX_KV
     )
-    if grouped and _identity_allowed(pages_per_seq) and k_eff >= pages_per_seq:
+    if (
+        grouped
+        and _identity_allowed(pages_per_seq)
+        and k_eff >= pages_per_seq
+        and _identity_covers_budget(pages_per_seq)
+    ):
         # budget covers the bucket: every page visible to each query is selected -> no scoring
         # (cc64 1k/1k census 10-04: this grouped reference path is 4.9 ms/step)
         topk_pages = _identity_page_topk_grouped(
@@ -2003,6 +2015,24 @@ def _prefill_page_topk(
     if k_eff < k_pages:
         topk_pages = _pad_topk_pages(topk_pages, k_pages)
     return topk_pages
+
+
+def _attend_k_pages_max(pages_per_req: int) -> int:
+    """Page-list width handed to the page-level attend kernel: the page-topk budget
+    (``DSA_PAGE_TOPK``) clamped to the request's page span, plus one column for the
+    new token's page; 512 when the budget is off (token-topk page-union path).
+    ``pages_per_req`` must be the per-REQUEST span (page table length / requests),
+    not the per-pseudo-sequence value of a spec decode-form batch."""
+    if _PAGE_TOPK_BUDGET <= 0:
+        return 512
+    return min(_PAGE_TOPK_BUDGET, int(pages_per_req)) + 1
+
+
+def _identity_covers_budget(pages_per_seq: int) -> bool:
+    """The identity page-topk lists pages in ascending id order and only makes sense
+    when the attend kernel keeps every one of them: the attend wrapper truncates the
+    list to ``_attend_k_pages_max - 1`` columns, which would keep the OLDEST pages."""
+    return _PAGE_TOPK_BUDGET <= 0 or int(pages_per_seq) <= _PAGE_TOPK_BUDGET
 
 
 def _pad_topk_pages(topk_pages: jax.Array, width: int) -> jax.Array:
