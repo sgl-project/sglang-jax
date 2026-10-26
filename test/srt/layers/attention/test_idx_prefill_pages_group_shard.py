@@ -81,8 +81,8 @@ def _sets(a):
 
 
 class IdxPrefillPagesGroupShardTest(unittest.TestCase):
-    def _pages(self, tp, md, cache, k_idx, q_idx, w):
-        devs = np.array(jax.devices()[:tp]).reshape(1, tp)
+    def _pages(self, tp, md, cache, k_idx, q_idx, w, dp=1):
+        devs = np.array(jax.devices()[: dp * tp]).reshape(dp, tp)
         mesh = Mesh(devs, ("data", "tensor"))
         backend = _backend(mesh)
         with (
@@ -121,6 +121,29 @@ class IdxPrefillPagesGroupShardTest(unittest.TestCase):
         self.assertEqual(_sets(got_pages), _sets(ref_pages))
         self.assertTrue(all(len(s) > 0 for s in _sets(got_pages)))
         np.testing.assert_array_equal(got_cache, ref_cache)
+
+    def test_dp_local_rows_decide_sharding(self):
+        # review: DP=2, TP=2, one 4-token request per DP rank. The global row count (8)
+        # divided by tp is a whole group, but each DP rank only holds 4 rows, which the
+        # tensor axis would split into half-groups (every page -1). Must stay replicated
+        # inside each DP rank and match that rank's single-device page sets.
+        rng = np.random.default_rng(7)
+        ranks = [_verify_batch(rng, prefix=[9]), _verify_batch(rng, prefix=[20])]
+        refs = [self._pages(1, *b)[1] for b in ranks]
+        # DP layout = per-rank arrays concatenated (each P("data") shard is one rank's
+        # self-consistent metadata, page ids local to that rank's cache slice).
+        md = MLAAttentionMetadata()
+        for f in ("cu_q_lens", "cu_kv_lens", "page_indices", "seq_lens", "distribution"):
+            setattr(md, f, jnp.concatenate([getattr(b[0], f) for b in ranks]))
+        cache = jnp.concatenate([b[1] for b in ranks])
+        k_idx = jnp.concatenate([b[2] for b in ranks])
+        q_idx = jnp.concatenate([b[3] for b in ranks])
+        w = jnp.concatenate([b[4] for b in ranks])
+        _, got_pages = self._pages(2, md, cache, k_idx, q_idx, w, dp=2)
+        ref_pages = np.concatenate(refs)
+        self.assertEqual(got_pages.shape, ref_pages.shape)
+        self.assertEqual(_sets(got_pages), _sets(ref_pages))
+        self.assertTrue(all(len(s) > 0 for s in _sets(got_pages)))
 
 
 if __name__ == "__main__":

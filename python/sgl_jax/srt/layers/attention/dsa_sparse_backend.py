@@ -1080,13 +1080,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # Shard the query rows over the tensor axis only when every rank's window holds
         # whole verify groups: the batched grouped page-topk treats a request whose local
         # q_len != q_group as padding (all pages -1), so e.g. tp16 with 8 requests x 4
-        # tokens (2 rows per rank) must stay replicated.
-        t_local = q_idx.shape[0] // tp_size if tp_size > 1 else q_idx.shape[0]
-        tshard = (
-            tp_size > 1
-            and q_idx.shape[0] % tp_size == 0
-            and (q_group is None or t_local % int(q_group) == 0)
-        )
+        # tokens (2 rows per rank) must stay replicated. The window is cut from the
+        # DP-local rows (``q_idx`` is sharded over ``dpa`` first), so the divisibility is
+        # checked on ``T / dp / tp``, not on the global ``T / tp`` (#1811 review).
+        tshard = _idx_tshard_eligible(q_idx.shape[0], self.mesh.shape[dpa], tp_size, q_group)
         in_specs = (
             P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] replicated
             P(dpa, None),  # k_idx    [T, D_idx]
@@ -1250,7 +1247,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             row = row.at[:, kv_lora_rank : kv_lora_rank + rope].set(
                 kpe_.reshape(t, rope).astype(cache_.dtype)
             )
-            return paged_write_back(cache_, row, loc, page_size=page_size, small_rows_scatter=True)
+            # Explicit run capacity: each request's rows are one page-contiguous run per
+            # page they touch (<= t//page_size + 2 per request in total), so size the run
+            # table by the request count. The default 2*(t//ps)+130 only covers
+            # ``t <= STATIC_DISPATCH_MAX_ROWS``; above it (e.g. 256 requests x 5 tokens =
+            # 1280 rows, 150 runs) the kernel silently dropped the remaining writes
+            # (#1811 review).
+            return paged_write_back(
+                cache_,
+                row,
+                loc,
+                page_size=page_size,
+                r_cap=spec_prewrite_run_capacity(t, sl_.shape[0], page_size),
+                small_rows_scatter=True,
+            )
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             kvc, kpe, cache, md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices
@@ -1557,7 +1567,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
 
         qb = _TSA_PREFILL_QB
-        zigzag = ql.shape[0] % (tp_size * qb) == 0
+        # ``tsa_zigzag_permute`` reshapes each DP rank's rows into [T_dp/(tp*qb), tp, qb],
+        # so the divisibility is on the DP-local count (#1811 review: DP=2, TP=8, T=128,
+        # QB=16 passes globally but each rank holds 64 rows and the reshape fails).
+        zigzag = _tsa_zigzag_eligible(ql.shape[0], self.mesh.shape[dpa], tp_size, qb)
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, sl_, cuq_, cukv_, pi_, *rest):
             rest = list(rest)
@@ -1832,6 +1845,38 @@ def _gather_cache_rows(cache: jax.Array, loc: jax.Array, page_size: int) -> jax.
     off = safe % page_size
     rows = cache[page, off // pk, off % pk]
     return jnp.where((loc >= 0)[:, None], rows, jnp.zeros_like(rows))
+
+
+def _idx_tshard_eligible(
+    num_tokens_global: int, dp_size: int, tp_size: int, q_group: int | None
+) -> bool:
+    """Shard the verify page-topk query rows over the tensor axis only when every tensor
+    rank's window of the DP-local rows is non-empty, even, and holds whole ``q_group``
+    verify groups (a split group is treated as padding by the grouped page-topk)."""
+    if tp_size <= 1 or dp_size <= 0 or num_tokens_global % dp_size != 0:
+        return False
+    t_dp = num_tokens_global // dp_size
+    if t_dp % tp_size != 0:
+        return False
+    t_local = t_dp // tp_size
+    return q_group is None or (t_local > 0 and t_local % int(q_group) == 0)
+
+
+def _tsa_zigzag_eligible(num_tokens_global: int, dp_size: int, tp_size: int, qb: int) -> bool:
+    """Zigzag (block-strided) TSA query assignment needs the DP-local row count to be a
+    whole number of ``tp_size * qb`` blocks (``tsa_zigzag_permute`` reshapes to
+    ``[T_dp / (tp*qb), tp, qb]``)."""
+    if dp_size <= 0 or num_tokens_global % dp_size != 0:
+        return False
+    return (num_tokens_global // dp_size) % (tp_size * qb) == 0
+
+
+def spec_prewrite_run_capacity(num_rows: int, num_seqs: int, page_size: int) -> int:
+    """Run-table capacity for the spec pre-write (``paged_write_back`` over ``num_rows``
+    rows of ``num_seqs`` requests): every request contributes at most one run per page it
+    touches, i.e. ``ceil(q / page_size) + 1``, which sums to ``num_rows // page_size +
+    2 * num_seqs + 2`` -- the same bound the indexer-key write uses."""
+    return int(num_rows) // int(page_size) + 2 * int(num_seqs) + 2
 
 
 def _tsa_eligible(num_tokens_global: int, dp_size: int, tp_size: int) -> bool:
