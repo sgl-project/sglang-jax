@@ -317,3 +317,42 @@ def test_transform_experts_unpacks_only_packed_4bit_codes():
     out_p = layout.transform_experts(jnp.asarray(packed), spec, target)
     assert out_p.shape == (2, 6, 4)
     np.testing.assert_array_equal(np.asarray(out_p).astype(np.int8), np.transpose(codes, (0, 2, 1)))
+
+
+def test_default_max_layer_includes_nextn_draft_layers():
+    # #1810 review: the serving int4 YAML applies to every routed-expert layer, so the
+    # converter's default range must cover the NextN (MTP) draft layers too.
+    assert (
+        converter.default_max_layer({"num_hidden_layers": 78, "num_nextn_predict_layers": 1}) == 79
+    )
+    assert converter.default_max_layer({"num_hidden_layers": 78}) == 78
+    assert (
+        converter.default_max_layer({"num_hidden_layers": 4, "num_nextn_predict_layers": None}) == 4
+    )
+
+
+def test_epmoe_scale_expansion_uses_moe_block_size(tmp_path):
+    # #1810 review: global [128, 128] with a MoE override of [64, 64] stores the fused 2D
+    # scale as [E, k_blocks, out/64]; expanding it with the linear block size (128) left it
+    # compact and failed the load-time shape check.
+    path = tmp_path / "mixed.yaml"
+    path.write_text(
+        "quantization:\n  is_static_checkpoint: true\n  weight_block_size: [128, 128]\n"
+        "  linear:\n    rules:\n      - {module_path: '.*', weight_dtype: 'float8_e4m3fn'}\n"
+        "  moe:\n    weight_dtype: 'int8'\n    weight_block_size: [64, 64]\n"
+    )
+    cfg = QuantizationConfig.from_yaml(str(path))
+    assert cfg.get_moe_weight_block_size() == (64, 64) and cfg.weight_block_size == (128, 128)
+    E, k_blocks, out_dim = 2, 3, 256
+    target = jax.ShapeDtypeStruct((E, k_blocks, 1, out_dim), jnp.float32)
+    compact = jnp.arange(E * k_blocks * (out_dim // 64), dtype=jnp.float32).reshape(
+        E, k_blocks, out_dim // 64
+    )
+    loader = SimpleNamespace(model_config=SimpleNamespace(quantization_config=cfg))
+    out = TensorLayout._maybe_convert_epmoe_scale_for_kernel(
+        loader, compact, target, "model.layers.3.mlp.experts.w1_scale"
+    )
+    assert out.shape == target.shape
+    np.testing.assert_array_equal(
+        np.asarray(out)[:, :, 0, :], np.repeat(np.asarray(compact), 64, axis=2)
+    )

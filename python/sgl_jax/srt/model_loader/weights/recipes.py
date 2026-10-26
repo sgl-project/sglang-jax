@@ -151,7 +151,13 @@ class TensorLayout:
             return weight
 
         quant_cfg = getattr(self.model_config, "quantization_config", None)
-        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        # Expert scales follow the MoE block size (``moe.weight_block_size`` override, else
+        # the global value), not the linear layers' ``weight_block_size``: with a global
+        # [128, 128] and a MoE override of [64, 64] the compact scale is [E, k, out/64].
+        get_moe_bs = getattr(quant_cfg, "get_moe_weight_block_size", None)
+        weight_block_size = (
+            get_moe_bs() if callable(get_moe_bs) else getattr(quant_cfg, "weight_block_size", None)
+        )
         block_size_out = None
         if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
             block_size_out = int(weight_block_size[0])

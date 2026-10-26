@@ -141,6 +141,15 @@ def convert_shard(
     return sizes
 
 
+def default_max_layer(config: dict) -> int:
+    """Default conversion bound (exclusive): every routed-expert layer the serving
+    quantization config covers -- the decoder layers plus the NextN (MTP) draft layers.
+    The draft model loads its experts through the same routed-expert quantization
+    (``routed_expert_scale_suffix``), so with the int4 YAML it expects int4 codes and
+    ``.weight_scale`` sidecars; leaving the draft layers in FP8 made the MTP load fail."""
+    return int(config["num_hidden_layers"]) + int(config.get("num_nextn_predict_layers") or 0)
+
+
 def finalize(input_dir: str, output_dir: str, *, max_layer: int, min_layer: int) -> None:
     index = _load_index(input_dir)
     files = _shard_files(index)
@@ -200,8 +209,10 @@ def main(argv: list[str] | None = None) -> int:
         "--max-layer",
         type=int,
         default=None,
-        help="convert routed experts of layers < MAX_LAYER (default: num_hidden_layers, "
-        "which leaves MTP draft layers in FP8)",
+        help="convert routed experts of layers < MAX_LAYER (default: num_hidden_layers + "
+        "num_nextn_predict_layers, i.e. the NextN/MTP draft layers too: the serving int4 "
+        "YAML applies to every routed-expert layer, so the draft loader expects int4 codes "
+        "and .weight_scale sidecars as well)",
     )
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     ap.add_argument(
@@ -217,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     config = _load_config(args.input_dir)
-    max_layer = args.max_layer if args.max_layer is not None else int(config["num_hidden_layers"])
+    max_layer = args.max_layer if args.max_layer is not None else default_max_layer(config)
     min_layer = int(config.get("first_k_dense_replace", 0))
 
     if args.finalize:
