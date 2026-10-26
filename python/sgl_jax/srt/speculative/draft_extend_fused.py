@@ -28,7 +28,6 @@ from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
 )
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -252,28 +251,41 @@ def _chained_relay(hidden_relay, num_steps: int, num_blocks: int) -> bool:
 def _spec_decode_compiler_options():
     """Per-executable XLA options for the decode-shaped speculative executables.
 
-    The non-speculative decode path compiles its executables with the
-    SparseCore gather offload disabled when
-    ``SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD`` is set (jax 0.11.1 TPU
-    regression, see ``aot_dispatch.decode_no_sc_gather_compiler_options_fn``).
-    The speculative draft-extend / fused-verify executables are decode-shaped
-    too but were compiled with plain ``jax.jit`` and therefore kept the
-    offload; on v7x tp16 that left ~2/3 of a fused-verify step in offloaded
-    small collectives. Mirror the same opt-in here so both paths agree; the
-    prefill-phase speculative executable keeps the default (large prefill
-    gathers profit from the offload).
+    The non-speculative decode path compiles its executables with the opt-in
+    decode options (SparseCore gather offload disabled under
+    ``SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD``, all-reduce SparseCore
+    threshold under ``SGLANG_JAX_SC_ALLREDUCE_MIN_BYTES``; see
+    ``aot_dispatch.decode_compiler_options``). The speculative draft-extend /
+    fused-verify executables are decode-shaped too but are compiled with plain
+    ``jax.jit``, so mirror the same options here; on v7x tp16 the fused-verify
+    step otherwise keeps ~1/3 of its time in offloaded small all-reduces. The
+    prefill-phase speculative executable keeps the default.
     """
-    if jax.default_backend() != "tpu" or not get_bool_env_var(
-        "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD"
-    ):
-        return None
-    return {
-        "xla_tpu_offload_gather_to_sparsecore": "false",
-        "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
-    }
+    from sgl_jax.srt.model_executor.aot_dispatch import decode_compiler_options
+
+    options = decode_compiler_options()
+    if options:
+        logger.info("speculative decode executables will be compiled with XLA options %s", options)
+    return options
 
 
 _SPEC_DECODE_COMPILER_OPTIONS = _spec_decode_compiler_options()
+
+
+def _spec_prefill_compiler_options():
+    """Per-executable XLA options for the fused speculative *prefill* executable
+    (target extend + MTP draft extend in one jit): SGLANG_JAX_PREFILL_XLA_OPTIONS,
+    see ``aot_dispatch.prefill_compiler_options``. With speculative decoding on,
+    this jit -- not ModelRunner's run_model -- is the prefill executable."""
+    from sgl_jax.srt.model_executor.aot_dispatch import prefill_compiler_options
+
+    options = prefill_compiler_options()
+    if options:
+        logger.info("speculative prefill executable will be compiled with XLA options %s", options)
+    return options
+
+
+_SPEC_PREFILL_COMPILER_OPTIONS = _spec_prefill_compiler_options()
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -1939,6 +1951,40 @@ def _build_verify(topk: int):
 
 
 def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
+    """Build the prefill JIT (target extend + all MTP draft-extend layers). With
+    SGLANG_JAX_PREFILL_XLA_OPTIONS and a MIN_TOKENS threshold, two jits are built and the
+    one with the options serves only batches at or above the threshold."""
+    from sgl_jax.srt.model_executor.aot_dispatch import prefill_xla_options_min_tokens
+
+    options = _SPEC_PREFILL_COMPILER_OPTIONS
+    min_tokens = prefill_xla_options_min_tokens()
+    if not options or min_tokens <= 0:
+        return _build_prefill_jit(num_layers, topk, hidden_relay, options)
+    plain = _build_prefill_jit(num_layers, topk, hidden_relay, None)
+    tuned = _build_prefill_jit(num_layers, topk, hidden_relay, options)
+
+    def _dispatch(
+        target_model_def,
+        target_model_state_def,
+        target_leaves,
+        target_forward_batch,
+        *args,
+        **kwargs,
+    ):
+        fn = tuned if target_forward_batch.input_ids.shape[0] >= min_tokens else plain
+        return fn(
+            target_model_def,
+            target_model_state_def,
+            target_leaves,
+            target_forward_batch,
+            *args,
+            **kwargs,
+        )
+
+    return _dispatch
+
+
+def _build_prefill_jit(num_layers: int, topk: int, hidden_relay=None, compiler_options=None):
     """Build prefill JIT: target extend + all MTP draft-extend layers."""
     assert topk == 1, "Fused greedy prefill only supports topk=1"
 
@@ -1953,6 +1999,7 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
             "per_dp_bs",
             "update_relay",
         ],
+        compiler_options=compiler_options,
     )
     def fused_prefill(
         target_model_def,

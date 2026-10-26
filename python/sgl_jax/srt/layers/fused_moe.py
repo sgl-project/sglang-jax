@@ -204,6 +204,13 @@ class FusedEPMoE(nnx.Module):
         weight_block_size = (
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
+        if quantization_config is not None and getattr(
+            quantization_config, "moe_weight_block_size_override", False
+        ):
+            raise NotImplementedError(
+                "quantization.moe.weight_block_size is only honoured by the epmoe backend; "
+                "the fused MoE backend reads the linear-layer block size"
+            )
         if weight_block_size is not None and len(weight_block_size) == 2:
             self.quant_block_k = int(weight_block_size[1])  # block_k
             self.quant_block_n = int(weight_block_size[0])  # block_n

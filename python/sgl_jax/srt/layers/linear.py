@@ -633,6 +633,84 @@ class QuantizedLinear(nnx.Module):
         return output, None
 
 
+def fuse_quantized_linears(
+    mods: Sequence["QuantizedLinear"],
+    *,
+    scope_name: str,
+    pad_n_to: int = 512,
+    member_paths: Sequence[str] | None = None,
+) -> tuple["QuantizedLinear", list[int]] | None:
+    """Concatenate replicated ``QuantizedLinear`` modules that consume the same
+    input into ONE ``QuantizedLinear`` along the output dim.
+
+    GLM-5.2 decode issues q_a_proj / kv_a_proj_with_mqa / indexer.wk as three
+    separate fp8 blockwise matmuls over the same ``hidden_states`` every layer;
+    at M<=64 each is a ~12-20 us fixed-cost launch far above its HBM time, so
+    3 -> 1 launches per layer is the win (weights are byte-identical, blockwise
+    scales ``[in_blocks, 1, n_out]`` simply concatenate along ``n_out``).
+
+    The concatenated output width is zero-padded up to a multiple of
+    ``pad_n_to`` at build time: the blockwise kernel wrapper otherwise pads the
+    weight to a multiple of its out block on EVERY call (09-21 trace: a 25 MB
+    ``pad(f8[2752,6144]) -> [4096,6144]`` per layer per step, +2.5 ms/step).
+
+    Returns ``(fused, splits)`` where ``splits`` are the per-module output
+    widths (slice the fused output with ``jnp.split``; the padding tail is the
+    last, unused segment), or ``None`` when the
+    modules are not fusable (different input width / dtype / block size /
+    non-replicated layout / 1-D scales / bias) so callers keep the unfused path.
+
+    ``member_paths`` (module paths of ``mods`` relative to the fused module's parent, e.g.
+    ``"q_a_proj"`` / ``"indexer/wk"``) are kept on the fused module as
+    ``fused_member_paths`` so later per-module passes keyed on the module path (the
+    per-channel requantization skip regex) still see the original layers.
+    """
+    if not mods or not all(isinstance(m, QuantizedLinear) for m in mods):
+        return None
+    m0 = mods[0]
+    w_qs = [m.weight_q.value for m in mods]
+    w_scales = [m.weight_scale.value for m in mods]
+    same = all(
+        w.shape[1] == w_qs[0].shape[1]
+        and w.dtype == w_qs[0].dtype
+        and ws.ndim == 3
+        and ws.shape[:2] == w_scales[0].shape[:2]
+        and m.bias is None
+        and tuple(m.kernel_axes or (None, None)) == (None, None)
+        and m.activation_dtype == m0.activation_dtype
+        and m.weight_block_size == m0.weight_block_size
+        and m.compute_dtype == m0.compute_dtype
+        for m, w, ws in zip(mods, w_qs, w_scales)
+    )
+    if not same:
+        return None
+    w_q = jnp.concatenate(w_qs, axis=0)
+    w_scale = jnp.concatenate(w_scales, axis=-1)
+    n_total = int(w_q.shape[0])
+    n_pad = (-n_total) % pad_n_to if pad_n_to else 0
+    if n_pad:
+        w_q = jnp.concatenate([w_q, jnp.zeros((n_pad, w_q.shape[1]), w_q.dtype)], axis=0)
+        w_scale = jnp.concatenate(
+            [w_scale, jnp.ones(w_scale.shape[:2] + (n_pad,), w_scale.dtype)], axis=-1
+        )
+    fused = QuantizedLinear(
+        weight_q=w_q,
+        weight_scale=w_scale,
+        bias=None,
+        activation_dtype=m0.activation_dtype,
+        mesh=m0.mesh,
+        kernel_axes=(None, None),
+        skip_bias_add=m0.skip_bias_add,
+        params_dtype=m0.params_dtype,
+        compute_dtype=m0.compute_dtype,
+        weight_block_size=m0.weight_block_size,
+        allow_narrow_n_blockwise=m0.allow_narrow_n_blockwise,
+        scope_name=scope_name,
+    )
+    fused.fused_member_paths = tuple(member_paths or ())
+    return fused, [int(w.shape[0]) for w in w_qs]
+
+
 def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256) -> int:
     """Pad every block-quant QuantizedLinear under ``module`` once (see
     QuantizedLinear.pad_out_rows). Disabled with SGLANG_JAX_QMM_PREPAD_N=0.

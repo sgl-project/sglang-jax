@@ -1,0 +1,38 @@
+# FP8 block-128 linear layers + int4 per-channel routed experts (W4A8).
+# - For checkpoints produced by `sgl_jax.tools.convert_moe_experts_int4` from an
+#   HF FP8 block-quant release (DeepSeek-V3 / GLM-5 style): attention, dense
+#   MLP and shared experts keep their float8_e4m3fn weights with 128x128
+#   `weight_scale_inv` sidecars; routed experts are int8-stored int4 codes with
+#   a per-output-channel `weight_scale`.
+# - `moe.weight_block_size: null` keeps the MoE scale placeholders per-channel
+#   ([E, 1, 1, N]) while the global block size still applies to linear layers.
+# - Routed-expert activations are quantized to fp8 in-kernel (W4A8); on chips
+#   without an int8 MXU (v7x) gmm_v2 upcasts the int4 tile to e4m3 and runs the
+#   fp8 MXU. The block-128 linear path keeps bf16 activations
+#   (`activation_dtype: null`): enabling activation quantization on the static
+#   block-128 kernel produced NaN logits for every batch>1 decode step on
+#   GLM-5.2 (first MoE layer, shared experts). `per_channel_requant: a8` then
+#   rewrites those linears to per-channel scales with fp8 activations after
+#   loading (plain fp8 x fp8 dot, no blockwise kernel).
+# - Use `moe_backend: epmoe` (ep_size > 1); the fused kernels have no int4 path.
+
+quantization:
+  is_static_checkpoint: true
+  weight_block_size: [128, 128]
+  allow_narrow_n_blockwise: true
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+    # after loading, requantize the block-128 fp8 linears to per-output-channel fp8 scales and
+    # run them as fp8 x fp8 dots (W8A8 per-channel): the blockwise Pallas path pops and rescales
+    # its accumulator once per 128-wide K block (measured on v7x, v7x: 1.8-2.4x the bf16 dot
+    # floor at M=4096); the GLM-5.2 production setting
+    per_channel_requant: a8
+
+  moe:
+    weight_dtype: 'int4'
+    activation_dtype: 'float8_e4m3fn'
+    weight_block_size: null

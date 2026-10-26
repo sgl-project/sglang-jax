@@ -304,7 +304,7 @@ def apply_moe_quantization(
             if hasattr(obj, "quantized_dtype") and obj.quantized_dtype is None:
                 obj.quantized_dtype = quant_config.get_moe_weight_dtype()
                 obj.activation_quantized_dtype = quant_config.get_moe_activation_dtype()
-                obj.weight_block_size = getattr(quant_config, "weight_block_size", None)
+                obj.weight_block_size = quant_config.get_moe_weight_block_size()
             obj.quantize_weights(
                 is_static=is_static_input,
                 abstract=getattr(model_config, "_abstract_mode", False),

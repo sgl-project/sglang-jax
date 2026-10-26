@@ -16,6 +16,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.eplb.expert_location import (
     init_expert_location_metadata,
     set_global_server_args,
@@ -41,13 +42,17 @@ from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.aot_dispatch import (
     AotDispatcher,
     aot_dispatch_requested,
+    prefill_compiler_options,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_forward import (
     _maybe_apply_recurrent_cow as _maybe_apply_recurrent_cow,  # DFlash imports this helper.
 )
-from sgl_jax.srt.model_executor.model_forward import make_jitted_run_model
+from sgl_jax.srt.model_executor.model_forward import (
+    make_jitted_run_model,
+    select_run_model_by_mode,
+)
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
@@ -323,7 +328,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         # Retain the serving JIT definitions for compile-only preparation.
         # Warmup still calls the ordinary wrappers and threads donated pools.
-        self._lower_model = lambda batch, metadata: jitted_run_model.lower(
+        self._lower_model = lambda batch, metadata: self._run_model_by_mode(batch).lower(
             model_def,
             model_state_def,
             self.model_state_leaves,
@@ -372,6 +377,24 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             use_aot_dispatch = False
 
+        # SGLANG_JAX_PREFILL_XLA_OPTIONS on the ordinary jit path (the one
+        # speculative decoding serves from): a second jit carries the prefill
+        # options for the EXTEND / MIXED batches. AOT dispatch / executable
+        # stores apply them per shape in CompilationManager.compiler_options.
+        jitted_run_model_prefill = None
+        prefill_options = prefill_compiler_options()
+        if prefill_options and not use_aot_dispatch and executable_store is None:
+            jitted_run_model_prefill = make_jitted_run_model(
+                self.attn_backend, {**(jit_compiler_options or {}), **prefill_options}
+            )
+            logger.info(
+                "prefill executables (jit path) will be compiled with XLA options %s",
+                prefill_options,
+            )
+        self._run_model_by_mode = select_run_model_by_mode(
+            jitted_run_model, jitted_run_model_prefill
+        )
+
         # Match the exact compile options used by the selected serving path so
         # both ordinary JIT and AOT dispatch reuse JAX's compiled-executable cache.
         self.model_compile_options = lambda batch: (
@@ -413,7 +436,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         else:
 
             def run_model_wrapper(forward_batch, logits_metadata):
-                return jitted_run_model(
+                return self._run_model_by_mode(forward_batch)(
                     model_def,
                     model_state_def,
                     self.model_state_leaves,
@@ -683,6 +706,29 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 self.model = apply_quantization(self.model_config, self.model)
             else:
                 logger.info("Static quantization detected. Skipping online requantization.")
+            from sgl_jax.srt.utils.quantization.per_channel_requant import (
+                per_channel_mode,
+                requantize_linears_per_channel,
+            )
+
+            qc = self.model_config.quantization_config
+            pc_mode = per_channel_mode(qc)
+            if pc_mode is not None:
+                with jax.set_mesh(self.mesh):
+                    requantize_linears_per_channel(
+                        self.model, pc_mode, skip=qc.linear_per_channel_requant_skip
+                    )
+        # Fuse each EPMoE's gate/up expert weights into one [E, K, 2N] grouped matmul
+        # (75 fewer gmm calls per step on GLM-5.2). Must run before nnx.split / jit.
+        if envs.SGLANG_JAX_EPMOE_FUSED_GATE_UP.get():
+            from sgl_jax.srt.layers.moe import EPMoE
+
+            fused = 0
+            for _path, node in nnx.iter_graph(self.model):
+                if isinstance(node, EPMoE) and node.fuse_gate_up():
+                    fused += 1
+            logger.info("EPMoE fused gate/up expert weights on %d layers", fused)
+
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
         self.dtype = self.model_config.dtype

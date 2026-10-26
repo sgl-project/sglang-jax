@@ -1,5 +1,6 @@
 import functools
 import logging
+import math
 from dataclasses import replace
 
 import jax
@@ -15,6 +16,23 @@ from sgl_jax.srt.utils.quantization.quantization_utils import is_int4_dtype
 from .specs import WeightSpec
 
 logger = logging.getLogger(__name__)
+
+
+def packed_4bit_factor(weight: jax.Array, target_shape) -> int | None:
+    """How many 4-bit values each element of ``weight`` packs for ``target_shape``.
+
+    Returns 2 for int8/uint8 nibble packing and 8 for int32/uint32 packing when the
+    element counts match that layout, and None when the checkpoint tensor already
+    holds one code per element (e.g. int8 codes written by convert_moe_experts_int4),
+    in which case no unpacking must happen.
+    """
+    target_size = math.prod(target_shape)
+    weight_size = math.prod(weight.shape)
+    if weight.dtype in (jnp.int32, jnp.uint32) and weight_size * 8 == target_size:
+        return 8
+    if weight.dtype in (jnp.int8, jnp.uint8) and weight_size * 2 == target_size:
+        return 2
+    return None
 
 
 @functools.partial(jax.jit, static_argnames=("target_dtype", "do_transpose"))
@@ -133,7 +151,13 @@ class TensorLayout:
             return weight
 
         quant_cfg = getattr(self.model_config, "quantization_config", None)
-        weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+        # Expert scales follow the MoE block size (``moe.weight_block_size`` override, else
+        # the global value), not the linear layers' ``weight_block_size``: with a global
+        # [128, 128] and a MoE override of [64, 64] the compact scale is [E, k, out/64].
+        get_moe_bs = getattr(quant_cfg, "get_moe_weight_block_size", None)
+        weight_block_size = (
+            get_moe_bs() if callable(get_moe_bs) else getattr(quant_cfg, "weight_block_size", None)
+        )
         block_size_out = None
         if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
             block_size_out = int(weight_block_size[0])
@@ -295,6 +319,7 @@ class TensorLayout:
             isinstance(mapping.target_path, str)
             and is_int4_dtype(targets[mapping.target_path].dtype)
             and weight.dtype in (jnp.int32, jnp.uint32, jnp.int8, jnp.uint8)
+            and packed_4bit_factor(weight, targets[mapping.target_path].shape) is not None
         ):
             weight = unpack_4bit_jax(weight, targets[mapping.target_path].dtype)
         if mapping.transpose_axes is not None and not hf_key.endswith(".bias"):
@@ -313,11 +338,16 @@ class TensorLayout:
             jnp.int8,
             jnp.uint8,
         ):
-            weight = unpack_4bit_jax(
-                weight,
-                target.dtype,
-                do_transpose=mapping.transpose,
-            )
+            if packed_4bit_factor(weight, target.shape) is not None:
+                weight = unpack_4bit_jax(
+                    weight,
+                    target.dtype,
+                    do_transpose=mapping.transpose,
+                )
+            elif mapping.transpose:
+                # One int8 code per element (unpacked int4 checkpoint): the loader read
+                # the tensor untransposed for int4 targets, so apply the transpose here.
+                weight = jnp.transpose(weight, (0, 2, 1))
         if mapping.reshape is not None:
             weight = jnp.reshape(weight, mapping.reshape)
         if mapping.repeat is not None:
