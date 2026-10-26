@@ -219,6 +219,79 @@ def streamindex_topk_ref(
     return jax.lax.fori_loop(0, num_seqs, body, out)
 
 
+@functools.partial(
+    jax.jit, static_argnames=("k_pages", "pages_per_seq", "head_chunk", "unroll_heads")
+)
+def streamindex_page_topk_ref_batched(
+    q: jax.Array,
+    weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_kv_lens: jax.Array,
+    *,
+    k_pages: int,
+    pages_per_seq: int,
+    head_chunk: int = 8,
+    unroll_heads: bool = True,
+) -> jax.Array:
+    """Decode page-topk, vectorized over sequences (token i belongs to seq i).
+
+    Same selection semantics as ``streamindex_page_topk_ref(one_token_per_seq=
+    True)`` but without the per-sequence ``fori_loop``: one gather of every
+    sequence's ``pages_per_seq`` pages from the idx cache (a single large
+    gather, eligible for the SparseCore offload path instead of 64 tiny 1 MiB
+    TensorCore gathers), a batched score einsum accumulated over head chunks
+    (bounds the [S, H, max_kv] f32 temporary), a batched page max-pool and one
+    batched top_k. Memory at the largest decode kv bucket (65536): keys
+    [64, 65536, 128] bf16 = 1 GiB transient + scores 16 MiB f32.
+    """
+    T, H, D = q.shape
+    page_size = cache_kv.shape[1]
+    max_kv = pages_per_seq * page_size
+    S = seq_lens.shape[0]
+    n = min(T, S)
+
+    starts = cu_kv_lens[:n] // page_size  # [n]
+    gidx = starts[:, None] + jnp.arange(pages_per_seq)[None, :]  # [n, pps]
+    gidx = jnp.minimum(gidx, page_indices.shape[0] - 1)
+    pages = page_indices[gidx]  # [n, pps]
+    # One gather over the whole cache with a FLAT 1-D page index: a 2-D
+    # [n, pps] index makes XLA emit a batched gather (batch dims) that the
+    # 09-21 e2e traces show staying on the TensorCore (gather_fusion,
+    # ~10% of HBM BW); the compile-only probe offloads 1-D-indexed gathers
+    # of >=32 MiB sources to the SparseCore. Leading-dim reshapes are free.
+    keys = cache_kv[pages.reshape(-1)].reshape(n, max_kv, D)
+
+    qs = q[:n]
+    ws = weights[:n].astype(jnp.float32)
+    nchunks = -(-H // head_chunk)
+    q_pad = jnp.pad(qs, ((0, 0), (0, nchunks * head_chunk - H), (0, 0)))
+    w_pad = jnp.pad(ws, ((0, 0), (0, nchunks * head_chunk - H)))
+
+    def h_step(c, acc):
+        h0 = c * head_chunk
+        q_c = jax.lax.dynamic_slice_in_dim(q_pad, h0, head_chunk, axis=1)  # [n, hc, D]
+        w_c = jax.lax.dynamic_slice_in_dim(w_pad, h0, head_chunk, axis=1)  # [n, hc]
+        s_c = jnp.einsum("shd,skd->shk", q_c, keys, preferred_element_type=jnp.float32)
+        return acc + jnp.einsum("sh,shk->sk", w_c, jax.nn.relu(s_c))
+
+    if unroll_heads:
+        # static unroll: no while op in the graph (dpb9: head-chunk while 2.62 ms/step)
+        scores = jnp.zeros((n, max_kv), jnp.float32)
+        for c in range(nchunks):
+            scores = h_step(c, scores)
+    else:
+        scores = jax.lax.fori_loop(0, nchunks, h_step, jnp.zeros((n, max_kv), jnp.float32))
+    mask = jnp.arange(max_kv)[None, :] < seq_lens[:n, None]
+    scores = jnp.where(mask, scores, _NEG_INF)
+    page_scores = scores.reshape(n, pages_per_seq, page_size).max(axis=-1)
+    vals, pidx = jax.lax.top_k(page_scores, k_pages)
+    pidx = jnp.where(vals > _NEG_INF, pidx, -1)
+    out = jnp.full((T, k_pages), -1, dtype=jnp.int32)
+    return out.at[:n].set(pidx)
+
+
 @functools.partial(jax.jit, static_argnames=("k_pages", "pages_per_seq", "one_token_per_seq"))
 def streamindex_page_topk_ref(
     q: jax.Array,

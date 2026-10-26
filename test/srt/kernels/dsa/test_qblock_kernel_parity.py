@@ -145,6 +145,25 @@ def test_deployment_shape_qb64_h4():
     _run_both(c, query_block=64)
 
 
+def test_out_dtype_bf16_matches_f32_cast():
+    """out_dtype=bf16 stores the f32-normalised result cast on store: bit-identical to the
+    f32 output cast afterwards (the TSA backend's first consumer casts to bf16 anyway)."""
+    c = _make_case(B=1, S=128, H=4, K=3, pages=6, seed=5)
+    common = dict(
+        kv_lora_rank=c["kv_lora_rank"],
+        read_block=c["page_size"],
+        sm_scale=c["sm_scale"],
+        interpret=True,
+        query_block=64,
+    )
+    o32 = sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    o16 = sparse_mla_attention_qblock(
+        c["q"], c["kv"], c["indices"], c["positions"], out_dtype=jnp.bfloat16, **common
+    )
+    assert o32.dtype == jnp.float32 and o16.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(o32.astype(jnp.bfloat16)), np.asarray(o16))
+
+
 def test_qbh_exact_128():
     # QB*H == 128 exactly (no lane padding), B=2
     c = _make_case(B=2, S=48, H=8, K=3, pages=4, seed=1)
@@ -384,6 +403,99 @@ def test_tsa_sharded_vs_full(seq_lens_list, shards, qb):
     assert d_o < 2e-3, f"TSA sharded attend drifted from full-chunk qblock: {d_o}"
 
 
+@pytest.mark.parametrize(
+    "seq_lens_list, shards, qb",
+    [
+        ([200, 512, 1, 129], 4, 16),  # 1024 rows = 16 blocks x 4 shards: blocks straddle requests
+        ([130, 70], 4, 16),  # 512 rows = 8 blocks x 4 shards: tail blocks mostly padding
+    ],
+)
+def test_tsa_zigzag_vs_full(seq_lens_list, shards, qb):
+    """Block-strided (zigzag) token assignment: shard s owns query blocks s, s+shards, ...
+    Every block is the same 16 consecutive tokens as in the full-chunk call, so the
+    attend output must be bit-identical regardless of which shard ran it."""
+    c = _ragged_case(seq_lens_list, K=4, seed=13)
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True)
+    o_full, cache_full = prefill_write_and_attend_ragged_qblock(
+        c["ql"],
+        c["qpe"],
+        c["kvc"],
+        c["kpe"],
+        c["cache"],
+        c["topk_pages"],
+        c["positions"],
+        c["loc"],
+        c["seq_lens"],
+        c["cu_q_lens"],
+        c["cu_kv_lens"],
+        c["page_indices"],
+        query_block=qb,
+        **kw,
+    )
+    T = c["ql"].shape[0]
+    assert T % (shards * qb) == 0
+    nb = T // qb
+    o_zz = np.zeros_like(np.asarray(o_full))
+    for s in range(shards):
+        blocks = np.arange(s, nb, shards)
+        idx = (blocks[:, None] * qb + np.arange(qb)[None, :]).reshape(-1).astype(np.int32)
+        o_s, cache_s = prefill_write_and_attend_ragged_qblock_tsa(
+            c["ql"][idx],
+            c["qpe"][idx],
+            c["kvc"],
+            c["kpe"],
+            c["cache"],
+            c["topk_pages"][idx],
+            c["positions"][idx],
+            c["loc"],
+            c["seq_lens"],
+            c["cu_q_lens"],
+            c["cu_kv_lens"],
+            c["page_indices"],
+            query_block=qb,
+            q_token_index=jnp.asarray(idx),
+            **kw,
+        )
+        assert np.abs(np.asarray(cache_s) - np.asarray(cache_full)).max() == 0.0
+        o_zz[idx] = np.asarray(o_s)
+    real = c["real"]
+    d_o = np.abs(o_zz[real] - np.asarray(o_full)[real]).max()
+    print(f"[tsa zigzag shards={shards} qb={qb}] |o_zz-o_full|={d_o:.3e}")
+    assert (
+        d_o == 0.0
+    ), f"zigzag shard assignment must be bit-identical to the full-chunk qblock: {d_o}"
+
+
+def test_tsa_zigzag_index_matches_offset():
+    """q_token_index with a contiguous arange must reproduce q_token_offset exactly."""
+    c = _ragged_case([200, 512, 1, 129], K=4, seed=13)
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True)
+    T = c["ql"].shape[0]
+    n = T // 4
+    sl = slice(n, 2 * n)
+    args = (
+        c["ql"][sl],
+        c["qpe"][sl],
+        c["kvc"],
+        c["kpe"],
+        c["cache"],
+        c["topk_pages"][sl],
+        c["positions"][sl],
+        c["loc"],
+        c["seq_lens"],
+        c["cu_q_lens"],
+        c["cu_kv_lens"],
+        c["page_indices"],
+    )
+    o_a, _ = prefill_write_and_attend_ragged_qblock_tsa(
+        *args, query_block=16, q_token_offset=n, **kw
+    )
+    o_b, _ = prefill_write_and_attend_ragged_qblock_tsa(
+        *args, query_block=16, q_token_index=jnp.arange(n, 2 * n, dtype=jnp.int32), **kw
+    )
+    assert np.abs(np.asarray(o_a) - np.asarray(o_b)).max() == 0.0
+
+
 # ── argument validation: ragged page-size guard, u_max truncation warning ───
 
 
@@ -440,3 +552,146 @@ def test_umax_reduced_warns_once(caplog):
     assert not [
         r for r in caplog.records if "u_max" in r.getMessage()
     ], "default u_max must not warn"
+
+
+def test_head_major_rows_bit_identical():
+    """head_major=True (q [B,H,S,Dk], rows h*QB+q) is a pure row permutation of the
+    token-major kernel: outputs must be bit-identical (interpret)."""
+    c = _make_case(B=1, S=200, H=4, K=3, pages=8, seed=11, empty_rows=(7, 199))
+    common = dict(
+        kv_lora_rank=c["kv_lora_rank"],
+        read_block=c["page_size"],
+        sm_scale=c["sm_scale"],
+        interpret=True,
+        query_block=32,  # 32 * 4 = 128 rows: no lane padding
+    )
+    o_tm = sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    o_hm = sparse_mla_attention_qblock(
+        jnp.transpose(c["q"], (0, 2, 1, 3)),
+        c["kv"],
+        c["indices"],
+        c["positions"],
+        head_major=True,
+        **common,
+    )
+    assert o_hm.shape == (1, 4, 200, c["kv_lora_rank"])
+    np.testing.assert_array_equal(np.asarray(jnp.transpose(o_hm, (0, 2, 1, 3))), np.asarray(o_tm))
+
+
+def test_head_major_rejects_lane_padded_rows():
+    c = _make_case(B=1, S=64, H=4, K=2, pages=4, seed=12)
+    with pytest.raises(ValueError, match="head_major"):
+        sparse_mla_attention_qblock(
+            jnp.transpose(c["q"], (0, 2, 1, 3)),
+            c["kv"],
+            c["indices"],
+            c["positions"],
+            kv_lora_rank=c["kv_lora_rank"],
+            read_block=c["page_size"],
+            sm_scale=c["sm_scale"],
+            interpret=True,
+            query_block=16,  # 16 * 4 = 64 rows -> would need padding to 128
+            head_major=True,
+        )
+
+
+def test_tsa_head_major_matches_token_major():
+    """TSA wrapper: head-major q/o (the absorb-dot natural layouts) equals the token-major
+    path bit for bit, cache write included; the a2a/zigzag-sharded row slice is the same."""
+    c = _ragged_case([200, 512, 1, 129], K=4, seed=21)
+    H = c["ql"].shape[1]
+    qb = 128 // H if 128 % H == 0 else 128
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True, query_block=qb)
+    T = c["ql"].shape[0]
+    n = T // 4
+    sl = slice(n, 2 * n)  # an interior shard: block boundaries straddle requests
+    args = (
+        c["kvc"],
+        c["kpe"],
+        c["cache"],
+        c["topk_pages"][sl],
+        c["positions"][sl],
+        c["loc"],
+        c["seq_lens"],
+        c["cu_q_lens"],
+        c["cu_kv_lens"],
+        c["page_indices"],
+    )
+    o_tm, cache_tm = prefill_write_and_attend_ragged_qblock_tsa(
+        c["ql"][sl], c["qpe"][sl], *args, q_token_offset=n, **kw
+    )
+    o_hm, cache_hm = prefill_write_and_attend_ragged_qblock_tsa(
+        jnp.transpose(c["ql"][sl], (1, 0, 2)),
+        jnp.transpose(c["qpe"][sl], (1, 0, 2)),
+        *args,
+        q_token_offset=n,
+        head_major=True,
+        **kw,
+    )
+    assert o_hm.shape == (H, n, _KV_LORA)
+    np.testing.assert_array_equal(np.asarray(cache_hm), np.asarray(cache_tm))
+    np.testing.assert_array_equal(np.asarray(jnp.transpose(o_hm, (1, 0, 2))), np.asarray(o_tm))
+
+
+def _assert_same_schedule(got, ref):
+    """Bit-identical on the CPU backend; one f32 ulp on TPU hosts (see test_row_groups_two_bit_identical)."""
+    if jax.default_backend() == "cpu":
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+    else:
+        np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-6, atol=0)
+
+
+def test_row_groups_two_bit_identical(monkeypatch):
+    """ROW_GROUPS=2 issues both groups' QK before any PV; rows are independent so the
+    result equals the single-group schedule (interpret), head-major and token-major, VMEM
+    flash state on and off. Bit-identical on the CPU backend; on a TPU host the interpreter
+    accumulates the 8-page units of the two groups in a different f32 order and the results
+    differ by one ulp (max rel 2.4e-7 on v7x, the TPU test pod), so there the comparison is
+    a 1-ulp allclose."""
+    c = _make_case(B=1, S=200, H=4, K=3, pages=8, seed=17, empty_rows=(3, 150))
+    common = dict(
+        kv_lora_rank=c["kv_lora_rank"],
+        read_block=c["page_size"],
+        sm_scale=c["sm_scale"],
+        interpret=True,
+        query_block=64,  # 64 * 4 = 256 rows -> two 128-lane groups
+    )
+    monkeypatch.setattr(qb_mod, "_ROW_GROUPS", 1)
+    ref = sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    monkeypatch.setattr(qb_mod, "_ROW_GROUPS", 2)
+    got = sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    _assert_same_schedule(got, ref)
+    got_hm = sparse_mla_attention_qblock(
+        jnp.transpose(c["q"], (0, 2, 1, 3)),
+        c["kv"],
+        c["indices"],
+        c["positions"],
+        head_major=True,
+        **common,
+    )
+    _assert_same_schedule(jnp.transpose(got_hm, (0, 2, 1, 3)), ref)
+    monkeypatch.setattr(
+        qb_mod, "_ACC_SCRATCH", True
+    )  # production form: flash state in VMEM scratch
+    got2 = sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    if jax.default_backend() == "cpu":
+        _assert_same_schedule(got2, ref)
+    else:
+        np.testing.assert_allclose(np.asarray(got2), np.asarray(ref), rtol=1e-6, atol=0)
+
+
+def test_row_groups_falls_back_when_rows_not_divisible(monkeypatch):
+    # 32 * 4 = 128 rows cannot split into two 128-lane groups -> single group, same result
+    c = _make_case(B=1, S=64, H=4, K=2, pages=4, seed=18)
+    common = dict(
+        kv_lora_rank=c["kv_lora_rank"],
+        read_block=c["page_size"],
+        sm_scale=c["sm_scale"],
+        interpret=True,
+        query_block=32,
+    )
+    monkeypatch.setattr(qb_mod, "_ROW_GROUPS", 1)
+    ref = sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    monkeypatch.setattr(qb_mod, "_ROW_GROUPS", 2)
+    got = sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))

@@ -39,11 +39,49 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+
+def _attend_sched_tagged(fn):
+    """Prefill micro-batch PIN>=7: run the attend pallas_call inside
+    ``set_xla_metadata(_scheduling_group_id=...)`` when the model set a group for this window
+    (``dsa_sparse_backend.PREFILL_SCHED_GROUP``). Only the attend is tagged -- tagging the
+    paged write-back too made the group span write-back -> (copies) -> attend and the TPU
+    scheduler rejects groups with such gaps."""
+
+    def _call(*a, **k):
+        from sgl_jax.srt.layers.attention import dsa_sparse_backend as _b
+
+        gid = getattr(_b, "PREFILL_SCHED_GROUP", None)
+        if gid is None:
+            return fn(*a, **k)
+        from jax.experimental import xla_metadata
+
+        with xla_metadata.set_xla_metadata(_scheduling_group_id=int(gid)):
+            return fn(*a, **k)
+
+    return _call
+
+
 logger = logging.getLogger(__name__)
 
 _SENTINEL = jnp.iinfo(jnp.int32).max
 
-_NBUF = 4  # DMA ring depth (prefetch distance)
+# DMA ring depth (prefetch distance). Each unit is one 128-token page (~147 KB
+# at Dk_pad=576/640), far below the v7x HBM->VMEM DMA knee (t0*B ~ 1.9 MiB), so
+# the loop is latency-bound at this depth: measured 27 -> 7.6 ms per layer going
+# from no prefetch to 4 at the 110k shape. VMEM cost is NBUF x PPU x RBF x Dk_pad x 2 B.
+_NBUF = 4
+# Two independent query-row groups per unit step so the VPU softmax of one group
+# overlaps the MXU work of the other (see _qblock_kernel); falls back to one group
+# when the padded rows do not split into 128-lane halves.
+_ROW_GROUPS = 2
+# Pages (128-token units) processed per ring slot / loop step: 8 pages stack to
+# M=1024 key rows per score matmul and the flash update runs once per 8 pages.
+_PPU = 8
+# Keep the flash state (m, l, acc [QBHp, Dv] f32 = 2 MiB at the TSA shape) in VMEM
+# scratch refs instead of fori_loop carries: a carry of >= 128 vregs is spilled and
+# refilled every iteration by the register allocator (static cost: 45% of the
+# step's instructions are spill traffic). Numerics unchanged.
+_ACC_SCRATCH = True
 
 
 @functools.cache
@@ -127,9 +165,9 @@ def _qblock_kernel(
     kv_hbm,  # flat: [B, T(+RBF), Dk_pad]; paged: 4D pool or [1, Pn*PS, Dk_pad] HBM
     pt_ref,  # [1, 1, 1, PTW]      SMEM  packed page table (paged only)
     o_ref,  # [1, 1, QBHp, Dv]
-    kv_scratch,  # [NBUF, RBF, Dk_pad] VMEM  DMA ring
-    sem,  # DMA semaphores (NBUF,)
-    *,
+    kv_scratch,  # [NBUF, PPU*RBF, Dk_pad] VMEM  DMA ring (PPU pages per slot)
+    sem,  # DMA semaphores (NBUF, PPU)
+    *state_refs,  # (m_ref [1, QBHp] f32, l_ref [1, QBHp] f32, acc_ref [QBHp, Dv] f32) when ACC_SCRATCH
     sm_scale: float,
     Dv: int,
     RB: int,
@@ -137,14 +175,12 @@ def _qblock_kernel(
     paged: bool,
     PS: int,  # page size (paged only; == RB in v1 paged mode)
     PTW: int,
+    PPU: int = 1,  # pages (units) per ring slot / per loop step
+    ACC_SCRATCH: bool = False,
+    HEAD_MAJOR: bool = False,  # q_ref/o_ref blocks are [1, H, QB, *]; rows ordered h*QB + q
+    ROW_GROUPS: int = 1,  # >1: split the query rows into independent groups per unit step (see unit_body)
 ):
     if kv_hbm.ndim == 4:
-        # Paged pool passed in its native word-packed shape. Flattening the
-        # HBM ref here (instead of a host-side jnp.reshape) keeps the pool's
-        # native tile in the graph: on jax 0.11.1 the host-side flat view
-        # forces a full T(2,128)->T(8,128) retile copy of the pool per
-        # chunk (110k prefill: ~+2s). HBM refs are DMA-addressed, so the
-        # in-kernel view is free (same trick as _write_back_kernel).
         _pn, _pspk, _pk, _dk = kv_hbm.shape
         kv_hbm = kv_hbm.reshape(1, _pn * _pspk * _pk, _dk)
     """Query-block sparse-MLA kernel, ring-prefetched (flat or packed-paged KV).
@@ -155,102 +191,175 @@ def _qblock_kernel(
     seq-local position is ``u*RB + r - base_tokens[row]`` — a plain 2D
     broadcast, which is what lets one block hold queries from different
     requests.
+
+    ``PPU`` > 1 walks the union ``PPU`` units per loop step: the slot holds
+    ``PPU`` pages stacked on sublanes, the score matmul sees ``PPU*RBF`` key
+    rows (MXU M axis) and the PV contraction is ``PPU*RBF`` deep, and the flash
+    update runs once per step. Units beyond ``cnt`` in the last step are
+    ``-1``-padded in ``units_ref`` (DMA clamped to unit 0, membership row all
+    zero -> -inf bias), so the math is the masked softmax over the same keys.
     """
     b = pl.program_id(0)
-    QBHp = q_ref.shape[2]
-    q = q_ref[0, 0]  # [QBHp, Dk_pad]
+    if HEAD_MAJOR:
+        # [1, H, QB, Dk_pad] block; merging (H, QB) into rows is layout-preserving when
+        # QB % 8 == 0 (the (8,128) tiles of each head's QB rows stack contiguously).
+        _, _Hh, _QBq, _Dkp = q_ref.shape
+        QBHp = _Hh * _QBq
+        q = q_ref[0].reshape(QBHp, _Dkp)  # rows h*QB + q
+    else:
+        QBHp = q_ref.shape[2]
+        q = q_ref[0, 0]  # [QBHp, Dk_pad]
     cnt = cnt_ref[0, 0, 0, 0]
+    nsteps = (cnt + PPU - 1) // PPU
     qpos_row = qpos_ref[0, 0]  # [1, QBHp] int32
     kvlen_row = kvlen_ref[0, 0]  # [1, QBHp] int32
     base_row = base_ref[0, 0]  # [1, QBHp] int32 (tokens; 0 when flat)
     rows = jax.lax.broadcasted_iota(jnp.int32, (RBF, 1), 0)  # key row within unit
 
-    def _copy(j, slot):
-        u = jnp.maximum(units_ref[0, 0, 0, j], 0)
+    def _copy(j, slot, i):
+        # page i of step j -> rows [i*RBF, (i+1)*RBF) of ring slot `slot`
+        u = jnp.maximum(units_ref[0, 0, 0, j * PPU + i], 0)
         if paged:
-            # whole-page unit: physical row 0 of page pt[u]. The token axis is
-            # sublane-tiled (8): express the offset as r8*8 so divisibility is
-            # provable (PS % 8 == 0), the same idiom as the dense paged kernel.
             pp = pt_ref[0, 0, 0, jnp.minimum(u, PTW - 1)]
             r8 = pp * (PS // 8)
             src = kv_hbm.at[0, pl.ds(r8 * 8, RBF), :]
         else:
             src = kv_hbm.at[b, pl.ds(u * RB, RBF), :]
-        return pltpu.make_async_copy(src, kv_scratch.at[slot], sem.at[slot])
+        return pltpu.make_async_copy(
+            src, kv_scratch.at[slot, pl.ds(i * RBF, RBF), :], sem.at[slot, i]
+        )
 
-    # prologue: fill the ring (d=d: bind the loop var per iteration, B023)
     for d in range(_NBUF - 1):
 
-        @pl.when(d < cnt)
+        @pl.when(d < nsteps)
         def _(d=d):
-            _copy(d, d).start()
+            for i in range(PPU):
+                _copy(d, d, i).start()
 
     m0 = jnp.full((QBHp,), -jnp.inf, dtype=jnp.float32)
     l0 = jnp.zeros((QBHp,), dtype=jnp.float32)
     acc0 = jnp.zeros((QBHp, Dv), dtype=jnp.float32)
+    if ACC_SCRATCH:
+        m_ref, l_ref, acc_ref = state_refs
+        m_ref[...] = m0[None, :]
+        l_ref[...] = l0[None, :]
+        acc_ref[...] = acc0
 
-    def unit_body(j, carry):
-        m_i, l_i, acc = carry
-        u = units_ref[0, 0, 0, j]  # scalar unit id (>= 0 for j < cnt)
-        slot = jax.lax.rem(j, _NBUF)
-
-        # keep the ring full: issue the fetch NBUF-1 ahead
-        nxt = j + _NBUF - 1
-
-        @pl.when(nxt < cnt)
-        def _():
-            _copy(nxt, jax.lax.rem(nxt, _NBUF)).start()
-
-        # membership row for this slot: aligned 32-row window + iota select
-        # (a direct dynamic sublane index is not provably %32 — Mosaic E2003).
-        j32 = (j // 32) * 32
+    def _bias(j, i):
+        # membership row of union slot j*PPU+i (int8 tile is (32,128): read the
+        # aligned 32-row window and select the row with an iota compare)
+        jj = j * PPU + i
+        u = units_ref[0, 0, 0, jj]  # scalar unit id (>= 0 for jj < cnt, -1 pad)
+        j32 = (jj // 32) * 32
         mem_win = mem_ref[0, 0, pl.ds(j32, 32), :]  # [32, QBHp] int8
-        rowsel = jax.lax.broadcasted_iota(jnp.int32, (32, 1), 0) == (j - j32)
+        rowsel = jax.lax.broadcasted_iota(jnp.int32, (32, 1), 0) == (jj - j32)
         mem_row = jnp.max(
             jnp.where(rowsel, mem_win.astype(jnp.int32), 0), axis=0, keepdims=True
         )  # [1, QBHp]
-
-        # seq-local key positions per (key row, query row): kp = u*RB + r - base.
-        # For queries of a different request than the unit's owner this is
-        # garbage, but their membership bit is 0 so the lane is -inf anyway.
         kp = (u * RB + rows) - base_row  # [RBF, QBHp]
         valid = (mem_row > 0) & (kp <= qpos_row) & (kp < kvlen_row)
         if RBF > RB:
             valid &= rows < RB  # drop sublane over-fetch rows
-        bias = jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
+        return jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
 
-        _copy(j, slot).wait()
-        kv_blk = kv_scratch[slot]  # [RBF, Dk_pad]
+    def unit_body(j, carry):
+        if ACC_SCRATCH:
+            m_i = m_ref[0]
+            l_i = l_ref[0]
+            acc = acc_ref[...]
+        else:
+            m_i, l_i, acc = carry
+        slot = jax.lax.rem(j, _NBUF)
+        nxt = j + _NBUF - 1
 
-        # score: [RBF,Dk]·[QBHp,Dk] -> [RBF, QBHp] (keys sublane, queries lane)
-        s = (
-            jax.lax.dot_general(
-                kv_blk, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+        @pl.when(nxt < nsteps)
+        def _():
+            for i in range(PPU):
+                _copy(nxt, jax.lax.rem(nxt, _NBUF), i).start()
+
+        for i in range(PPU):
+            _copy(j, slot, i).wait()
+        kv_blk = kv_scratch[slot]  # [PPU*RBF, Dk_pad]
+        v_blk = kv_blk[:, :Dv]  # [PPU*RBF, Dv]
+
+        def _qk_raw(q_rows):
+            return jax.lax.dot_general(
+                kv_blk, q_rows, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )
-            * sm_scale
-        )
-        s = s + bias
 
-        # flash-softmax over keys = axis 0 (the sublane axis)
-        m_cur = jnp.max(s, axis=0)  # [QBHp]
-        m_new = jnp.maximum(m_i, m_cur)
-        corr = jnp.where(jnp.isneginf(m_new), 0.0, m_new)
-        p = jnp.exp(s - corr[None, :])  # [RBF, QBHp]
-        alpha = jnp.where(jnp.isneginf(m_new), 1.0, jnp.exp(m_i - m_new))
-        l_new = l_i * alpha + jnp.sum(p, axis=0)
-        v_blk = kv_blk[:, :Dv]  # [RBF, Dv]
-        # acc[qh, dv] += sum_r p[r, qh] * v[r, dv]  (contract the key axis)
-        acc = acc * alpha[:, None] + jax.lax.dot_general(
-            p.astype(kv_blk.dtype),
-            v_blk,
-            (((0,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
-        return (m_new, l_new, acc)
+        # Issue the score matmul(s) first, build the membership/causal bias afterwards:
+        # the bias is ~6.5k int32 vector-unit ops per unit step (compare/and/select over
+        # [PPU*RBF, QBHp]) and, written before the DMA wait, ran with the MXU idle
+        # (static cost 10-03: longest MXU-idle stretch 5050 of 10280 bundles). Behind
+        # the dots it can be packed under the MXU pushes; the values are unchanged.
+        s_raw = [_qk_raw(q)] if ROW_GROUPS == 1 else None
+        if ROW_GROUPS != 1:
+            RG = QBHp // ROW_GROUPS
+            groups = [slice(g * RG, (g + 1) * RG) for g in range(ROW_GROUPS)]
+            s_raw = [_qk_raw(q[sl]) for sl in groups]
+        biases = [_bias(j, i) for i in range(PPU)]
+        bias = biases[0] if PPU == 1 else jnp.concatenate(biases, axis=0)  # [PPU*RBF, QBHp]
 
-    m_i, l_i, acc = jax.lax.fori_loop(0, cnt, unit_body, (m0, l0, acc0))
+        def _qk(s_raw_, bias_cols):
+            return s_raw_ * sm_scale + bias_cols
+
+        def _softmax_pv(s_, m_prev, l_prev, acc_prev):
+            m_cur = jnp.max(s_, axis=0)  # [rows]
+            m_new_ = jnp.maximum(m_prev, m_cur)
+            corr = jnp.where(jnp.isneginf(m_new_), 0.0, m_new_)
+            p_ = jnp.exp(s_ - corr[None, :])  # [PPU*RBF, rows]
+            alpha = jnp.where(jnp.isneginf(m_new_), 1.0, jnp.exp(m_prev - m_new_))
+            l_new_ = l_prev * alpha + jnp.sum(p_, axis=0)
+            acc_new_ = acc_prev * alpha[:, None] + jax.lax.dot_general(
+                p_.astype(kv_blk.dtype),
+                v_blk,
+                (((0,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            return m_new_, l_new_, acc_new_
+
+        if ROW_GROUPS == 1:
+            m_new, l_new, acc = _softmax_pv(_qk(s_raw[0], bias), m_i, l_i, acc)
+            if ACC_SCRATCH:
+                m_ref[0] = m_new
+                l_ref[0] = l_new
+                acc_ref[...] = acc
+                return carry
+            return (m_new, l_new, acc)
+
+        # Row groups (flash-MLA style, 10-03): the MXU is in-order and with one group a
+        # unit step is QK -> softmax (MXU idle) -> PV in series (static cost: MXU slot
+        # 33%, longest MXU-idle stretch half the loop body). Issuing every group's QK
+        # before any PV lets one group's VPU softmax overlap the other's matmuls; rows
+        # are independent, so the per-row math -- and the result -- is unchanged.
+        s_g = [_qk(sr, bias[:, sl]) for sr, sl in zip(s_raw, groups)]
+        outs = []
+        for sl, s_ in zip(groups, s_g):
+            m_new, l_new, acc_new = _softmax_pv(s_, m_i[sl], l_i[sl], acc[sl])
+            if ACC_SCRATCH:
+                m_ref[0, sl] = m_new
+                l_ref[0, sl] = l_new
+                acc_ref[sl, :] = acc_new
+            else:
+                outs.append((m_new, l_new, acc_new))
+        if ACC_SCRATCH:
+            return carry
+        return (
+            jnp.concatenate([o[0] for o in outs], axis=0),
+            jnp.concatenate([o[1] for o in outs], axis=0),
+            jnp.concatenate([o[2] for o in outs], axis=0),
+        )
+
+    if ACC_SCRATCH:
+        jax.lax.fori_loop(0, nsteps, unit_body, 0)
+        m_i, l_i, acc = m_ref[0], l_ref[0], acc_ref[...]
+    else:
+        m_i, l_i, acc = jax.lax.fori_loop(0, nsteps, unit_body, (m0, l0, acc0))
     out = acc / jnp.where(l_i == 0.0, 1.0, l_i)[:, None]
-    o_ref[0, 0] = out.astype(o_ref.dtype)
+    if HEAD_MAJOR:
+        o_ref[0] = out.astype(o_ref.dtype).reshape(_Hh, _QBq, Dv)
+    else:
+        o_ref[0, 0] = out.astype(o_ref.dtype)
 
 
 def sparse_mla_attention_qblock(
@@ -271,8 +380,20 @@ def sparse_mla_attention_qblock(
     seq_lens=None,  # [num_seqs] int32       per-request kv length (causal bound)
     cu_kv_lens=None,  # [num_seqs+1] int32    page-aligned kv offsets
     page_indices=None,  # [total_pages] int32 packed physical page ids
+    out_dtype=jnp.float32,  # output dtype; the kernel normalises in f32 and casts on store
+    head_major: bool = False,  # q is [B, H, S, Dk] and the output [B, H, S, Dv] (see below)
 ):
     """Blocked sparse MLA-latent attention (query-batching kernel).
+
+    ``head_major``: the TSA absorb path produces q with a batched dot whose natural
+    output is batch(head)-major, and consumes the output with another batched dot
+    that wants the same; with token-major kernel I/O XLA inserts a tile-level relayout
+    on each side (4k trace: 7.95 ms + 4.55 ms per chunk). In head-major mode the
+    kernel block for query block ``n`` is the ``[H, QB, Dk_pad]`` slab gathered from
+    ``[B, H, nQB, QB, Dk_pad]`` (a bitcast view of ``[B, H, S, Dk_pad]`` when QB % 8 == 0),
+    rows are ordered ``h*QB + q`` instead of ``q*H + h`` (the kernel is per-row
+    independent, so the math is unchanged), and the output comes back ``[B, H, S, Dv]``.
+    Requires ``(QB * H) % 128 == 0`` (no lane padding of the row axis).
 
     Semantics match :func:`sparse_mla_prefill.sparse_mla_attention` (same
     masked-softmax math); the difference is purely execution shape: queries are
@@ -294,7 +415,10 @@ def sparse_mla_attention_qblock(
     diverge from :func:`sparse_mla_prefill.sparse_mla_attention`. A one-time
     warning is logged when such a cap is in effect.
     """
-    B, S, H, Dk = q.shape
+    if head_major:
+        B, H, S, Dk = q.shape
+    else:
+        B, S, H, Dk = q.shape
     K = indices.shape[2]
     Dv = kv_lora_rank
     RB = read_block
@@ -357,13 +481,21 @@ def sparse_mla_attention_qblock(
     )(idx_g)
     # blk_u [B,nQB,u_max] blk_m [B,nQB,QB,u_max] blk_c [B,nQB]
     nQB = blk_u.shape[1]
-    U_pad = ((u_max + 31) // 32) * 32  # int8 sublane tile
+    # int8 sublane tile; with PPU > 1 the last step may read union slots up to
+    # cnt + PPU - 1 (padded -1 units / zero membership rows), keep them in range.
+    U_pad = ((u_max + _PPU - 1 + 31) // 32) * 32
     QBH = QB * H
     QBHp = ((QBH + 127) // 128) * 128  # lane axis of the score
 
     # membership -> slot-major [B,nQB,U_pad,QBHp] int8, lanes H-expanded so the
     # kernel's lane r = q*H + h reads member[q] directly.
-    memt = jnp.repeat(blk_m.transpose(0, 1, 3, 2), H, axis=3)  # [B,nQB,u_max,QBH]
+    if head_major:
+        if QBHp != QBH:
+            raise ValueError(f"head_major needs (query_block*H) % 128 == 0, got {QB}*{H}={QBH}")
+        # lane r = h*QB + q reads member[q]
+        memt = jnp.tile(blk_m.transpose(0, 1, 3, 2), (1, 1, 1, H))  # [B,nQB,u_max,QBH]
+    else:
+        memt = jnp.repeat(blk_m.transpose(0, 1, 3, 2), H, axis=3)  # [B,nQB,u_max,QBH]
     memt = jnp.pad(memt, ((0, 0), (0, 0), (0, U_pad - u_max), (0, QBHp - QBH)))
     units4 = jnp.pad(blk_u, ((0, 0), (0, 0), (0, U_pad - u_max)), constant_values=-1)
     units4 = units4.reshape(B, nQB, 1, U_pad)
@@ -371,16 +503,24 @@ def sparse_mla_attention_qblock(
     # the retained prefix of the union is walked.
     counts4 = jnp.minimum(blk_c, u_max).reshape(B, nQB, 1, 1)
 
-    # q -> [B, nQB, QBHp, Dk_pad] (row = q*H + h), zero pad rows/features
     Sp = nQB * QB
-    q4 = jnp.pad(q, ((0, 0), (0, Sp - S), (0, 0), (0, Dk_pad - Dk)))
-    q4 = q4.reshape(B, nQB, QBH, Dk_pad)
-    q4 = jnp.pad(q4, ((0, 0), (0, 0), (0, QBHp - QBH), (0, 0)))
+    if head_major:
+        # q [B, H, S, Dk] -> [B, H, nQB, QB, Dk_pad]: pad rows/features, split S (bitcast)
+        q4 = jnp.pad(q, ((0, 0), (0, 0), (0, Sp - S), (0, Dk_pad - Dk)))
+        q4 = q4.reshape(B, H, nQB, QB, Dk_pad)
+    else:
+        # q -> [B, nQB, QBHp, Dk_pad] (row = q*H + h), zero pad rows/features
+        q4 = jnp.pad(q, ((0, 0), (0, Sp - S), (0, 0), (0, Dk_pad - Dk)))
+        q4 = q4.reshape(B, nQB, QBH, Dk_pad)
+        q4 = jnp.pad(q4, ((0, 0), (0, 0), (0, QBHp - QBH), (0, 0)))
 
     def _rows(vec, fill):
         # [B, S] -> [B, nQB, 1, QBHp] with H-expansion and `fill` on pad rows
         v = jnp.pad(vec.reshape(B, S), ((0, 0), (0, Sp - S)), constant_values=fill)
-        v = jnp.repeat(v.reshape(B, nQB, QB), H, axis=2)
+        if head_major:
+            v = jnp.tile(v.reshape(B, nQB, QB), (1, 1, H))  # lane h*QB + q -> token q
+        else:
+            v = jnp.repeat(v.reshape(B, nQB, QB), H, axis=2)
         v = jnp.pad(v, ((0, 0), (0, 0), (0, QBHp - QBH)), constant_values=fill)
         return v.reshape(B, nQB, 1, QBHp)
 
@@ -398,14 +538,26 @@ def sparse_mla_attention_qblock(
         paged=ragged,
         PS=ps,
         PTW=PTW,
+        PPU=_PPU,
+        ACC_SCRATCH=_ACC_SCRATCH,
+        HEAD_MAJOR=head_major,
+        ROW_GROUPS=_ROW_GROUPS if (QBHp % (128 * _ROW_GROUPS) == 0) else 1,
     )
     smem = pltpu.SMEM
     row_spec = pl.BlockSpec((1, 1, 1, QBHp), lambda b, n: (b, n, 0, 0))
+    if head_major:
+        q_spec = pl.BlockSpec((1, H, None, QB, Dk_pad), lambda b, n: (b, 0, n, 0, 0))
+        o_spec = pl.BlockSpec((1, H, None, QB, Dv), lambda b, n: (b, 0, n, 0, 0))
+        o_shape = (B, H, nQB, QB, Dv)
+    else:
+        q_spec = pl.BlockSpec((1, 1, QBHp, Dk_pad), lambda b, n: (b, n, 0, 0))
+        o_spec = pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0))
+        o_shape = (B, nQB, QBHp, Dv)
     out = pl.pallas_call(
         kernel,
         grid=(B, nQB),
         in_specs=[
-            pl.BlockSpec((1, 1, QBHp, Dk_pad), lambda b, n: (b, n, 0, 0)),  # q
+            q_spec,  # q
             pl.BlockSpec((1, 1, 1, U_pad), lambda b, n: (b, n, 0, 0), memory_space=smem),
             pl.BlockSpec((1, 1, 1, 1), lambda b, n: (b, n, 0, 0), memory_space=smem),
             row_spec,  # qpos rows
@@ -415,15 +567,26 @@ def sparse_mla_attention_qblock(
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv (untiled, DMA-gathered)
             pl.BlockSpec((1, 1, 1, PTW), lambda b, n: (b, 0, 0, 0), memory_space=smem),
         ],
-        out_specs=pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
+        out_specs=o_spec,
+        out_shape=jax.ShapeDtypeStruct(o_shape, out_dtype),
         scratch_shapes=[
-            pltpu.VMEM((_NBUF, RBF, Dk_pad), kv2.dtype),
-            pltpu.SemaphoreType.DMA((_NBUF,)),
-        ],
+            pltpu.VMEM((_NBUF, _PPU * RBF, Dk_pad), kv2.dtype),
+            pltpu.SemaphoreType.DMA((_NBUF, _PPU)),
+        ]
+        + (
+            [
+                pltpu.VMEM((1, QBHp), jnp.float32),
+                pltpu.VMEM((1, QBHp), jnp.float32),
+                pltpu.VMEM((QBHp, Dv), jnp.float32),
+            ]
+            if _ACC_SCRATCH
+            else []
+        ),
         interpret=interpret,
     )(q4, units4, counts4, pos_rows, kvlen_rows, base_rows, memt, kv2, pt_arg)
 
+    if head_major:
+        return out.reshape(B, H, Sp, Dv)[:, :, :S]
     out = out[:, :, :QBH, :].reshape(B, Sp, H, Dv)
     return out[:, :S]
 
@@ -478,7 +641,7 @@ def prefill_write_and_attend_ragged_qblock(
         row,
         loc.astype(jnp.int32),
         page_size=ps,
-        r_cap=T // ps + S + 34,
+        r_cap=T // ps + 2 * S + 2,  # <= ceil(q / ps) + 1 runs per sequence
         interpret=interpret,
     )
 
@@ -488,7 +651,7 @@ def prefill_write_and_attend_ragged_qblock(
         jnp.int32
     )
 
-    out = sparse_mla_attention_qblock(
+    out = _attend_sched_tagged(sparse_mla_attention_qblock)(
         q_sparse.reshape(1, T, H, q_sparse.shape[2]),
         cache_new,
         topk_pages.reshape(1, T, -1),
@@ -526,24 +689,34 @@ def prefill_write_and_attend_ragged_qblock_tsa(
     sm_scale: float,
     query_block: int = 16,
     q_token_offset=0,  # int or traced scalar: global index of ql's first row
+    q_token_index=None,  # [q_tokens] int32: global index per local row (overrides the offset)
     interpret: bool = False,
+    out_dtype=None,  # attend output dtype (None = f32); bf16 when the consumer casts to bf16 anyway
+    head_major: bool = False,  # ql/qpe are [H, q_tokens, *] and the output [H, q_tokens, Dv]
 ):
     """Token-sharded-attention variant of the ragged qblock wrapper.
 
     The write side covers the FULL chunk (``kvc``/``kpe``/``loc``, replicated
     per device — the latent pool is num_kv_heads=1 so every device keeps a
     complete cache copy), while the attend side runs only this device's
-    contiguous query slice with ALL heads. ``q_token_offset`` maps local query
-    rows back to global chunk positions for the per-request causal metadata.
+    query slice with ALL heads. ``q_token_offset`` (contiguous slice) or
+    ``q_token_index`` (any row order, e.g. the block-strided zigzag assignment)
+    maps local query rows back to global chunk positions for the per-request
+    causal metadata; the attend itself only depends on the rows' own
+    positions / page-topk, so the output of a row is independent of which
+    device ran it.
     """
-    Tq, H, Dv = ql.shape
+    if head_major:
+        H, Tq, Dv = ql.shape
+    else:
+        Tq, H, Dv = ql.shape
     rope = qpe.shape[-1]
     Tkv = kvc.shape[0]
     ps = page_size
     _, _, _, Dk_pad = cache.shape
     S = seq_lens.shape[0]
 
-    q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [Tq, H, Dv+rope]
+    q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [Tq, H, Dv+rope] (or [H, Tq, Dv+rope])
 
     row = jnp.zeros((Tkv, Dk_pad), cache.dtype)
     row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
@@ -553,17 +726,25 @@ def prefill_write_and_attend_ragged_qblock_tsa(
         row,
         loc.astype(jnp.int32),
         page_size=ps,
-        r_cap=Tkv // ps + S + 34,
+        r_cap=Tkv // ps + 2 * S + 2,
         interpret=interpret,
     )
 
-    t = q_token_offset + jnp.arange(Tq, dtype=jnp.int32)
+    if q_token_index is not None:
+        t = jnp.asarray(q_token_index, jnp.int32).reshape(Tq)
+    else:
+        t = q_token_offset + jnp.arange(Tq, dtype=jnp.int32)
     q_seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, S - 1).astype(
         jnp.int32
     )
 
-    out = sparse_mla_attention_qblock(
-        q_sparse.reshape(1, Tq, H, q_sparse.shape[2]),
+    q_in = (
+        q_sparse.reshape(1, H, Tq, q_sparse.shape[2])
+        if head_major
+        else q_sparse.reshape(1, Tq, H, q_sparse.shape[2])
+    )
+    out = _attend_sched_tagged(sparse_mla_attention_qblock)(
+        q_in,
         cache_new,
         topk_pages.reshape(1, Tq, -1),
         positions.reshape(1, Tq),
@@ -577,7 +758,11 @@ def prefill_write_and_attend_ragged_qblock_tsa(
         cu_kv_lens=cu_kv_lens,
         page_indices=page_indices,
         interpret=interpret,
+        out_dtype=jnp.float32 if out_dtype is None else out_dtype,
+        head_major=head_major,
     )
+    if head_major:
+        return out.reshape(H, Tq, Dv), cache_new
     return out.reshape(Tq, H, Dv), cache_new
 
 
@@ -816,11 +1001,10 @@ def paged_write_back(
         # interpret cannot lower dynamic-size DMAs; the scatter is the
         # bit-identical reference semantics anyway.
         return _scatter(cache, row_w, table, n_ent)
-    if pallas_always_fits(Tp, r_cap):
-        # Static dispatch: the run table cannot overflow, so the lax.cond is
-        # not needed. It is also expensive: both branches hand back a whole
-        # pool, XLA cannot alias the pool in place across the conditional
-        # (spec verify: 2 x ~0.02 ms per layer; draft-extend: three 372 MB
-        # pool copies per step on GLM-5.2 tp16).
-        return _pallas(cache, row_w, table, n_ent)
-    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table, n_ent)
+    # No lax.cond on n_raw <= r_cap: both branches hand back a whole pool, XLA cannot alias
+    # the pool in place across the conditional (spec verify: 2 x ~0.02 ms per layer; 10-03
+    # 4k trace: ~20 whole-pool copies per 4k prefill window, 6-9 ms). The run table
+    # cannot overflow r_cap for extend-form slot layouts (page-contiguous new slots per
+    # sequence; test_write_back_run_bound.py) nor for the static ``pallas_always_fits``
+    # shapes, so the kernel is taken unconditionally.
+    return _pallas(cache, row_w, table, n_ent)

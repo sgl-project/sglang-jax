@@ -16,7 +16,7 @@ def _put(value, mesh, axes):
     )
 
 
-def _absorb_mla(inputs, *, mesh, rank, heads, key_dim, value_dim, dtype, block):
+def _absorb_mla(inputs, *, mesh, rank, heads, key_dim, value_dim, dtype, block, replicate=False):
     weight = _put(inputs[0], mesh, ())
     if len(inputs) == 2:
         scale = _put(inputs[1], mesh, ()).astype(jnp.float32)
@@ -32,10 +32,18 @@ def _absorb_mla(inputs, *, mesh, rank, heads, key_dim, value_dim, dtype, block):
         weight = weight.astype(dtype)
     weight = weight.T.reshape(rank, heads, key_dim + value_dim)
     sharding = NamedSharding(mesh, P(None, "tensor", None))
-    return tuple(
+    parts = tuple(
         jax.sharding.reshard(part, sharding)
         for part in (weight[:, :, :key_dim], weight[:, :, key_dim:])
     )
+    if replicate:
+        # full-head replicated copies for the TSA absorb-after-a2a path
+        rep = NamedSharding(mesh, P(None, None, None))
+        parts = parts + tuple(
+            jax.sharding.reshard(part, rep)
+            for part in (weight[:, :, :key_dim], weight[:, :, key_dim:])
+        )
+    return parts
 
 
 def prepare_absorbed_mla(module, loader, mappings, prefix):
@@ -57,11 +65,16 @@ def prepare_absorbed_mla(module, loader, mappings, prefix):
     if len(selected) != len(sources):
         raise ValueError(f"Unsupported absorbed MLA checkpoint inputs: {tuple(selected)}")
     mappings = {key: spec for key, spec in mappings.items() if key not in sources}
+    replicate = getattr(module, "w_uk_all", None) is not None
+    targets = [prefix + ".w_uk", prefix + ".w_uv"]
+    if replicate:
+        targets += [prefix + ".w_uk_all", prefix + ".w_uv_all"]
     mappings[weight] = WeightSpec(
-        [prefix + ".w_uk", prefix + ".w_uv"],
+        targets,
         sources=tuple(sources),
         recipe=partial(
             _absorb_mla,
+            replicate=replicate,
             mesh=module.mesh,
             rank=module.kv_lora_rank,
             heads=module.num_heads,

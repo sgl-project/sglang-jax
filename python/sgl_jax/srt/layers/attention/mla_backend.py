@@ -25,11 +25,18 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+# head-major q/o contract for the MLA v2
+# kernel on EXTEND batches (distribution is statically [0, 0, N] there, so the
+# two decode kernels are skipped). Decode / verify keep the packed token-major
+# path. SGLANG_JAX_MLA_Q_HEAD_MAJOR (opt-in, default off).
+_MLA_Q_HEAD_MAJOR = envs.SGLANG_JAX_MLA_Q_HEAD_MAJOR.get()
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -310,6 +317,9 @@ class MLAAttentionBackend(AttentionBackend):
         )
         sliding_window = layer.sliding_window_size if layer is not None else None
         soft_cap = layer.logit_cap if layer is not None else None
+        is_extend = forward_batch.forward_mode == ForwardMode.EXTEND
+        q_head_major = _MLA_Q_HEAD_MAJOR and is_extend
+        skip_decode_cases = q_head_major
 
         in_specs = (
             P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
@@ -358,6 +368,8 @@ class MLAAttentionBackend(AttentionBackend):
                 num_queries_per_block=self.num_queries_per_block,
                 decode_batch_size=self.decode_batch_size,
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                skip_decode_cases=skip_decode_cases,
+                q_head_major=q_head_major,
             )
 
         o_latent, updated_cache = jax.shard_map(
