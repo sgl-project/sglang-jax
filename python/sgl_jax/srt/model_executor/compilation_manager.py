@@ -510,7 +510,7 @@ class CompilationManager:
                 bs = logits.next_token_logits.shape[0]
                 batch = self._make_dummy_batch(bs, bs, mode, bs)
                 metadata = SamplingMetadata.from_model_worker_batch(
-                    batch, 0, model_runner.mesh, self.vocab_size
+                    batch, model_runner.mesh, self.vocab_size
                 )
                 metadata.update_vocab_mask(
                     batch.sampling_info.vocab_mask, model_runner.mesh, self.vocab_size
@@ -574,7 +574,7 @@ class CompilationManager:
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    batch, 0, mesh, self.vocab_size
+                    batch, mesh, self.vocab_size
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 if future_token_ids_map is not None:
@@ -634,7 +634,7 @@ class CompilationManager:
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    batch, 0, mesh, self.vocab_size
+                    batch, mesh, self.vocab_size
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 if future_token_ids_map is not None:

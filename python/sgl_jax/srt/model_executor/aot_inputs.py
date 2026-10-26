@@ -230,7 +230,7 @@ class AbstractSampler:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         metadata = SamplingMetadata.from_model_worker_batch(
-            batch, 0, self.mesh, logits.next_token_logits.shape[-1], abstract=True
+            batch, self.mesh, logits.next_token_logits.shape[-1], abstract=True
         )
         return self.fn, (
             self.sampler_def,

@@ -392,7 +392,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             )
         sampling_metadata = SamplingMetadata.from_model_worker_batch(
             model_worker_batch,
-            len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
             self.mesh,
             vocab_size=self.target_worker.model_config.vocab_size,
         )
@@ -1577,7 +1576,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 batch,
-                0,
                 self.mesh,
                 self._target_vocab_size,
             )

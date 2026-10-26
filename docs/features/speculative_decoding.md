@@ -104,6 +104,7 @@ matches the target model.
 
 - **Performance tuning:** Some array operations in the speculative path still need to move into JIT-compiled functions before treating the path as fully optimized.
 - **Non-greedy sampling:** Kernel coverage for verifying branched candidate tokens is still incomplete. The validated TPU command above uses `--speculative-eagle-topk 1`.
+- **Penalties:** Verify does not apply sampling penalties yet, so requests that set `frequency_penalty`, `presence_penalty` or `min_new_tokens` are rejected with a 400 error. The server also refuses to start if `--preferred-sampling-params` sets them.
 
 ## Operational tips
 

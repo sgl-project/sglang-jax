@@ -206,7 +206,7 @@ class TestAotDispatcher(unittest.TestCase):
                 for greedy in (False, True):
                     batch.sampling_info.is_all_greedy = greedy
                     batch.sampling_info.linear_penalty = np.full((4, 128), 0.25, dtype=np.float32)
-                    metadata = SamplingMetadata.from_model_worker_batch(batch, 0, mesh, 128)
+                    metadata = SamplingMetadata.from_model_worker_batch(batch, mesh, 128)
                     metadata.update_vocab_mask(np.full((4, 4), -1, dtype=np.int32), mesh, 128)
                     result = fn(*stable, step, logits, metadata)
                     (tokens, logprobs, _), next_step = result

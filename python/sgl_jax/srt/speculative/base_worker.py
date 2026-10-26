@@ -246,7 +246,6 @@ class BaseSpecWorker:
                 )
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
-                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )

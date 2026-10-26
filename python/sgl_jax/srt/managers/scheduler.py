@@ -202,6 +202,23 @@ def validate_dflash_request(req) -> str | None:
     return None
 
 
+def validate_spec_request(req) -> str | None:
+    """Per-request guard for the EAGLE-family workers.
+
+    Their verify step does not apply the linear penalty, so a request using one
+    would run with it silently ignored. repetition_penalty is not checked: it is
+    not implemented with or without speculative decoding. ServerArgs applies the
+    same check to --preferred-sampling-params.
+    """
+    sp = req.sampling_params
+    if sp.frequency_penalty != 0.0 or sp.presence_penalty != 0.0 or sp.min_new_tokens != 0:
+        return (
+            "Speculative decoding does not support frequency or presence penalties, "
+            "or min_new_tokens, yet."
+        )
+    return None
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
@@ -1270,6 +1287,13 @@ class Scheduler(
             if dflash_err is not None:
                 req.set_finish_with_abort(dflash_err)
                 self._add_request_to_queue(req)
+                return
+        elif self._is_spec_decode_enabled():
+            spec_err = validate_spec_request(req)
+            if spec_err is not None:
+                req.set_finish_with_abort(spec_err)
+                req.check_finished()
+                self.stream_output([req], req.return_logprob, req.return_output_logprob_only)
                 return
 
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:

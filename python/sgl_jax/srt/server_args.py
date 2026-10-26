@@ -2075,6 +2075,23 @@ class ServerArgs:
         )
         return hf_config
 
+    def check_spec_preferred_sampling_params(self):
+        # The scheduler rejects these per request under speculative decoding
+        # (validate_spec_request); as server-wide defaults they would fail every request.
+        if self.speculative_algorithm is None or not self.preferred_sampling_params:
+            return
+        preferred = json.loads(self.preferred_sampling_params)
+        unsupported = [
+            name
+            for name in ("frequency_penalty", "presence_penalty", "min_new_tokens")
+            if preferred.get(name, 0)
+        ]
+        if unsupported:
+            raise ValueError(
+                f"--preferred-sampling-params sets {', '.join(unsupported)}, which "
+                "speculative decoding does not support yet."
+            )
+
     def check_server_args(self):
         if self.precompile_num_threads < 1:
             raise ValueError("--precompile-num-threads must be at least 1")
@@ -2136,6 +2153,8 @@ class ServerArgs:
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
+
+        self.check_spec_preferred_sampling_params()
 
         if self.speculative_algorithm == "DSPARK":
             self.speculative_sample_from_anchor = True
