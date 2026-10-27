@@ -86,5 +86,105 @@ class TestReasoningParserLing3(CustomTestCase):
         self.assertTrue(normal.startswith("<tool_call>execute_bash"))
 
 
+_KIMI_SECTION = (
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+    '<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_calls_section_end|>'
+)
+# The same completion split at token boundaries (every marker is a single token).
+_KIMI_SECTION_TOKENS = [
+    "<|tool_calls_section_begin|>",
+    "<|tool_call_begin|>",
+    "functions.get_weather:0",
+    "<|tool_call_argument_begin|>",
+    '{"city": ',
+    '"Paris"}',
+    "<|tool_call_end|>",
+    "<|tool_calls_section_end|>",
+]
+
+
+class TestReasoningParserKimiK2(CustomTestCase):
+    """Kimi-K2.5: the prompt ends with `<think>`; reasoning ends at the first of `</think>` or
+    `<|tool_calls_section_begin|>`, and a `</think>` after that point is dropped (vLLM parity)."""
+
+    def _stream(self, chunks, stream_reasoning=True):
+        parser = ReasoningParser(model_type="kimi_k2", stream_reasoning=stream_reasoning)
+        reasoning, normal = "", ""
+        for chunk in chunks:
+            r, n = parser.parse_stream_chunk(chunk)
+            reasoning += r
+            normal += n
+        return reasoning, normal
+
+    def test_kimi_k2_registered_and_kimi_unchanged(self):
+        self.assertEqual(
+            type(ReasoningParser(model_type="kimi_k2").detector).__name__, "KimiK2Detector"
+        )
+        self.assertEqual(ReasoningParser(model_type="kimi").detector.think_start_token, "◁think▷")
+
+    def test_think_then_content_then_tools(self):
+        parser = ReasoningParser(model_type="kimi_k2")
+        reasoning, normal = parser.parse_non_stream("plan</think>Sure." + _KIMI_SECTION)
+        self.assertEqual(reasoning, "plan")
+        self.assertEqual(normal, "Sure." + _KIMI_SECTION)
+
+    def test_tool_section_ends_reasoning_without_think_end(self):
+        parser = ReasoningParser(model_type="kimi_k2")
+        reasoning, normal = parser.parse_non_stream("plan" + _KIMI_SECTION)
+        self.assertEqual(reasoning, "plan")
+        self.assertEqual(normal, _KIMI_SECTION)
+
+    def test_think_end_after_tool_section_is_dropped(self):
+        """Kimi-K2.5 RFC example: `</think>` is emitted after `<|tool_calls_section_end|>`."""
+        parser = ReasoningParser(model_type="kimi_k2")
+        reasoning, normal = parser.parse_non_stream("plan" + _KIMI_SECTION + "</think>")
+        self.assertEqual(reasoning, "plan")
+        self.assertEqual(normal, _KIMI_SECTION)
+
+    def test_text_after_late_think_end_stays_content(self):
+        parser = ReasoningParser(model_type="kimi_k2")
+        reasoning, normal = parser.parse_non_stream("plan" + _KIMI_SECTION + "</think>tail")
+        self.assertEqual(reasoning, "plan")
+        self.assertEqual(normal, _KIMI_SECTION + "tail")
+
+    def test_truncated_reasoning(self):
+        parser = ReasoningParser(model_type="kimi_k2")
+        reasoning, normal = parser.parse_non_stream("step1 step2")
+        self.assertEqual(reasoning, "step1 step2")
+        self.assertEqual(normal, "")
+
+    def test_stray_think_end_in_content_is_dropped(self):
+        parser = ReasoningParser(model_type="kimi_k2")
+        reasoning, normal = parser.parse_non_stream("plan</think>answer</think>")
+        self.assertEqual(reasoning, "plan")
+        self.assertEqual(normal, "answer")
+
+    def test_streaming_per_token_think_end_after_tool_section(self):
+        chunks = ["pl", "an"] + _KIMI_SECTION_TOKENS + ["</think>"]
+        self.assertEqual(self._stream(chunks), ("plan", _KIMI_SECTION))
+
+    def test_streaming_coalesced_chunks(self):
+        tokens = ["pl", "an"] + _KIMI_SECTION_TOKENS + ["</think>"]
+        for split in range(1, len(tokens)):
+            chunks = ["".join(tokens[:split]), "".join(tokens[split:])]
+            self.assertEqual(self._stream(chunks), ("plan", _KIMI_SECTION), chunks)
+        self.assertEqual(self._stream(["".join(tokens)]), ("plan", _KIMI_SECTION))
+
+    def test_streaming_think_then_content_then_tools(self):
+        chunks = ["plan", "</think>", "Sure", "."] + _KIMI_SECTION_TOKENS
+        self.assertEqual(self._stream(chunks), ("plan", "Sure." + _KIMI_SECTION))
+
+    def test_streaming_content_with_angle_bracket_after_reasoning(self):
+        self.assertEqual(self._stream(["plan", "</think>", "a ", "<", " b"]), ("plan", "a < b"))
+
+    def test_streaming_without_stream_reasoning(self):
+        parser = ReasoningParser(model_type="kimi_k2", stream_reasoning=False)
+        self.assertEqual(parser.parse_stream_chunk("pl"), ("", ""))
+        self.assertEqual(parser.parse_stream_chunk("an"), ("", ""))
+        self.assertEqual(
+            parser.parse_stream_chunk(_KIMI_SECTION_TOKENS[0]), ("plan", _KIMI_SECTION_TOKENS[0])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
