@@ -2,6 +2,7 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -186,6 +187,41 @@ class TestKVCache(unittest.TestCase):
 
         # Cache should remain unchanged since all tokens are padding
         self.assertTrue(jnp.allclose(updated_cache, original_cache))
+
+    def test_token_updates_across_slice_block_boundaries(self):
+        # Exercise a partial final 128-slice block, physical cache pages larger
+        # than a DMA slice, and preservation of nonzero untouched cache entries.
+        for tokens, page_size, head_dim, dtype, all_padding in (
+            (129, 1, 128, jnp.bfloat16, False),
+            (129, 128, 256, jnp.bfloat16, False),
+            (257, 256, 128, jnp.bfloat16, False),
+            (129, 128, 128, jnp.float32, False),
+            (129, 128, 128, jnp.bfloat16, True),
+        ):
+            with self.subTest(
+                tokens=tokens, page_size=page_size, dtype=dtype, all_padding=all_padding
+            ):
+                rng = np.random.default_rng(42)
+                k = jnp.asarray(rng.standard_normal((tokens, self.num_heads, head_dim)), dtype)
+                v = jnp.asarray(rng.standard_normal((tokens, self.num_heads, head_dim)), dtype)
+                fused = merge_kv(k, v)
+                fused = jax.device_put(fused, P("data", None, "tensor", None, None))
+                cache = _make_fused_cache(tokens * 3, self.num_heads, head_dim, page_size, dtype)
+                cache = jnp.full_like(cache, -3)
+                capacity = cache.shape[0] * cache.shape[1]
+                loc = rng.choice(capacity - 1, tokens, replace=False).astype(np.int32) + 1
+                loc[::7] = -1
+                if all_padding:
+                    loc[:] = -1
+                expected = np.asarray(cache).reshape(capacity, self.num_heads * 2, head_dim).copy()
+                valid = loc != -1
+                expected[loc[valid]] = np.asarray(fused).reshape(
+                    tokens, self.num_heads * 2, head_dim
+                )[valid]
+                updated = update_fused_kv_cache(
+                    fused, jax.device_put(loc, P("data")), cache, page_size=page_size
+                )
+                np.testing.assert_array_equal(np.asarray(updated).reshape(expected.shape), expected)
 
     def test_kv_cache_update_multiple_segments_with_padding(self):
         """Test KV cache update with multiple contiguous segments of different lengths and padding."""
