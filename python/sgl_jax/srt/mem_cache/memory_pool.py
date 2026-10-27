@@ -1515,8 +1515,9 @@ def update_fused_kv_cache_vectorized(
     mesh: Mesh = None,
 ) -> jax.Array:
     """
-    Vectorized fused KV cache update that handles padding and supports page_size > 1
-    by grouping contiguous tokens into page-sized chunks for efficient updates.
+    Update a paged fused KV cache using one DMA slice per non-padding token.
+
+    The cache's page_size does not determine the size of an individual copy.
     """
 
     @jax.shard_map(
@@ -1541,10 +1542,12 @@ def update_fused_kv_cache_vectorized(
         slice_lens = jnp.where(local_loc_int == -1, 0, 1).astype(jnp.int32)
         num_slices = total_tokens
 
+        # Every slice below copies at most one token. Cache page geometry does
+        # not determine the scratch capacity needed by those DMA operations.
         num_slices_per_block = get_num_slices_per_block(
             local_fused_kv,
             local_kv_cache,
-            page_size,
+            page_size=1,
         )
 
         slot_mapping = get_slot_mapping(
@@ -1561,7 +1564,7 @@ def update_fused_kv_cache_vectorized(
             slices=slot_mapping,
             kv_cache=local_kv_cache,
             num_kv_update_slices=num_kv_update_slices,
-            page_size=page_size,
+            page_size=1,
             num_slices_per_block=num_slices_per_block,
         )
 

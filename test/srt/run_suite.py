@@ -286,6 +286,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_sampler.py", 0.5),
         TestFile("python/sgl_jax/test/test_sampler_deterministic_cond.py", 0.3),
         TestFile("python/sgl_jax/test/test_utils.py", 0.1),
+        TestFile("python/sgl_jax/test/test_kv_cache_slice_selection.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 0.7),
         TestFile("test/srt/kernels/hca/test_cache.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e_tpu.py", 1, runner="pytest"),

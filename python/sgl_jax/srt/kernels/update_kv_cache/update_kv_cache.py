@@ -41,7 +41,10 @@ VMEM_HEADROOM_BYTES = 128 * 1024
 def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=128):
     """
     new_kv: 5D [tokens, 1, heads*2//packing, packing, head_dim]
-    kv_cache: 5D [num_pages, page_size, heads*2//packing, packing, head_dim]
+    kv_cache: 5D [num_pages, cache_page_size, heads*2//packing, packing, head_dim]
+
+    page_size is the maximum copy length, which may be smaller than a cache
+    page. Token-wise updates use 1 even when the cache contains larger pages.
     """
     assert new_kv.ndim == 5, f"new_kv must be 5D, got {new_kv.ndim}D"
     assert kv_cache.ndim == 5, f"kv_cache must be 5D, got {kv_cache.ndim}D"
@@ -62,6 +65,10 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=1
     bytes_per_slice = bytes_per_element * page_size * kv_head_num * head_dim
     usable_vmem_size = VMEM_SIZE - VMEM_HEADROOM_BYTES
     max_num_slices_per_block = usable_vmem_size // bytes_per_slice
+    if page_size == 1:
+        # The DMA start/wait loops are unrolled. Larger token-wise blocks offer
+        # little additional overlap, while growing compilation time and code size.
+        max_num_slices_per_block = min(max_num_slices_per_block, 128)
     assert (
         max_num_slices_per_block > 0
     ), f"max_num_slices_per_block={max_num_slices_per_block} is not greater than 0"
