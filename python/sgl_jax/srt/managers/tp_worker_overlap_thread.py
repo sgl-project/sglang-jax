@@ -301,7 +301,6 @@ class ModelWorkerClient:
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
-                0,
                 self.mesh,
                 self.worker.model_config.vocab_size,
             )

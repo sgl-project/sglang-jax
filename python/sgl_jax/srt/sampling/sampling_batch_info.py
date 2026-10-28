@@ -131,7 +131,6 @@ class SamplingMetadata:
     def from_model_worker_batch(
         cls,
         batch: ModelWorkerBatch,
-        pad_size: int = 0,
         mesh: Mesh = None,
         vocab_size: int = 32000,
         *,
@@ -168,58 +167,30 @@ class SamplingMetadata:
             )
         )
 
-        # Extract penalty information from penalizer orchestrator
         linear_penalty_device = None
         do_penalties = False
         linear_penalty_sharding = NamedSharding(mesh, PartitionSpec("data", "tensor"))
+        batch_rows = batch.sampling_info.temperatures.shape[0]
 
-        # Handle linear penalty independently (created by update_penalties)
-        if (
-            batch.sampling_info.linear_penalty is not None
-            and batch.sampling_info.linear_penalty.size > 0
-        ):
-            do_penalties = True
-            original_linear_penalty = batch.sampling_info.linear_penalty
-            if pad_size > 0:
-                # Pad with zero rows for vocabulary dimension
-                pad_rows = np.zeros(
-                    (pad_size, original_linear_penalty.shape[1]),
-                    dtype=original_linear_penalty.dtype,
+        # ScheduleBatch._merge_sampling_info builds the penalty already padded to the batch
+        # (per-DP slots included), so it must match the logits rows as-is.
+        orchestrator = getattr(batch.sampling_info, "penalizer_orchestrator", None)
+        assert not (orchestrator is not None and orchestrator.is_required), (
+            "penalties must be precomputed into linear_penalty "
+            "(ScheduleBatch._merge_sampling_info)"
+        )
+        linear_penalty = batch.sampling_info.linear_penalty
+        if linear_penalty is not None and linear_penalty.size > 0:
+            if linear_penalty.shape[0] != batch_rows:
+                raise ValueError(
+                    f"linear penalty has {linear_penalty.shape[0]} rows, "
+                    f"sampling batch has {batch_rows}"
                 )
-                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
-            else:
-                padded_linear_penalty = original_linear_penalty
-
-            linear_penalty_device = to_device(
-                padded_linear_penalty,
-                sharding=linear_penalty_sharding,
-            )
-
-        # Handle individual penalties from orchestrator
-        if (
-            linear_penalty_device is None
-            and batch.sampling_info.penalizer_orchestrator
-            and batch.sampling_info.penalizer_orchestrator.is_required
-        ):
             do_penalties = True
-            orchestrator = batch.sampling_info.penalizer_orchestrator
+            linear_penalty_device = to_device(linear_penalty, sharding=linear_penalty_sharding)
 
-            original_linear_penalty = orchestrator.apply()
-            if pad_size > 0:
-                pad_rows = np.zeros(
-                    (pad_size, original_linear_penalty.shape[1]),
-                    dtype=original_linear_penalty.dtype,
-                )
-                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
-            else:
-                padded_linear_penalty = original_linear_penalty
-
-            linear_penalty_device = to_device(
-                padded_linear_penalty,
-                sharding=linear_penalty_sharding,
-            )
         if linear_penalty_device is None:
-            target_shape = (batch.sampling_info.temperatures.shape[0], vocab_size)
+            target_shape = (batch_rows, vocab_size)
             linear_penalty_device = (
                 array(target_shape, np.float32, linear_penalty_sharding)
                 if abstract

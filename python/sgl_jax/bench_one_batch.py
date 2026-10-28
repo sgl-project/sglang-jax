@@ -321,10 +321,8 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     )
     logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
 
-    pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
         model_worker_batch,
-        pad_size=pad_size,
         mesh=model_runner.mesh,
         vocab_size=model_runner.model_config.vocab_size,
     )
