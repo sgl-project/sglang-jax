@@ -26,6 +26,7 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
+from sgl_jax.srt.kernels.ragged_paged_attention.util import quantize_to_kv_dtype
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -303,6 +304,9 @@ class MLAAttentionBackend(AttentionBackend):
         q_pe = q_rope
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        new_kv_c = quantize_to_kv_dtype(new_kv_c, cache.dtype)
+        new_k_pe = quantize_to_kv_dtype(new_k_pe, cache.dtype)
+
         sm_scale = (
             (1.0 / jnp.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
             if (layer is None or layer.scaling is None)

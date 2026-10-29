@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.ragged_paged_attention.util import is_fp8_dtype
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -157,6 +158,10 @@ class NativeAttention(AttentionBackend):
         # Split interleaved [K0, V0, K1, V1, ...] into separate K and V
         k_3d = fused_3d.at[:, ::2, :].get(out_sharding=self.kv_sharding)
         v_3d = fused_3d.at[:, 1::2, :].get(out_sharding=self.kv_sharding)
+
+        if is_fp8_dtype(fused_5d.dtype):
+            k_3d = k_3d.astype(k.dtype)
+            v_3d = v_3d.astype(v.dtype)
 
         return k_3d, v_3d, fused_5d
 
