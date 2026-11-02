@@ -108,6 +108,7 @@ def sparse_mla_page_level(
     vmem_limit_bytes: int | None = None,
     page_share_group: int = 1,
     group_queries: bool = False,
+    precomputed_meta: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Page-level sparse MLA: dense kernel over only the topk-touched pages.
 
@@ -138,7 +139,131 @@ def sparse_mla_page_level(
     by the dense kernel, so no separate ``_scatter_paged`` is needed.
     """
     T = ql_nope.shape[0]
+    grouped = bool(group_queries) and page_share_group > 1 and T % page_share_group == 0
+
+    if precomputed_meta is not None:
+        sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist = precomputed_meta
+    else:
+        sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist = (
+            prepare_sparse_mla_page_level_metadata(
+                T=T,
+                num_cache_pages=cache_kv.shape[0],
+                kv_lens=kv_lens,
+                topk_indices=topk_indices,
+                page_indices=page_indices,
+                cu_q_lens=cu_q_lens,
+                cu_kv_lens=cu_kv_lens,
+                topk_pages=topk_pages,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                k_pages_max=k_pages_max,
+                page_share_group=page_share_group,
+                group_queries=group_queries,
+            )
+        )
+
+    o, cache_out = mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv,
+        sp_kv_len,
+        sp_page_indices,
+        sp_cu_q,
+        sp_cu_kv,
+        sp_dist,
+        sm_scale=sm_scale,
+        sliding_window=None,
+        soft_cap=None,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+        vmem_limit_bytes=vmem_limit_bytes,
+        # grouped: every pseudo-sequence has exactly G query rows.
+        mixed_static_q_len=page_share_group if grouped else None,
+    )
+    return o[..., :kv_lora_rank], cache_out
+
+
+def prepare_sparse_mla_page_level_metadata(
+    *,
+    T: int,
+    num_cache_pages: int,
+    kv_lens: jax.Array,
+    topk_indices: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    topk_pages: jax.Array | None,
+    page_size: int,
+    pages_per_seq: int,
+    k_pages_max: int,
+    page_share_group: int = 1,
+    group_queries: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Build `(sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist)` for `sparse_mla_page_level`."""
     S = kv_lens.shape[0]
+    grouped = bool(group_queries) and page_share_group > 1 and T % page_share_group == 0
+
+    if grouped and topk_pages is not None:
+        G = page_share_group
+        Ng = T // G
+        rep = slice(G - 1, None, G)
+        int_max = jnp.iinfo(jnp.int32).max
+        seq_id_rep = jnp.searchsorted(cu_q_lens[1:], jnp.arange(G - 1, T, G), side="right")
+        seq_id_rep = jnp.clip(seq_id_rep, 0, S - 1)
+        valid_g = kv_lens[seq_id_rep] > 0
+        seq_page_start_rep = cu_kv_lens[seq_id_rep] // page_size
+        new_abs_rep = jnp.maximum(kv_lens[seq_id_rep] - 1, 0)
+        new_pl = new_abs_rep // page_size
+        new_of = new_abs_rep % page_size
+        straddle = new_of < (G - 1)
+        prev_pl = jnp.maximum(new_pl - 1, 0)
+        s_i = straddle.astype(jnp.int32)
+
+        raw_rep = topk_pages[rep]
+        if raw_rep.shape[-1] < k_pages_max - 1:
+            raw_rep = jnp.pad(
+                raw_rep,
+                ((0, 0), (0, (k_pages_max - 1) - raw_rep.shape[-1])),
+                constant_values=-1,
+            )
+        hit_valid_g = (
+            (raw_rep >= 0)
+            & (raw_rep != new_pl[:, None])
+            & (~straddle[:, None] | (raw_rep != prev_pl[:, None]))
+        )
+        max_hist_g = k_pages_max - 1 - s_i
+        valid_rank_g = jnp.cumsum(hit_valid_g.astype(jnp.int32), axis=-1) <= max_hist_g[:, None]
+        keep_g = hit_valid_g & valid_rank_g
+        n_hit_g = jnp.sum(keep_g.astype(jnp.int32), axis=-1)
+        n_used_g = n_hit_g + 1 + s_i
+        hp2 = jnp.sort(jnp.where(keep_g, raw_rep, int_max), axis=-1)[..., : k_pages_max - 1]
+        colg = jnp.arange(k_pages_max)[None, :]
+        hp2p = jnp.pad(hp2, ((0, 0), (0, 1)))
+        tail0 = jnp.where(straddle, prev_pl, new_pl)
+        sp_local_g = jnp.where(
+            colg < n_hit_g[:, None],
+            hp2p,
+            jnp.where(
+                colg == n_hit_g[:, None],
+                tail0[:, None],
+                jnp.where((colg == n_hit_g[:, None] + 1) & straddle[:, None], new_pl[:, None], 0),
+            ),
+        )
+        sp_phys = jnp.where(
+            (colg < n_used_g[:, None]) & valid_g[:, None],
+            page_indices[seq_page_start_rep[:, None] + sp_local_g],
+            num_cache_pages - 1,
+        )
+        sp_kv_len = jnp.where(
+            valid_g, n_hit_g * page_size + s_i * page_size + new_of + 1, G
+        ).astype(jnp.int32)
+        sp_page_indices = sp_phys.reshape(-1)
+        sp_cu_q = jnp.arange(Ng + 1, dtype=jnp.int32) * G
+        sp_cu_kv = jnp.arange(Ng + 1, dtype=jnp.int32) * (k_pages_max * page_size)
+        sp_dist = jnp.array([0, 0, Ng], dtype=jnp.int32)
+        return sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist
 
     # Per-token seq id (decode: token t belongs to seq t after cu_q_lens=[0..T]).
     seq_id = jnp.searchsorted(cu_q_lens[1:], jnp.arange(T), side="right")
@@ -160,15 +285,16 @@ def sparse_mla_page_level(
     new_off = new_abs % page_size
 
     if topk_pages is not None:
-        # Precomputed by the indexer (shared across the 4-layer IndexShare
-        # group), so this branch skips the ~0.25ms one_hot+top_k per layer.
-        # Compact valid entries to the front via sort — new_page may sit in
-        # the middle of topk_pages (compute_topk_pages doesn't know it), and
-        # the sp_local layout below assumes hit_pages[:n_hit_c] are all valid.
-        raw = topk_pages[..., : k_pages_max - 1]
+        raw = topk_pages
+        if raw.shape[-1] < k_pages_max - 1:
+            raw = jnp.pad(raw, ((0, 0), (0, (k_pages_max - 1) - raw.shape[-1])), constant_values=-1)
         hit_is_valid = (raw >= 0) & (raw != new_page_local[:, None])
-        n_hit_c = jnp.minimum(jnp.sum(hit_is_valid, -1), k_pages_max - 1)
-        hit_pages = jnp.sort(jnp.where(hit_is_valid, raw, jnp.iinfo(jnp.int32).max), axis=-1)
+        valid_rank = jnp.cumsum(hit_is_valid.astype(jnp.int32), axis=-1) <= (k_pages_max - 1)
+        hit_is_valid = hit_is_valid & valid_rank
+        n_hit_c = jnp.sum(hit_is_valid.astype(jnp.int32), axis=-1)
+        hit_pages = jnp.sort(jnp.where(hit_is_valid, raw, jnp.iinfo(jnp.int32).max), axis=-1)[
+            ..., : k_pages_max - 1
+        ]
     else:
         # Unique pages via one-hot OR over the k topk positions (page count is
         # bounded by pages_per_seq which is static). Keeps everything jit-static.
@@ -190,7 +316,6 @@ def sparse_mla_page_level(
         jnp.pad(hit_pages, ((0, 0), (0, 1))),
         jnp.where(col == n_hit_c[:, None], new_page_local[:, None], 0),
     )
-    grouped = bool(group_queries) and page_share_group > 1 and T % page_share_group == 0
     if grouped:
         G = page_share_group
         Ng = T // G
@@ -227,7 +352,7 @@ def sparse_mla_page_level(
         sp_phys = jnp.where(
             (colg < n_used_g[:, None]) & valid_g[:, None],
             page_indices[seq_page_start[rep][:, None] + sp_local_g],
-            cache_kv.shape[0] - 1,
+            num_cache_pages - 1,
         )
         # bs-padding groups (kv_len == 0) still carry G query rows, and the mixed
         # kernel sizes its KV loop by kv_len: kv_len == 0 skips the loop, so the
@@ -241,6 +366,7 @@ def sparse_mla_page_level(
         sp_cu_q = jnp.arange(Ng + 1, dtype=jnp.int32) * G
         sp_cu_kv = jnp.arange(Ng + 1, dtype=jnp.int32) * (k_pages_max * page_size)
         sp_dist = jnp.array([0, 0, Ng], dtype=jnp.int32)  # all sequences are mixed
+        return sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist
     elif page_share_group > 1 and T % page_share_group == 0:
         G = page_share_group
         rep = slice(G - 1, None, G)  # last token of every group
@@ -249,45 +375,23 @@ def sparse_mla_page_level(
         sp_phys = jnp.where(
             (col < jnp.repeat(n_used[rep], G)[:, None]) & tok_valid[:, None],
             jnp.repeat(phys_g, G, axis=0),
-            cache_kv.shape[0] - 1,
+            num_cache_pages - 1,
         )
         n_hit_c = jnp.repeat(n_hit_c[rep], G)
     else:
         sp_phys = jnp.where(
             (col < n_used[:, None]) & tok_valid[:, None],
             page_indices[seq_page_start[:, None] + sp_local],
-            cache_kv.shape[0] - 1,
+            num_cache_pages - 1,
         )
 
-    if not grouped:
-        # Metadata for the dense kernel: T "sequences", each kv_len positions.
-        sp_kv_len = (n_hit_c * page_size + new_off + 1).astype(jnp.int32)  # [T]
-        sp_page_indices = sp_phys.reshape(-1)  # [T * k_pages_max]
-        sp_cu_q = jnp.arange(T + 1, dtype=jnp.int32)
-        sp_cu_kv = jnp.arange(T + 1, dtype=jnp.int32) * (k_pages_max * page_size)
-        sp_dist = jnp.array([T, T, T], dtype=jnp.int32)
-
-    o, cache_out = mla_ragged_paged_attention(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        cache_kv,
-        sp_kv_len,
-        sp_page_indices,
-        sp_cu_q,
-        sp_cu_kv,
-        sp_dist,
-        sm_scale=sm_scale,
-        sliding_window=None,
-        soft_cap=None,
-        num_kv_pages_per_block=num_kv_pages_per_block,
-        num_queries_per_block=num_queries_per_block,
-        vmem_limit_bytes=vmem_limit_bytes,
-        # grouped: every pseudo-sequence has exactly G query rows.
-        mixed_static_q_len=page_share_group if grouped else None,
-    )
-    return o[..., :kv_lora_rank], cache_out
+    # Metadata for the dense kernel: T "sequences", each kv_len positions.
+    sp_kv_len = (n_hit_c * page_size + new_off + 1).astype(jnp.int32)  # [T]
+    sp_page_indices = sp_phys.reshape(-1)  # [T * k_pages_max]
+    sp_cu_q = jnp.arange(T + 1, dtype=jnp.int32)
+    sp_cu_kv = jnp.arange(T + 1, dtype=jnp.int32) * (k_pages_max * page_size)
+    sp_dist = jnp.array([T, T, T], dtype=jnp.int32)
+    return sp_kv_len, sp_page_indices, sp_cu_q, sp_cu_kv, sp_dist
 
 
 @functools.partial(
