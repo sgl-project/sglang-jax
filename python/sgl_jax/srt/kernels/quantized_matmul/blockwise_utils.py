@@ -385,21 +385,24 @@ def get_safe_blockwise_tuned_value(
     n_batch_i = int(n_batch)
     sublane_m = max(8, 256 // max(8, jnp.dtype(x_q_dtype).itemsize * 8))
     batch_block_size = max(1, min(int(tuned.batch_block_size), n_batch_i))
-    if batch_block_size < n_batch_i and batch_block_size % sublane_m != 0:
+    if batch_block_size < n_batch_i and n_batch_i <= 96 and int(tuned.batch_block_size) >= 8:
+        batch_block_size = n_batch_i
+    elif batch_block_size < n_batch_i and batch_block_size % sublane_m != 0:
         if n_batch_i <= sublane_m:
             batch_block_size = n_batch_i
         else:
             batch_block_size = min(n_batch_i, _next_multiple(batch_block_size, sublane_m))
 
     # out (N): round up to compute_tile_n, cap to matrix N, then snap to
-    # nearest power-of-two multiple for TPU alignment.
+    # nearest power-of-two multiple when out_block_size does not divide n_out.
     out_block_size = _next_multiple(max(int(tuned.out_block_size), compute_tile_n), compute_tile_n)
     out_block_size = min(out_block_size, _floor_multiple(int(n_out), compute_tile_n))
-    out_block_size = _nearest_power_of_two_multiple(
-        out_block_size,
-        compute_tile_n,
-        _floor_multiple(int(n_out), compute_tile_n),
-    )
+    if int(n_out) % out_block_size != 0:
+        out_block_size = _nearest_power_of_two_multiple(
+            out_block_size,
+            compute_tile_n,
+            _floor_multiple(int(n_out), compute_tile_n),
+        )
     # in (K): must be a multiple of the quantization block_size_in so that
     # each tile boundary aligns with a scale-block boundary.
     in_block_size = max(int(tuned.in_block_size), int(block_size_in))

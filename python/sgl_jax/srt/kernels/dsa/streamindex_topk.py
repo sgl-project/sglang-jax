@@ -76,8 +76,9 @@ class MlaCase(Enum):
 def _scores_kernel(
     # Prefetch
     seq_lens_ref,  # [max_num_seqs]
-    page_indices_ref,  # [max_num_seqs * pages_per_seq]
+    page_indices_ref,  # [num_page_indices]
     cu_q_lens_ref,  # [max_num_seqs + 1]
+    cu_kv_pages_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_sz_ref,  # [2] row count of each output buffer's in-flight DMA (-1 = none)
@@ -100,6 +101,7 @@ def _scores_kernel(
     bkv_p: int,
     bq_sz: int,
     seq_batch_size: int,
+    pages_per_seq: int,
     page_pool_size: int | None = None,
     num_bkv_max: int | None = None,
 ):
@@ -108,11 +110,7 @@ def _scores_kernel(
 
     total_num_pages, page_size_per_kv_packing, kv_packing, _ = cache_kv_hbm_ref.shape
 
-    max_num_seqs = seq_lens_ref.shape[0]
     num_page_indices = page_indices_ref.shape[0]
-
-    assert num_page_indices % max_num_seqs == 0
-    pages_per_seq = num_page_indices // max_num_seqs
 
     # Validate against the KV dtype.
     kv_dtype = cache_kv_hbm_ref.dtype
@@ -200,7 +198,7 @@ def _scores_kernel(
             bkv_vmem_ref = bkv_x2_ref.at[bkv_sem_idx, batch_idx]
 
             kv_p_start = bkv_idx * bkv_p
-            page_indices_offset = (seq_idx + batch_idx) * pages_per_seq + kv_p_start
+            page_indices_offset = cu_kv_pages_ref[seq_idx + batch_idx] + kv_p_start
 
             if not wait:
 
@@ -767,6 +765,7 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "topk_backend",
+        "pages_per_seq",
     ),
 )
 def streamindex_topk(
@@ -774,7 +773,7 @@ def streamindex_topk(
     indexer_weights: jax.Array,  # [max_num_tokens, actual_num_q_heads]
     cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, head_dim]
     seq_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    page_indices: jax.Array,  # i32[num_page_indices]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     *,
@@ -785,6 +784,8 @@ def streamindex_topk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     topk_backend: str = "auto",
+    cu_kv_pages: jax.Array | None = None,
+    pages_per_seq: int | None = None,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -840,7 +841,10 @@ def streamindex_topk(
     lkv_dim = cache_kv.shape[-1]
     _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    if pages_per_seq is None:
+        pages_per_seq = page_indices.shape[0] // max_num_seqs
+    if cu_kv_pages is None:
+        cu_kv_pages = jnp.arange(max_num_seqs + 1, dtype=jnp.int32) * pages_per_seq
 
     # Validate bkv_sz alignment due to TPU DMA constraints
     for bkv_p in num_kv_pages_per_blocks:
@@ -942,6 +946,7 @@ def streamindex_topk(
             seq_lens,
             page_indices,
             cu_q_lens,
+            cu_kv_pages,
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
             jnp.zeros((3,), jnp.int32),  # (bq, bkv, bo) sem indices
             jnp.full((2,), -1, jnp.int32),  # in-flight out DMA row counts
@@ -957,6 +962,7 @@ def streamindex_topk(
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     seq_batch_size=seq_batch_size,
+                    pages_per_seq=pages_per_seq,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -1063,6 +1069,7 @@ def streamindex_topk(
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
+        "pages_per_seq",
     ),
 )
 def streamindex_page_topk(
@@ -1070,7 +1077,7 @@ def streamindex_page_topk(
     indexer_weights: jax.Array,  # [max_num_tokens, num_q_heads]
     cache_kv: jax.Array,  # [total_pages, page_size_per_kv_packing, kv_packing, lkv]
     seq_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    page_indices: jax.Array,  # i32[num_page_indices]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[] number of valid sequences
     *,
@@ -1079,6 +1086,8 @@ def streamindex_page_topk(
     num_kv_pages_per_block: int = 128,
     num_queries_per_block: int = 512,
     vmem_limit_bytes: int | None = 64 * 1024 * 1024,
+    cu_kv_pages: jax.Array | None = None,
+    pages_per_seq: int | None = None,
 ) -> jax.Array:
     """Page-level lightning-indexer top-k (prefill/extend form).
 
@@ -1098,7 +1107,10 @@ def streamindex_page_topk(
     lkv_dim = cache_kv.shape[-1]
     _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    if pages_per_seq is None:
+        pages_per_seq = page_indices.shape[0] // max_num_seqs
+    if cu_kv_pages is None:
+        cu_kv_pages = jnp.arange(max_num_seqs + 1, dtype=jnp.int32) * pages_per_seq
     if compression_ratio != 1:
         raise NotImplementedError(
             "page mode is validated for compression_ratio=1 only (GLM); the"
@@ -1113,6 +1125,10 @@ def streamindex_page_topk(
     num_bkv_max = cdiv(pages_per_seq, bkv_p)
     num_page_cols = align_to(num_bkv_max * bkv_p, 128)
     num_page_sublanes = num_page_cols // 128
+    # Cap bq_sz at long context or large bkv_sz so double-buffered page scores
+    # f32[2, bq_sz, num_page_sublanes, 128] + bq buffers + vreg spill slots fit in 64 MiB VMEM.
+    if num_page_sublanes >= 32 or page_size * bkv_p >= 16384:
+        bq_sz = min(bq_sz, 64)
     bkv_sz = page_size * bkv_p // compression_ratio
     if bkv_sz % 128 != 0:
         raise ValueError(f"bkv block token span ({bkv_sz}) must be a multiple of 128.")
@@ -1140,6 +1156,7 @@ def streamindex_page_topk(
         seq_lens,
         page_indices,
         cu_q_lens,
+        cu_kv_pages,
         jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32)]),
         jnp.zeros((3,), jnp.int32),
         jnp.full((2,), -1, jnp.int32),
@@ -1155,6 +1172,7 @@ def streamindex_page_topk(
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
                 seq_batch_size=1,
+                pages_per_seq=pages_per_seq,
                 page_pool_size=page_size,
                 num_bkv_max=num_bkv_max,
             ),

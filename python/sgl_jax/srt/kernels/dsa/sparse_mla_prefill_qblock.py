@@ -138,15 +138,13 @@ def _qblock_kernel(
     PS: int,  # page size (paged only; == RB in v1 paged mode)
     PTW: int,
 ):
-    if kv_hbm.ndim == 4:
-        # Paged pool passed in its native word-packed shape. Flattening the
-        # HBM ref here (instead of a host-side jnp.reshape) keeps the pool's
-        # native tile in the graph: on jax 0.11.1 the host-side flat view
-        # forces a full T(2,128)->T(8,128) retile copy of the pool per
-        # chunk (110k prefill: ~+2s). HBM refs are DMA-addressed, so the
-        # in-kernel view is free (same trick as _write_back_kernel).
+    is_4d = kv_hbm.ndim == 4
+    if is_4d:
+        # Paged pool passed in its native word-packed shape. Using the 3D word
+        # view (_pn * _pspk, _pk, _dk) keeps the pool's native (pk, Dk) tile in
+        # the graph for both bf16 (pk=2) and fp8 (pk=4) without host-side retiling.
         _pn, _pspk, _pk, _dk = kv_hbm.shape
-        kv_hbm = kv_hbm.reshape(1, _pn * _pspk * _pk, _dk)
+        kv_hbm = kv_hbm.reshape(_pn * _pspk, _pk, _dk)
     """Query-block sparse-MLA kernel, ring-prefetched (flat or packed-paged KV).
 
     In paged mode a unit id is a **global key** = position in the packed
@@ -167,7 +165,10 @@ def _qblock_kernel(
 
     def _copy(j, slot):
         u = jnp.maximum(units_ref[0, 0, 0, j], 0)
-        if paged:
+        if paged and is_4d:
+            pp = pt_ref[0, 0, 0, jnp.minimum(u, PTW - 1)]
+            src = kv_hbm.at[pl.ds(pp * _pspk, RBF // _pk), :, :]
+        elif paged:
             # whole-page unit: physical row 0 of page pt[u]. The token axis is
             # sublane-tiled (8): express the offset as r8*8 so divisibility is
             # provable (PS % 8 == 0), the same idiom as the dense paged kernel.
@@ -220,7 +221,7 @@ def _qblock_kernel(
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
 
         _copy(j, slot).wait()
-        kv_blk = kv_scratch[slot]  # [RBF, Dk_pad]
+        kv_blk = kv_scratch[slot].reshape(RBF, _dk) if is_4d else kv_scratch[slot]  # [RBF, Dk_pad]
 
         # score: [RBF,Dk]·[QBHp,Dk] -> [RBF, QBHp] (keys sublane, queries lane)
         s = (
@@ -240,8 +241,9 @@ def _qblock_kernel(
         l_new = l_i * alpha + jnp.sum(p, axis=0)
         v_blk = kv_blk[:, :Dv]  # [RBF, Dv]
         # acc[qh, dv] += sum_r p[r, qh] * v[r, dv]  (contract the key axis)
+        p_dtype = q.dtype if kv_blk.dtype.itemsize == 1 else kv_blk.dtype
         acc = acc * alpha[:, None] + jax.lax.dot_general(
-            p.astype(kv_blk.dtype),
+            p.astype(p_dtype),
             v_blk,
             (((0,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
@@ -418,7 +420,14 @@ def sparse_mla_attention_qblock(
         out_specs=pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
         out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
         scratch_shapes=[
-            pltpu.VMEM((_NBUF, RBF, Dk_pad), kv2.dtype),
+            pltpu.VMEM(
+                (
+                    (_NBUF, RBF // kv2.shape[2], kv2.shape[2], Dk_pad)
+                    if kv2.ndim == 4
+                    else (_NBUF, RBF, Dk_pad)
+                ),
+                kv2.dtype,
+            ),
             pltpu.SemaphoreType.DMA((_NBUF,)),
         ],
         interpret=interpret,
