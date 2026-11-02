@@ -14,6 +14,7 @@ projects it through `W_UV → W_O` (see `docs/design/MLA.md` §3.9).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -301,8 +302,14 @@ class MLAAttentionBackend(AttentionBackend):
         new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
         ql_nope = q
         q_pe = q_rope
+        has_tensor_axis = self.mesh is not None and "tensor" in self.mesh.axis_names
+        q_spec = P(dpa, "tensor", None) if has_tensor_axis else P(dpa, None, None)
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        if new_kv_c.dtype != cache.dtype:
+            new_kv_c = new_kv_c.astype(cache.dtype)
+        if new_k_pe.dtype != cache.dtype:
+            new_k_pe = new_k_pe.astype(cache.dtype)
         sm_scale = (
             (1.0 / jnp.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
             if (layer is None or layer.scaling is None)
@@ -312,8 +319,8 @@ class MLAAttentionBackend(AttentionBackend):
         soft_cap = layer.logit_cap if layer is not None else None
 
         in_specs = (
-            P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
-            P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
+            q_spec,  # ql_nope    [T, n_h/tp, lkv]
+            q_spec,  # q_pe       [T, n_h/tp, r]
             P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
             P(dpa, None),  # new_k_pe   [T, r]    (single latent)
             P(dpa, None, None, None),  # cache (page axis sharded by data)
@@ -324,7 +331,7 @@ class MLAAttentionBackend(AttentionBackend):
             P(dpa),  # distribution
         )
         out_specs = (
-            P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
+            q_spec,  # o_latent       [T, n_h/tp, lkv]
             P(dpa, None, None, None),  # updated cache  4D
         )
 
@@ -362,6 +369,7 @@ class MLAAttentionBackend(AttentionBackend):
 
         o_latent, updated_cache = jax.shard_map(
             _run,
+            mesh=self.mesh,
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,
@@ -390,7 +398,8 @@ class MLAAttentionBackend(AttentionBackend):
         assert (
             res > 0
         ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
-        return res
+        min_reqs = int(os.environ.get("SGL_MLA_MIN_RUNNING_REQS", "0"))
+        return max(min_reqs, res)
 
     def get_eagle_base_metadata(self, batch, **kwargs):
         """Metadata for the fused speculative JITs that rebuild dynamic fields on device.

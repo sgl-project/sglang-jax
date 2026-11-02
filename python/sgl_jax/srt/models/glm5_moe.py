@@ -1,5 +1,6 @@
 import logging
-from functools import partial
+import os
+from functools import cache, partial
 from typing import Any
 
 import jax
@@ -16,7 +17,11 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase, prepad_replicated_quantized_linears
+from sgl_jax.srt.layers.linear import (
+    LinearBase,
+    QuantizedLinear,
+    prepad_replicated_quantized_linears,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
@@ -97,7 +102,24 @@ class GlmNorm(nnx.Module):
         return normalized * self.weight.value + self.bias.value
 
 
+@cache
+def _build_hadamard_np(n: int) -> np.ndarray:
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError(f"Hadamard size must be a positive power of 2, got {n}")
+    if n == 1:
+        return np.array([[1.0]], dtype=np.float32)
+    h = _build_hadamard_np(n // 2)
+    return np.block([[h, h], [h, -h]])
+
+
+@cache
+def _get_scaled_hadamard_np(n: int) -> np.ndarray:
+    return _build_hadamard_np(n) * (n**-0.5)
+
+
 def get_hadamard_matrix(n):
+    if isinstance(n, int) and n > 0 and (n & (n - 1)) == 0:
+        return jnp.asarray(_build_hadamard_np(n))
     if n == 1:
         return jnp.array([[1.0]])
     h = get_hadamard_matrix(n // 2)
@@ -150,7 +172,13 @@ class GlmDsaIndexer(nnx.Module):
         )
 
     def project(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        *,
+        precomputed_wk: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Indexer projections only (query, key, per-head weights); no top-k.
 
@@ -160,7 +188,10 @@ class GlmDsaIndexer(nnx.Module):
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
-        key, _ = self.wk(hidden_states)
+        if precomputed_wk is not None:
+            key = precomputed_wk
+        else:
+            key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
         rope_dim = 64
@@ -176,7 +207,7 @@ class GlmDsaIndexer(nnx.Module):
             query = query.at[:, :, :rope_dim].set(q_rope)
             key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
+        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim))
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
 
@@ -184,13 +215,22 @@ class GlmDsaIndexer(nnx.Module):
         return query, key, weights
 
     def __call__(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        *,
+        precomputed_wk: jax.Array | None = None,
     ) -> jax.Array:
         # 1. Project Query and Key
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
-        key, _ = self.wk(hidden_states)
+        if precomputed_wk is not None:
+            key = precomputed_wk
+        else:
+            key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
         # Apply RoPE
@@ -210,8 +250,7 @@ class GlmDsaIndexer(nnx.Module):
             key = key.at[:, :rope_dim].set(k_rope)
 
         # Apply Hadamard Transform
-        h_matrix = get_hadamard_matrix(128)
-        h_matrix = h_matrix * (128**-0.5)
+        h_matrix = jnp.asarray(_get_scaled_hadamard_np(self.head_dim))
 
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
@@ -257,6 +296,8 @@ class Glm5Attention(nnx.Module):
         has_indexer: bool = True,
         indexer_type: str = "full",
         use_dsa_sparse: bool = False,
+        index_head_dim: int = 128,
+        index_n_heads: int = 32,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -342,8 +383,8 @@ class Glm5Attention(nnx.Module):
             self.indexer = GlmDsaIndexer(
                 hidden_size=hidden_size,
                 q_lora_rank=self.q_lora_rank,
-                index_head_dim=128,
-                index_n_heads=32,
+                index_head_dim=index_head_dim,
+                index_n_heads=index_n_heads,
                 mesh=mesh,
                 dtype=dtype,
                 scope_name="indexer",
@@ -399,6 +440,122 @@ class Glm5Attention(nnx.Module):
             v_head_dim=self.qk_head_dim,
             layer_id=layer_id,
         )
+        self.qkv_a_proj = nnx.data(None) if hasattr(nnx, "data") else None
+        self._qkv_a_has_wk = False
+        self._qkv_a_offsets = None
+
+    def fuse_qkv_a_proj(self, fuse_wk: bool = True, drop_originals: bool = True) -> bool:
+        """Fuse replicated block-quant `q_a_proj` + `kv_a_proj_with_mqa` (+ `indexer.wk`) into one `QuantizedLinear`."""
+        if os.environ.get("SGLANG_JAX_FUSE_QKV_A", "1") == "0" or self.qkv_a_proj is not None:
+            return False
+        if not (
+            isinstance(self.q_a_proj, QuantizedLinear)
+            and isinstance(self.kv_a_proj_with_mqa, QuantizedLinear)
+        ):
+            return False
+        if (
+            self.q_a_proj.kernel_axes != (None, None)
+            or self.kv_a_proj_with_mqa.kernel_axes != (None, None)
+            or self.q_a_proj.bias is not None
+            or self.kv_a_proj_with_mqa.bias is not None
+        ):
+            return False
+        w_qa = self.q_a_proj.weight_q.value
+        s_qa = self.q_a_proj.weight_scale.value
+        w_kva = self.kv_a_proj_with_mqa.weight_q.value
+        s_kva = self.kv_a_proj_with_mqa.weight_scale.value
+        if (
+            not isinstance(w_qa, jax.Array)
+            or not isinstance(s_qa, jax.Array)
+            or not isinstance(w_kva, jax.Array)
+            or not isinstance(s_kva, jax.Array)
+            or isinstance(w_qa, jax.ShapeDtypeStruct)
+            or isinstance(s_qa, jax.ShapeDtypeStruct)
+            or isinstance(w_kva, jax.ShapeDtypeStruct)
+            or isinstance(s_kva, jax.ShapeDtypeStruct)
+        ):
+            return False
+        if getattr(s_qa, "ndim", 0) != 3 or getattr(s_kva, "ndim", 0) != 3:
+            return False
+        self.q_a_proj.pad_out_rows(256)
+        self.kv_a_proj_with_mqa.pad_out_rows(256)
+        w_qa = self.q_a_proj.weight_q.value
+        s_qa = self.q_a_proj.weight_scale.value
+        w_kva = self.kv_a_proj_with_mqa.weight_q.value
+        s_kva = self.kv_a_proj_with_mqa.weight_scale.value
+        qa_valid = self.q_a_proj.n_out_valid or int(w_qa.shape[0])
+        kva_valid = self.kv_a_proj_with_mqa.n_out_valid or int(w_kva.shape[0])
+        qa_pad = int(w_qa.shape[0])
+        kva_pad = int(w_kva.shape[0])
+
+        has_wk = (
+            fuse_wk
+            and self.indexer is not None
+            and isinstance(self.indexer.wk, QuantizedLinear)
+            and self.indexer.wk.kernel_axes == (None, None)
+            and self.indexer.wk.bias is None
+            and isinstance(self.indexer.wk.weight_q.value, jax.Array)
+            and isinstance(self.indexer.wk.weight_scale.value, jax.Array)
+            and not isinstance(self.indexer.wk.weight_q.value, jax.ShapeDtypeStruct)
+            and not isinstance(self.indexer.wk.weight_scale.value, jax.ShapeDtypeStruct)
+            and getattr(self.indexer.wk.weight_scale.value, "ndim", 0) == 3
+        )
+        if has_wk:
+            self.indexer.wk.pad_out_rows(256)
+            w_wk = self.indexer.wk.weight_q.value
+            s_wk = self.indexer.wk.weight_scale.value
+            wk_valid = self.indexer.wk.n_out_valid or int(w_wk.shape[0])
+            w_fused = jnp.concatenate([w_qa, w_kva, w_wk], axis=0)
+            s_fused = jnp.concatenate([s_qa, s_kva, s_wk], axis=2)
+            self._qkv_a_has_wk = True
+            self._qkv_a_offsets = (
+                qa_valid,
+                qa_pad,
+                qa_pad + kva_valid,
+                qa_pad + kva_pad,
+                qa_pad + kva_pad + wk_valid,
+            )
+        else:
+            w_fused = jnp.concatenate([w_qa, w_kva], axis=0)
+            s_fused = jnp.concatenate([s_qa, s_kva], axis=2)
+            self._qkv_a_has_wk = False
+            self._qkv_a_offsets = (
+                qa_valid,
+                qa_pad,
+                qa_pad + kva_valid,
+                0,
+                0,
+            )
+
+        # Pad total output rows to a multiple of 1024 (e.g. 2816 -> 3072) so
+        # out_block_size = 1024 divides n_out without any runtime jnp.pad.
+        rem_1024 = int(w_fused.shape[0]) % 1024
+        if rem_1024 != 0:
+            pad_rows = 1024 - rem_1024
+            w_fused = jnp.pad(w_fused, ((0, pad_rows), (0, 0)))
+            s_fused = jnp.pad(s_fused, ((0, 0), (0, 0), (0, pad_rows)))
+
+        fused_proj = QuantizedLinear(
+            weight_q=w_fused,
+            weight_scale=s_fused,
+            bias=None,
+            activation_dtype=self.q_a_proj.activation_dtype,
+            mesh=self.mesh,
+            kernel_axes=(None, None),
+            skip_bias_add=False,
+            params_dtype=self.q_a_proj.params_dtype,
+            compute_dtype=self.q_a_proj.compute_dtype,
+            weight_block_size=self.q_a_proj.weight_block_size,
+            allow_narrow_n_blockwise=self.q_a_proj.allow_narrow_n_blockwise,
+            scope_name="quantized_qkv_a_proj",
+        )
+        self.qkv_a_proj = nnx.data(fused_proj) if hasattr(nnx, "data") else fused_proj
+        if drop_originals:
+            self.q_a_proj = nnx.data(None) if hasattr(nnx, "data") else None
+            self.kv_a_proj_with_mqa = nnx.data(None) if hasattr(nnx, "data") else None
+            if has_wk:
+                self.indexer.wk = nnx.data(None) if hasattr(nnx, "data") else None
+        return True
 
     def prepare_weight_loading(self, loader, mappings, prefix):
         from sgl_jax.srt.layers.weight_loading import prepare_absorbed_mla
@@ -488,7 +645,16 @@ class Glm5Attention(nnx.Module):
         dsa_topk_pages_in: jax.Array | None = None,
         dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
-        q_compressed, _ = self.q_a_proj(hidden_states)
+        if self.qkv_a_proj is not None:
+            qkv_out, _ = self.qkv_a_proj(hidden_states)
+            qa_end, kva_start, kva_end, wk_start, wk_end = self._qkv_a_offsets
+            q_compressed = qkv_out[:, :qa_end]
+            latent_cache = qkv_out[:, kva_start:kva_end]
+            precomputed_wk = qkv_out[:, wk_start:wk_end] if self._qkv_a_has_wk else None
+        else:
+            q_compressed, _ = self.q_a_proj(hidden_states)
+            latent_cache = None
+            precomputed_wk = None
         q_compressed = self.q_a_layernorm(q_compressed)
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
@@ -501,18 +667,29 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["dsa_topk_reuse"] = dsa_topk_reuse
             if self.indexer is not None:
                 q_idx, k_idx, idx_w = self.indexer.project(
-                    hidden_states, q_compressed, positions, self.rotary_emb
+                    hidden_states,
+                    q_compressed,
+                    positions,
+                    self.rotary_emb,
+                    precomputed_wk=precomputed_wk,
                 )
                 dsa_kwargs["q_idx"] = q_idx
                 dsa_kwargs["k_idx"] = k_idx
                 dsa_kwargs["idx_weights"] = idx_w
         elif self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+            _ = self.indexer(
+                hidden_states,
+                q_compressed,
+                positions,
+                self.rotary_emb,
+                precomputed_wk=precomputed_wk,
+            )
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
 
-        latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
+        if latent_cache is None:
+            latent_cache, _ = self.kv_a_proj_with_mqa(hidden_states)
         compressed, k_rope = jnp.split(latent_cache, [self.kv_lora_rank], axis=-1)
         compressed = self.kv_a_layernorm(compressed)
 
@@ -530,6 +707,30 @@ class Glm5Attention(nnx.Module):
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
+
+
+def fuse_glm5_qkv_a_projections(module: nnx.Module) -> int:
+    """Fuse replicated block-quant `q_a_proj` + `kv_a_proj_with_mqa` (+ `indexer.wk`) across all `Glm5Attention` layers."""
+    if os.environ.get("SGLANG_JAX_FUSE_QKV_A", "1") == "0":
+        return 0
+    fused_with_wk = 0
+    fused_no_wk = 0
+    for _, sub in module.iter_modules():
+        if isinstance(sub, Glm5Attention) and sub.fuse_qkv_a_proj():
+            if sub._qkv_a_has_wk:
+                fused_with_wk += 1
+            else:
+                fused_no_wk += 1
+    total = fused_with_wk + fused_no_wk
+    if total:
+        logger.info(
+            "Fused %d Glm5Attention input projections into (3072, 6144) QuantizedLinear "
+            "(with_wk=%d, shared_no_wk=%d)",
+            total,
+            fused_with_wk,
+            fused_no_wk,
+        )
+    return total
 
 
 class Glm5MLP(nnx.Module):
@@ -739,10 +940,18 @@ class Glm5DecoderLayer(nnx.Module):
             has_indexer=has_indexer,
             indexer_type=indexer_type,
             use_dsa_sparse=use_dsa_sparse,
+            index_head_dim=getattr(config, "index_head_dim", None) or 128,
+            index_n_heads=getattr(config, "index_n_heads", None) or 32,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
-        use_fused_mlp = getattr(config, "_sgl_use_fused_mlp", True)
+        mesh_devs = getattr(mesh, "devices", None)
+        is_tpu_mesh = (
+            mesh_devs is not None
+            and bool(mesh_devs.size)
+            and getattr(mesh_devs.flat[0], "platform", None) == "tpu"
+        )
+        use_fused_mlp = getattr(config, "_sgl_use_fused_mlp", True) and is_tpu_mesh
 
         if layer_id < first_k_dense_replace and not force_moe:
             self.mlp = Glm5MLP(
@@ -916,6 +1125,7 @@ class Glm5DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        token_valid_mask: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
@@ -940,6 +1150,72 @@ class Glm5DecoderLayer(nnx.Module):
         )
         hidden_states += residual
         residual = hidden_states
+
+        if (
+            self.is_moe_layer
+            and self.moe_backend == MoEBackend.FUSED_V2
+            and self.shared_experts is None
+            and hidden_states.shape[0]
+            >= int(os.environ.get("SGLANG_JAX_EP_SHARD_ROUTER_MIN_TOKENS", "32"))
+            and os.environ.get("SGLANG_JAX_EP_SHARD_ROUTER", "1") == "1"
+        ):
+            mesh = self.mlp.mesh
+            mesh_ep_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+            orig_num_tokens = hidden_states.shape[0]
+            padded_num_tokens = (
+                (orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size
+            ) * mesh_ep_size
+            pad_t = padded_num_tokens - orig_num_tokens
+            ep_sharding = NamedSharding(mesh, P(("data", "tensor"), None))
+            ep_mask_sharding = NamedSharding(mesh, P(("data", "tensor")))
+
+            def _prep_ep(hs_in, mask_in):
+                if pad_t > 0:
+                    hs_in = jnp.pad(hs_in, ((0, pad_t), (0, 0)))
+                hs_ep_out = jax.sharding.reshard(hs_in, ep_sharding)
+                if mask_in is None:
+                    return hs_ep_out, None
+                if pad_t > 0:
+                    mask_in = jnp.pad(mask_in, (0, pad_t), constant_values=False)
+                return hs_ep_out, jax.sharding.reshard(mask_in, ep_mask_sharding)
+
+            if getattr(mesh, "_any_axis_explicit", False):
+                if token_valid_mask is not None:
+                    hs_ep, mask_ep = jax.sharding.auto_axes(
+                        _prep_ep, out_sharding=(ep_sharding, ep_mask_sharding)
+                    )(hidden_states, token_valid_mask)
+                else:
+                    hs_ep = jax.sharding.auto_axes(
+                        lambda h: _prep_ep(h, None)[0], out_sharding=ep_sharding
+                    )(hidden_states)
+                    mask_ep = None
+            else:
+                hs_ep, mask_ep = _prep_ep(hidden_states, token_valid_mask)
+
+            hs_ep = self.post_attention_layernorm(hs_ep)
+            router_logits = self.moe_gate(hs_ep)
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+            topk_weights, topk_ids = self.topk(
+                router_logits,
+                correction_bias,
+                dispatch_info=dispatch_info,
+                routing_sharding=ep_sharding,
+            )
+            if mask_ep is not None:
+                topk_ids = jnp.where(mask_ep[:, None], topk_ids, -1)
+            hidden_states = self.mlp(hs_ep, topk_weights, topk_ids)
+            if pad_t > 0:
+                if getattr(mesh, "_any_axis_explicit", False):
+                    out_sh = NamedSharding(mesh, P("data", None))
+                    hidden_states = jax.sharding.auto_axes(
+                        lambda h: h[:orig_num_tokens], out_sharding=out_sh
+                    )(hidden_states)
+                else:
+                    hidden_states = hidden_states[:orig_num_tokens]
+            if not getattr(forward_batch, "return_routed_experts", False):
+                topk_ids = None
+            return hidden_states, residual, kv_fused, topk_ids
+
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
@@ -955,6 +1231,8 @@ class Glm5DecoderLayer(nnx.Module):
                 correction_bias,
                 dispatch_info=dispatch_info,
             )
+            if self.use_fused and token_valid_mask is not None:
+                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
@@ -1011,6 +1289,7 @@ class Glm5Model(nnx.Module):
         from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
 
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
         residual = None
         layers_kv_fused = []
         layers_idx_fused = []
@@ -1024,6 +1303,7 @@ class Glm5Model(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
+                token_valid_mask=token_valid_mask,
                 dispatch_info=forward_batch.expert_location_metadata,
                 dsa_topk_in=dsa_topk,
                 dsa_topk_pages_in=dsa_topk_pages,
@@ -1152,7 +1432,38 @@ class Glm5ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_glm5_weight_mappings(model_config)
-        loader.load(weight_mappings)
+        quant_config = getattr(model_config, "quantization_config", None)
+        if (
+            quant_config is not None
+            and not quant_config.is_static_checkpoint
+            and not getattr(model_config, "_dummy_mode", False)
+            and quant_config.has_moe_quantization()
+        ):
+            import gc
+
+            chunk_size = 20
+            num_layers = self.config.num_hidden_layers
+            for start_layer in range(0, num_layers, chunk_size):
+                end_layer = min(start_layer + chunk_size, num_layers)
+                layer_prefixes = tuple(f"model.layers.{i}." for i in range(start_layer, end_layer))
+                chunk_mappings = {
+                    k: v
+                    for k, v in weight_mappings.items()
+                    if k.startswith(layer_prefixes)
+                    or (end_layer == num_layers and not k.startswith("model.layers."))
+                }
+                loader.load(chunk_mappings)
+                for i in range(start_layer, end_layer):
+                    mlp = getattr(self.model.layers[i], "mlp", None)
+                    if isinstance(mlp, (EPMoE, FusedEPMoE)):
+                        mlp.quantize_weights(
+                            is_static=False,
+                            abstract=getattr(model_config, "_abstract_mode", False),
+                        )
+                gc.collect()
+        else:
+            loader.load(weight_mappings)
+        fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
 
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
@@ -1426,10 +1737,10 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         # become QuantizedLinear (no .weight), so post_load_weights cannot
         # populate w_gu/w_d and the abstract ShapeDtypeStruct placeholders
         # leak into jit inputs. Keep fused for bf16-only.
-        # The fused MLP is a TPU Pallas kernel; CPU (interpret/smoke) runs keep the plain path.
-        mc.hf_config._sgl_use_fused_mlp = (
-            mc.quantization_config is None and jax.default_backend() == "tpu"
-        )
+        # Do not call jax.default_backend() inside patch_model_config (runs before
+        # jax.distributed.initialize() on multi-host TPU pods and inside TokenizerManager
+        # where it grabs libtpu_lockfile); Glm5DecoderLayer checks mesh platform instead.
+        mc.hf_config._sgl_use_fused_mlp = mc.quantization_config is None
 
 
 _NEXTN_TOP_LEVEL_MODULES = ("eh_proj", "enorm", "hnorm", "shared_head", "embed_tokens", "lm_head")
@@ -1565,6 +1876,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
 
         embed = self.embed_tokens(forward_batch.input_ids)
+        token_valid_mask = forward_batch.get_token_valid_mask(embed.shape[0])
         hidden_in = forward_batch.spec_info.hidden_states
         emb_sh = jax.typeof(embed).sharding
         if isinstance(emb_sh, jax.sharding.NamedSharding):
@@ -1584,6 +1896,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             forward_batch,
             token_to_kv_pool,
             None,
+            token_valid_mask=token_valid_mask,
             dispatch_info=forward_batch.expert_location_metadata,
             dsa_topk_in=None,
             dsa_topk_pages_in=dsa_topk_pages_in,
@@ -1612,6 +1925,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         # MLA absorption and fused-MLP packing run inside loader.load via the
         # modules' prepare_weight_loading hooks (#1716); no post-load pass.
         self.loader.load(mappings)
+        fuse_glm5_qkv_a_projections(self)
         prepad_replicated_quantized_linears(self)
 
     def get_shared_weight_paths(self):

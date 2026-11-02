@@ -300,6 +300,13 @@ def apply_moe_quantization(
             if _is_ignored(log_path):
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
+            if (
+                not is_static_input
+                and getattr(obj, "w1_scale", None) is not None
+                and getattr(getattr(obj, "w1", None), "value", None) is not None
+                and getattr(obj.w1.value, "dtype", None) == getattr(obj, "quantized_dtype", None)
+            ):
+                return
             logger.debug("Quantizing MoE weights path=%s", log_path)
             if hasattr(obj, "quantized_dtype") and obj.quantized_dtype is None:
                 obj.quantized_dtype = quant_config.get_moe_weight_dtype()

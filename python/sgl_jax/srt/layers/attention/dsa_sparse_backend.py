@@ -281,6 +281,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             else layer.scaling
         )
         dpa = self.attention_data_partition_axis
+        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
+        if new_kv_c.dtype != kv_cache.dtype:
+            new_kv_c = new_kv_c.astype(kv_cache.dtype)
+        if new_k_pe.dtype != kv_cache.dtype:
+            new_k_pe = new_k_pe.astype(kv_cache.dtype)
         md = self.forward_metadata
 
         # ── dense short-circuit ────────────────────────────────────────────
