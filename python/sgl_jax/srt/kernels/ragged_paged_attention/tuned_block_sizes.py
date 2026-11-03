@@ -1464,8 +1464,15 @@ def get_tuned_block_sizes(
         # TPUv4 has much smaller VMEM size so we pick fixed block sizes.
         bkv_p, bq = (512 // page_size, 32)
     else:
-        if device_name in TUNED_BLOCK_SIZES and keys[1:] in TUNED_BLOCK_SIZES[device_name]:
-            bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys[1:]]
+        lookup_key = keys[1:]
+        if device_name in TUNED_BLOCK_SIZES and lookup_key in TUNED_BLOCK_SIZES[device_name]:
+            bkv_p, bq = TUNED_BLOCK_SIZES[device_name][lookup_key]
+        elif (
+            device_name in TUNED_BLOCK_SIZES
+            and lookup_key[1].startswith("float8_")
+            and (lookup_key[0], "bfloat16", *lookup_key[2:]) in TUNED_BLOCK_SIZES[device_name]
+        ):
+            bkv_p, bq = TUNED_BLOCK_SIZES[device_name][(lookup_key[0], "bfloat16", *lookup_key[2:])]
         else:
             logger.info(
                 "Tuned RPA block sizes not found for %s: page_size=%s, actual_num_q_heads=%s, "

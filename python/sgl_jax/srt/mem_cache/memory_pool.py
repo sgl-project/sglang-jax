@@ -17,7 +17,12 @@ from jax.tree_util import register_pytree_node_class
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
 
-from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
+from sgl_jax.srt.kernels.ragged_paged_attention.util import (
+    align_to,
+    get_dtype_packing,
+    is_fp8_dtype,
+    quantize_to_kv_dtype,
+)
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_num_slices_per_block,
     get_slot_mapping,
@@ -58,16 +63,15 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
     """Merge 3D k/v into 5D fused format matching KV cache shape.
 
     Input:  k, v: [num_tokens, num_kv_heads, head_dim]
-    Output: [num_tokens, 1, num_kv_heads * 2 // packing, packing, head_dim_aligned]
+    Output: [num_tokens, 1, align_to(num_kv_heads * 2, packing) // packing, packing, head_dim_aligned]
     """
     assert k.shape == v.shape, f"k and v must have same shape, got {k.shape} vs {v.shape}"
 
     num_tokens, num_kv_heads, head_dim = k.shape
 
-    from sgl_jax.srt.kernels.ragged_paged_attention.util import align_to
-
     packing = get_dtype_packing(k.dtype)
     num_kv_heads_x2 = num_kv_heads * 2
+    padded_heads_x2 = align_to(num_kv_heads_x2, packing)
     head_dim_aligned = align_to(head_dim, 128)
 
     # Interleave k and v: [tokens, heads, 2, head_dim] -> [tokens, heads*2, head_dim]
@@ -80,13 +84,13 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
         kv_fused,
         (
             (0, 0),
-            (0, 0),
+            (0, padded_heads_x2 - num_kv_heads_x2),
             (0, head_dim_aligned - head_dim),
         ),
         constant_values=0,
     )
-    # Step 1: [tokens, heads*2, hdim] -> [tokens, heads*2//packing, packing, hdim]
-    kv_fused = kv_fused.reshape(num_tokens, num_kv_heads_x2 // packing, packing, head_dim_aligned)
+    # Step 1: [tokens, padded_heads*2, hdim] -> [tokens, padded_heads*2//packing, packing, hdim]
+    kv_fused = kv_fused.reshape(num_tokens, padded_heads_x2 // packing, packing, head_dim_aligned)
     # Step 2: [tokens, h, packing, hdim] -> [tokens, 1, h, packing, hdim]
     kv_fused = jnp.expand_dims(kv_fused, axis=1)
     return kv_fused
@@ -582,12 +586,16 @@ class MHATokenToKVPool(KVCache):
 
         # Hack: this shape is more friendly to rpav3
         packing = get_dtype_packing(self.dtype)
+        tp_size = self.mesh.shape[self.kv_partition_axis]
+        kv_heads_per_shard = self.head_num // tp_size
+        padded_heads_x2_per_shard = align_to(kv_heads_per_shard * 2, packing)
+        total_padded_heads_x2 = padded_heads_x2_per_shard * tp_size
         fused_buffer_shape = (
             (self.size + self.page_size * self.dp_size) // self.page_size,
             self.page_size,
-            self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
+            total_padded_heads_x2 // packing,
             packing,
-            self.head_dim,
+            align_to(self.head_dim, 128),
         )
         if abstract:
             self.kv_buffer = [
@@ -621,11 +629,16 @@ class MHATokenToKVPool(KVCache):
 
     def _calculate_memory_usage(self):
         """Calculate memory usage for fused KV cache"""
+        packing = get_dtype_packing(self.dtype)
+        tp_size = self.mesh.shape[self.kv_partition_axis]
+        kv_heads_per_shard = self.head_num // tp_size
+        padded_heads_x2_per_shard = align_to(kv_heads_per_shard * 2, packing)
+        total_padded_heads_x2 = padded_heads_x2_per_shard * tp_size
+
         fused_kv_size = (
             (self.size + self.page_size * self.dp_size)
-            * self.head_num  # num_kv_heads
-            * self.head_dim
-            * 2  # num_heads * 2 (head interleaving)
+            * total_padded_heads_x2
+            * align_to(self.head_dim, 128)
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
@@ -639,11 +652,16 @@ class MHATokenToKVPool(KVCache):
 
     def get_kv_size_bytes(self):
         """Calculate KV cache size in bytes for fused format"""
+        packing = get_dtype_packing(self.dtype)
+        tp_size = self.mesh.shape[self.kv_partition_axis]
+        kv_heads_per_shard = self.head_num // tp_size
+        padded_heads_x2_per_shard = align_to(kv_heads_per_shard * 2, packing)
+        total_padded_heads_x2 = padded_heads_x2_per_shard * tp_size
+
         fused_kv_size = (
             (self.size + self.page_size * self.dp_size)
-            * self.head_num  # num_kv_heads
-            * self.head_dim
-            * 2  # num_heads * 2 (head interleaving)
+            * total_padded_heads_x2
+            * align_to(self.head_dim, 128)
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
@@ -679,6 +697,9 @@ class MHATokenToKVPool(KVCache):
         layer_idx = layer_id - self.start_layer
 
         page_size = 1 if is_decode else self.page_size
+
+        k = quantize_to_kv_dtype(k, self.dtype)
+        v = quantize_to_kv_dtype(v, self.dtype)
 
         # Merge k and v into fused format
         fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
@@ -792,6 +813,9 @@ class MSATokenToKVPool(MHATokenToKVPool):
         self.sparse_layer_ids = list(sparse_layer_ids)
         self.index_head_dim = index_head_dim
         self._sparse_map = {g: i for i, g in enumerate(self.sparse_layer_ids)}
+        dtype = kwargs.get("dtype")
+        if is_fp8_dtype(dtype):
+            raise ValueError(f"MSATokenToKVPool does not support FP8 KV cache ({dtype}).")
         super().__init__(**kwargs)
 
     def _create_buffers(self, *, abstract: bool = False):
@@ -921,6 +945,8 @@ class QSATokenToKVPool(MHATokenToKVPool):
         max_reqs: int = 0,
         abstract: bool = False,
     ):
+        if is_fp8_dtype(dtype):
+            raise ValueError(f"QSATokenToKVPool does not support FP8 KV cache ({dtype}).")
         self.indexer_key_dim_raw = indexer_key_dim
         self.indexer_key_dim = MLATokenToKVPool._aligned_indexer_dim(indexer_key_dim)
         self.num_indexer_layers = num_indexer_layers
@@ -1656,6 +1682,11 @@ class MLATokenToKVPool(KVCache):
             raise ValueError("cache feature dimensions must be non-negative")
         if num_indexer_layers and not indexer_key_dim:
             raise ValueError("indexer layers require a positive indexer_key_dim")
+        if is_fp8_dtype(dtype) and (indexer_key_dim > 0 or num_indexer_layers > 0):
+            raise ValueError(
+                f"MLATokenToKVPool does not support FP8 KV cache with DSA indexer layers "
+                f"({indexer_key_dim=}, {num_indexer_layers=}); DSA FP8 KV is tracked in #1776."
+            )
 
         latent_shape = cls._latent_cache_shape(
             total_num_pages=1,
@@ -1692,6 +1723,11 @@ class MLATokenToKVPool(KVCache):
         num_indexer_layers: int = 0,
         abstract: bool = False,
     ):
+        if is_fp8_dtype(dtype) and (indexer_key_dim > 0 or num_indexer_layers > 0):
+            raise ValueError(
+                f"MLATokenToKVPool does not support FP8 KV cache with DSA indexer layers "
+                f"({indexer_key_dim=}, {num_indexer_layers=}); DSA FP8 KV is tracked in #1776."
+            )
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim

@@ -11,7 +11,10 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.hca.compressor import init_hca_state_pool
-from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
+from sgl_jax.srt.kernels.ragged_paged_attention.util import (
+    get_dtype_packing,
+    is_fp8_dtype,
+)
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 
 
@@ -203,6 +206,8 @@ class HCAKVPool(KVCache):
             start_layer,
             end_layer,
         )
+        if is_fp8_dtype(dtype):
+            raise ValueError(f"HCAKVPool does not support FP8 KV cache ({dtype}).")
         if size <= 0 or size % dp_size:
             raise ValueError("HCA token capacity must be positive and divisible by dp_size")
         if max_num_requests <= 0 or max_num_requests % dp_size:

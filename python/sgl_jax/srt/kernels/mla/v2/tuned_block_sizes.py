@@ -367,6 +367,10 @@ def get_tuned_block_sizes_mla(
     )
 
     hit = table.get(key)
+    if hit is None and key[2].startswith("float8_"):
+        fallback_key = (key[0], key[1], "bfloat16", *key[3:])
+        hit = table.get(fallback_key)
+
     if hit is None and key not in _WARNED_MISSES:
         _WARNED_MISSES.add(key)
         logger.info(
