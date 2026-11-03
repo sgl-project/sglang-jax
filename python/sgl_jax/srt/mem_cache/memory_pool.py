@@ -945,6 +945,8 @@ class QSATokenToKVPool(MHATokenToKVPool):
         max_reqs: int = 0,
         abstract: bool = False,
     ):
+        if is_fp8_dtype(dtype):
+            raise ValueError(f"QSATokenToKVPool does not support FP8 KV cache ({dtype}).")
         self.indexer_key_dim_raw = indexer_key_dim
         self.indexer_key_dim = MLATokenToKVPool._aligned_indexer_dim(indexer_key_dim)
         self.num_indexer_layers = num_indexer_layers

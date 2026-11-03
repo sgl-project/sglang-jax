@@ -31,6 +31,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     MSATokenToKVPool,
+    QSATokenToKVPool,
     merge_kv,
 )
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
@@ -631,6 +632,30 @@ def test_mla_pool_rejects_dsa_indexer_fp8():
             mesh=None,
             indexer_key_dim=64,
             num_indexer_layers=2,
+        )
+
+
+def test_runner_rejects_qsa_backend_fp8():
+    """ModelRunnerKVCacheMixin must raise ValueError if backend is 'qsa_sparse' with FP8."""
+    with pytest.raises(ValueError, match="QSA attention backend does not support FP8"):
+        _DummyRunner(kv_cache_dtype_str="fp8", attention_backend="qsa_sparse")
+
+
+def test_qsa_pool_rejects_fp8():
+    """QSATokenToKVPool must raise ValueError for FP8 dtypes."""
+    with pytest.raises(ValueError, match="QSATokenToKVPool does not support FP8"):
+        QSATokenToKVPool(
+            size=128,
+            page_size=64,
+            dtype=jnp.float8_e4m3fn,
+            head_num=2,
+            head_dim=128,
+            layer_num=1,
+            mesh=None,
+            indexer_key_dim=64,
+            num_indexer_layers=1,
+            compress_ratio=1,
+            max_reqs=1,
         )
 
 

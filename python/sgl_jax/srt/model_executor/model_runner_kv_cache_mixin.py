@@ -562,6 +562,8 @@ class ModelRunnerKVCacheMixin:
                 raise ValueError(
                     "DSA attention backend does not support FP8 KV cache (tracked in #1776)."
                 )
+            if self.server_args.attention_backend == "qsa_sparse":
+                raise ValueError("QSA attention backend does not support FP8 KV cache.")
 
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
 
