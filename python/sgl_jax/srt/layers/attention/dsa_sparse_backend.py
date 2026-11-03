@@ -39,6 +39,7 @@ from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_topk,
 )
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
+from sgl_jax.srt.kernels.ragged_paged_attention.util import quantize_to_kv_dtype
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -273,6 +274,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
 
         kv_cache = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+        k_scale = getattr(layer, "k_scale", None) if layer is not None else None
+        new_kv_c = quantize_to_kv_dtype(new_kv_c, kv_cache.dtype, scale=k_scale)
+        new_k_pe = quantize_to_kv_dtype(new_k_pe, kv_cache.dtype, scale=k_scale)
         idx_cache = token_to_kv_pool.get_indexer_key_buffer(slot) if is_full else None
 
         sm_scale = (

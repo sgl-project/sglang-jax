@@ -203,6 +203,8 @@ class HCAKVPool(KVCache):
             start_layer,
             end_layer,
         )
+        if dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+            raise ValueError(f"HCAKVPool does not support FP8 KV cache ({dtype}).")
         if size <= 0 or size % dp_size:
             raise ValueError("HCA token capacity must be positive and divisible by dp_size")
         if max_num_requests <= 0 or max_num_requests % dp_size:

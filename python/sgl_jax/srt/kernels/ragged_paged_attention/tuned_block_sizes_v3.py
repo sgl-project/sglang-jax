@@ -2206,6 +2206,11 @@ def get_tuned_block_sizes_v3(
 
     key = (stage, sliding_window, *signature)
     hit = table.get(key)
+    if hit is None and str(signature[1]).startswith("float8_"):
+        fallback_signature = (signature[0], "bfloat16", *signature[2:])
+        fallback_key = (stage, sliding_window, *fallback_signature)
+        hit = table.get(fallback_key)
+
     if hit is None and key not in _WARNED_MISSES:
         _WARNED_MISSES.add(key)
         logger.info(

@@ -194,8 +194,8 @@ def _sparse_mla_kernel_chunked_hminor(
         v_blk = kv_blk[:, :Dv]  # [CBR, Dv]
         # acc[Hp,Dv] += sum_cbr p[hp,cbr] * v[cbr,dv]
         acc = acc * alpha[:, None] + jax.lax.dot_general(
-            p.astype(kv_blk.dtype),
-            v_blk,
+            p.astype(q.dtype),
+            v_blk.astype(q.dtype),
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )

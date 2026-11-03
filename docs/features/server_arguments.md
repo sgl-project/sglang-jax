@@ -93,8 +93,7 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 | `--dtype-config` | JSON string or JSON file path for submodule-specific dtype overrides. |
 | `--quantization` | Weight quantization method. Supported choices include `awq`, `fp8`, `gptq`, `bitsandbytes`, and related variants. |
 | `--quantization-config-path` | YAML quantization config path or built-in config name. |
-| `--quantization-param-path` | JSON scale file for quantized KV cache paths. |
-| `--kv-cache-dtype` | KV cache dtype: `auto`, `fp8_e5m2`, `fp8_e4m3`, or `bf16`. |
+| `--kv-cache-dtype` | KV cache dtype: `auto`, `bf16`, `bfloat16`, `fp8`, `fp8_e4m3`, or `fp8_e5m2`. `fp8` defaults to `fp8_e4m3`. Validated on TPU v6e/v7x with DeepSeek/Kimi MLA architectures. `fp8_e5m2` has lower precision than `fp8_e4m3`. Models with large activation outliers (e.g., Qwen2.5 without QK-norm) may require calibrated scales to avoid quality degradation. |
 
 `--dtype-config` is an advanced escape hatch. It only affects model code paths that explicitly consume `DtypeConfig`; model-level `--dtype` remains the normal user-facing control.
 

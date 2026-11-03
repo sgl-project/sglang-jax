@@ -158,6 +158,10 @@ class NativeAttention(AttentionBackend):
         k_3d = fused_3d.at[:, ::2, :].get(out_sharding=self.kv_sharding)
         v_3d = fused_3d.at[:, 1::2, :].get(out_sharding=self.kv_sharding)
 
+        if fused_5d.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+            k_3d = k_3d.astype(jnp.bfloat16)
+            v_3d = v_3d.astype(jnp.bfloat16)
+
         return k_3d, v_3d, fused_5d
 
     @staticmethod

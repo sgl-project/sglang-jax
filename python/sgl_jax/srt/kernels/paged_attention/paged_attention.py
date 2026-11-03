@@ -411,6 +411,10 @@ def paged_attention(
             f"k_pages and v_pages must have the same shape. Got {k_pages.shape} and"
             f" {v_pages.shape}"  # pytype: disable=attribute-error
         )
+    if k_pages.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+        raise ValueError(
+            f"paged_attention Triton kernel does not support FP8 KV cache ({k_pages.dtype})."
+        )
     # global_q / global_kv == local_q / local_kv
     if num_heads % num_kv_heads != 0:
         raise ValueError(

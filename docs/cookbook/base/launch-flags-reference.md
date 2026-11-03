@@ -55,8 +55,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--mem-fraction-static` | `None` (→ `0.88` on TPU) | HBM fraction for weights + KV cache. 0.92–0.95 typical for dedicated serving. |
-| `--kv-cache-dtype` | `auto` | `auto` / `fp8_e5m2` / `fp8_e4m3` / `bf16`. Cookbook recipes don't override today. |
+| `--kv-cache-dtype` | `auto` | `auto` / `bf16` / `bfloat16` / `fp8` / `fp8_e4m3` / `fp8_e5m2`. `fp8` maps to `fp8_e4m3` (recommended over `fp8_e5m2`). Models with large K outliers (e.g. Qwen2.5) may experience quality loss without calibrated scales. |
 
 ## 5. Attention & MoE backends
 

@@ -42,6 +42,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     get_dtype_packing,
     get_tpu_version,
     next_power_of_2,
+    quantize_to_kv_dtype,
 )
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
@@ -582,7 +583,7 @@ def _ragged_paged_attention_kernel_loop(
         assert v.shape == (bkv_csz, head_dim)
         assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, head_dim)
-        pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
+        pv = jnp.matmul(p, v.astype(p.dtype), preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
         o_prev = o_ref[...].astype(jnp.float32)
@@ -1254,7 +1255,14 @@ def prepare_inputs(
     k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     attention_sink: jax.Array | float | None = None,  # f32[actual_num_q_heads]
+    kv_cache_dtype: jnp.dtype | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
 ):
+    target_dtype = kv_cache_dtype if kv_cache_dtype is not None else k.dtype
+    k = quantize_to_kv_dtype(k, target_dtype, scale=k_scale)
+    v = quantize_to_kv_dtype(v, target_dtype, scale=v_scale)
+
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
     assert actual_num_q_heads % actual_num_kv_heads == 0
@@ -1364,16 +1372,7 @@ def prepare_updated_kv_cache_fused(
     actual_head_dim: int,
 ):
     """Extract actual KV cache from processed fused format."""
-    (
-        total_num_pages,
-        page_size,
-        num_kv_heads_interleaved_packed,
-        kv_packing,
-        head_dim,
-    ) = kv_cache_fused.shape
-
-    actual_num_kv_heads_interleaved = actual_num_kv_heads * 2
-    return kv_cache_fused[:, :, :actual_num_kv_heads_interleaved]
+    return kv_cache_fused
 
 
 def static_validate_inputs(
@@ -1843,7 +1842,15 @@ def ragged_paged_attention(
     actual_num_kv_heads = k.shape[1]
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
-    q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
+    q, kv, attention_sink = prepare_inputs(
+        q,
+        k,
+        v,
+        attention_sink,
+        kv_cache_dtype=kv_cache_fused.dtype,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
     kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
 
     (

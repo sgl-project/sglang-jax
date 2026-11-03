@@ -1,5 +1,7 @@
 """Utility functions for ragged paged attention."""
 
+import jax
+import jax.numpy as jnp
 from jax._src import dtypes
 
 from sgl_jax.srt.utils.jax_utils import get_device_kind
@@ -66,3 +68,32 @@ def next_power_of_2(x):
     x |= x >> 8
     x |= x >> 16
     return x + 1
+
+
+def quantize_to_kv_dtype(
+    x: jax.Array,
+    dtype: jnp.dtype,
+    scale: jax.Array | float | None = None,
+) -> jax.Array:
+    """Quantize activation tensor to the target KV cache data type.
+
+    If dtype is an FP8 type (e.g. float8_e4m3fn or float8_e5m2), values are scaled
+    (divided by scale if provided and != 1.0) and clipped to the representable range in float32
+    before downcasting, avoiding NaN overflow on out-of-range values.
+    Otherwise, casts directly to dtype (or no-op when already dtype and unscaled).
+    """
+    is_unscaled = scale is None or scale == 1.0
+    if x.dtype == dtype and is_unscaled:
+        return x
+
+    target_dtype = jnp.dtype(dtype)
+    if target_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+        finfo = jnp.finfo(target_dtype)
+        x_f32 = x.astype(jnp.float32)
+        if not is_unscaled:
+            x_f32 = x_f32 / scale
+        return jnp.clip(x_f32, float(finfo.min), float(finfo.max)).astype(target_dtype)
+
+    if not is_unscaled:
+        return (x / scale).astype(target_dtype)
+    return x.astype(target_dtype)
