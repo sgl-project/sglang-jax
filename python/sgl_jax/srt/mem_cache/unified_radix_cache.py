@@ -997,8 +997,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if target_node is not self.root_node:
             self._refresh_component_lru(target_node, LRURefreshPhase.INSERT_END)
 
-        if self._hybrid_hicache and is_new_leaf:
-            self._inc_hit_count(target_node)
         return result
 
     ##### HiCache (L1<->L2) Write Path #####

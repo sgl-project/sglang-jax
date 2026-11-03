@@ -605,6 +605,49 @@ class TestLRUHostKVPoolRankIsolation(unittest.TestCase):
         self.assertEqual(pool.available_size(1), 0)
         self.assertIsNone(pool.alloc(1, dp_rank=1))
 
+    def test_large_pool_small_allocations_preserve_rank_fifo_and_epochs(self):
+        # Exercise the large-pool/small-node workload without a flaky timing gate.
+        for dp_size in (1, 2):
+            with self.subTest(dp_size=dp_size):
+                pool = _make_rank_pool(pool_size=100_001, dp_size=dp_size)
+                rank = dp_size - 1
+                start = sum(pool.total_size(r) for r in range(rank))
+                first = pool.alloc(1, dp_rank=rank)
+                np.testing.assert_array_equal(first, [start])
+                pool.free(first)
+                second = pool.alloc(1, dp_rank=rank)
+                np.testing.assert_array_equal(second, [start + 1])
+                remaining = pool.alloc(pool.available_size(rank), dp_rank=rank)
+                self.assertEqual(int(remaining[-1]), start)
+                self.assertEqual(pool._generation[start], 2)
+                self.assertEqual(pool.available_size(rank), 0)
+                self.assertIsNone(pool.alloc(1, dp_rank=rank))
+                self.assertEqual(pool.available_size(), start)
+                pool.free(np.concatenate([second, remaining]))
+                self.assertEqual(pool.available_size(), 100_001)
+                self.assertEqual(pool.available_size(rank), pool.total_size(rank))
+
+    def test_mixed_reserve_and_batch_free_keep_counts_atomic(self):
+        pool = _make_rank_pool()
+        first = pool.reserve()
+        rank1 = pool.alloc(2, dp_rank=1)
+        self.assertEqual((pool.available_size(), pool.available_size(0)), (2, 2))
+        self.assertEqual(pool._peak_used, 3)
+        pool.pin([int(rank1[1])])
+        with self.assertRaises(RuntimeError):
+            pool.free([first, *rank1])
+        self.assertEqual(pool.available_size(), 2)
+        pool.unpin([int(rank1[1])])
+        pool.release(int(rank1[0]))
+        with self.assertRaises(RuntimeError):
+            pool.free([first, int(rank1[0])])  # A double free must not free first.
+        self.assertEqual((pool.available_size(0), pool.available_size(1)), (2, 1))
+        pool.free([first, first, int(rank1[1])])
+        self.assertEqual(pool.available_size(), 5)
+        self.assertEqual(pool.reserve(), 1)  # Rank 0 preserves FIFO across both APIs.
+        pool.release(1)
+        self.assertEqual(pool.available_size(), 5)
+
     def test_invalid_ranks_fail_without_allocating(self):
         pool = _make_rank_pool()
         for rank in (-1, 2, None):

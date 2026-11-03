@@ -159,7 +159,7 @@ def test_swa_only_admission_preserves_resident_full_pages(
 ):
     from sgl_jax.srt.sampling.sampling_params import SamplingParams
     from sgl_jax.test.mem_cache.test_hybrid_hicache import (
-        insert,
+        insert_and_backup,
         make_cache,
         settle,
         shutdown,
@@ -172,7 +172,7 @@ def test_swa_only_admission_preserves_resident_full_pages(
     resident_lock = None
     try:
         prefix_len = 8 * page
-        full, node = insert(cache, allocator, range(prefix_len))
+        full, node = insert_and_backup(cache, allocator, range(prefix_len))
         settle(cache)
         cache.components[CT.SWA].evict_component(node)
         cache._update_aux_evictable_node_sets(node)
@@ -235,7 +235,7 @@ def test_mixed_swa_window_admission_reaches_real_allocation(
     )
     from sgl_jax.srt.sampling.sampling_params import SamplingParams
     from sgl_jax.test.mem_cache.test_hybrid_hicache import (
-        insert,
+        insert_and_backup,
         make_cache,
         settle,
         shutdown,
@@ -247,7 +247,7 @@ def test_mixed_swa_window_admission_reaches_real_allocation(
     req = None
     allocated = None
     try:
-        full, node = insert(cache, allocator, range(8 * page))
+        full, node = insert_and_backup(cache, allocator, range(8 * page))
         settle(cache)
         parent = cache._split_node(node.key, node, 4 * page)
         cache.components[CT.SWA].evict_component(parent)
@@ -356,7 +356,7 @@ def test_locked_swa_shortage_recomputes_a_chunk_without_retry_stall(
     )
     from sgl_jax.srt.sampling.sampling_params import SamplingParams
     from sgl_jax.test.mem_cache.test_hybrid_hicache import (
-        insert,
+        insert_and_backup,
         make_cache,
         settle,
         shutdown,
@@ -368,7 +368,7 @@ def test_locked_swa_shortage_recomputes_a_chunk_without_retry_stall(
     req = None
     allocated = None
     try:
-        full, node = insert(cache, allocator, range(8 * page))
+        full, node = insert_and_backup(cache, allocator, range(8 * page))
         settle(cache)
         parent = cache._split_node(node.key, node, 4 * page)
         cache.components[CT.SWA].evict_component(parent)

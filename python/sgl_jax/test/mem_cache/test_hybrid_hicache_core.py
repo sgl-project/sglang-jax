@@ -9,6 +9,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixPara
 from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType as CT
 from sgl_jax.test.mem_cache.test_hybrid_hicache import (
     insert,
+    insert_and_backup,
     key,
     make_cache,
     settle,
@@ -96,7 +97,7 @@ def test_swa_internal_writeback_and_short_window_restore():
 def test_second_component_failure_rolls_back_all_destinations(monkeypatch):
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         before = (alloc.full_available_size(), alloc.swa_available_size())
@@ -121,8 +122,8 @@ def test_second_component_failure_rolls_back_all_destinations(monkeypatch):
 def test_failed_restore_discards_only_its_staging(monkeypatch, failure):
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, unrelated = insert(cache, alloc, range(20, 28))
-        _, node = insert(cache, alloc, range(8))
+        _, unrelated = insert_and_backup(cache, alloc, range(20, 28))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=16))
         before = (alloc.full_available_size(), alloc.swa_available_size())
@@ -176,8 +177,8 @@ def test_failed_restore_discards_only_its_staging(monkeypatch, failure):
 def test_executor_rejection_restores_capacity_and_releases_all_locks(component):
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, unrelated = insert(cache, alloc, range(20, 28))
-        _, node = insert(cache, alloc, range(8))
+        _, unrelated = insert_and_backup(cache, alloc, range(20, 28))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=16))
         before = (alloc.full_available_size(), alloc.swa_available_size())
@@ -208,7 +209,7 @@ def test_executor_rejection_restores_capacity_and_releases_all_locks(component):
 def test_cleanup_error_preserves_original_and_continues_safe_cleanup(monkeypatch):
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         before = (alloc.full_available_size(), alloc.swa_available_size())
@@ -241,7 +242,7 @@ def test_cleanup_error_preserves_original_and_continues_safe_cleanup(monkeypatch
 def test_successful_restore_cleanup_error_does_not_attach_to_callers_exception(monkeypatch):
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         cleanup_error = RuntimeError("discard after successful restore failed")
@@ -270,7 +271,7 @@ def test_submit_error_after_enqueue_keeps_restore_resources_protected(monkeypatc
     gate = threading.Event()
     entered = threading.Event()
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         before = (alloc.full_available_size(), alloc.swa_available_size())
@@ -322,7 +323,7 @@ def test_submit_error_after_enqueue_keeps_restore_resources_protected(monkeypatc
 def test_independent_capacity_rejection_and_reset():
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         before = (alloc.full_available_size(), alloc.swa_available_size())
@@ -339,7 +340,7 @@ def test_independent_capacity_rejection_and_reset():
 def test_swa_host_gap_rejects_but_deeper_valid_window_recovers():
     cache, alloc, _ = make_cache(window=4)
     try:
-        _, tail = insert(cache, alloc, range(12))
+        _, tail = insert_and_backup(cache, alloc, range(12))
         settle(cache)
         middle = tail.parent
         cache.components[CT.SWA].evict_component(middle)
@@ -422,7 +423,7 @@ def test_backup_submit_failure_releases_only_definitely_unsubmitted_work(monkeyp
 def test_restore_host_sources_pinned_through_scatter(monkeypatch):
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         controller = cache.hicache_controllers[CT.FULL]
@@ -444,7 +445,7 @@ def test_restore_host_sources_pinned_through_scatter(monkeypatch):
 def test_locked_full_swa_only_healing_preserves_counters():
     cache, alloc, _ = make_cache(window=8)
     try:
-        full, node = insert(cache, alloc, range(8))
+        full, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.components[CT.SWA].evict_component(node)
         lock = cache.inc_lock_ref(node)
@@ -483,7 +484,7 @@ def test_native_partial_submit_awaits_before_healthy_rollback(monkeypatch):
     cache, alloc, pool = make_cache(window=8)
     engines = use_fake_native(cache, pool)
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         cache.evict(EvictParams(num_tokens=8))
         before = (alloc.full_available_size(), alloc.swa_available_size())
 
@@ -504,7 +505,7 @@ def test_native_partial_submit_awaits_before_healthy_rollback(monkeypatch):
 def test_native_uncertain_failure_quarantines_both_component_reservations(monkeypatch):
     cache, alloc, pool = make_cache(window=8)
     engines = use_fake_native(cache, pool)
-    _, node = insert(cache, alloc, range(8))
+    _, node = insert_and_backup(cache, alloc, range(8))
     cache.evict(EvictParams(num_tokens=8))
     before = (alloc.full_available_size(), alloc.swa_available_size())
     original = engines[CT.SWA].h2d
@@ -539,7 +540,7 @@ def test_native_uncertain_failure_quarantines_both_component_reservations(monkey
 def test_mixed_device_and_host_window_only_allocates_missing_swa():
     cache, alloc, _ = make_cache(window=8)
     try:
-        full, tail = insert(cache, alloc, range(12))
+        full, tail = insert_and_backup(cache, alloc, range(12))
         settle(cache)
         # Split the 8-token tail into two pages-of-nodes, then keep the last
         # 4 tokens resident while restoring the preceding 4 from host.
@@ -571,7 +572,7 @@ def test_mixed_device_and_host_window_only_allocates_missing_swa():
 def test_host_splits_use_page_handles_and_boundary_nodes(page, window):
     cache, alloc, _ = make_cache(page=page, window=window)
     try:
-        full, tail = insert(cache, alloc, range(page * 4))
+        full, tail = insert_and_backup(cache, alloc, range(page * 4))
         settle(cache)
         if len(tail.key) > page:
             cache._split_node(tail.key, tail, page)
@@ -591,7 +592,7 @@ def test_host_splits_use_page_handles_and_boundary_nodes(page, window):
 def test_host_pressure_reclaims_both_pools_and_empty_structural_nodes():
     cache, alloc, _ = make_cache(window=4)
     try:
-        _, tail = insert(cache, alloc, range(12))
+        _, tail = insert_and_backup(cache, alloc, range(12))
         settle(cache)
         cache.evict(EvictParams(num_tokens=12))
         assert cache.evict_host(100, component_type=CT.FULL) == 12
@@ -626,7 +627,7 @@ def test_pending_dual_backup_keeps_evicted_tree_node_and_hides_incomplete_hit(mo
 def test_swa_allocation_failure_rolls_back_full_reservation():
     cache, alloc, _ = make_cache(window=8)
     try:
-        _, node = insert(cache, alloc, range(8))
+        _, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         busy_swa = alloc.alloc_swa(alloc.swa_available_size())
@@ -645,7 +646,7 @@ def test_swa_allocation_failure_rolls_back_full_reservation():
 def test_skipped_tombstone_receipt_survives_split_and_healing(fresh_healing):
     cache, alloc, _ = make_cache(window=8)
     try:
-        full, node = insert(cache, alloc, range(8))
+        full, node = insert_and_backup(cache, alloc, range(8))
         settle(cache)
         cache.components[CT.SWA].evict_component(node)
         original_receipt = cache.inc_lock_ref(node)
@@ -713,6 +714,8 @@ def test_recomputed_full_tombstone_adopts_live_swa_suffix_without_leaking(policy
     cache, alloc, _ = make_cache(window=8, policy=policy)
     try:
         _, node = insert(cache, alloc, range(8))
+        if policy == "write_through":
+            cache.write_backup(node)
         settle(cache)
         cache.evict(EvictParams(num_tokens=8))
         settle(cache)

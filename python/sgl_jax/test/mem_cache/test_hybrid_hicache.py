@@ -170,6 +170,13 @@ def insert(cache, allocator, tokens, rank=0):
     )
 
 
+def insert_and_backup(cache, allocator, tokens, rank=0):
+    """Prepare host state explicitly for transfer/ownership tests, independent of WT hits."""
+    indices, node = insert(cache, allocator, tokens, rank=rank)
+    cache.write_backup(node)
+    return indices, node
+
+
 def settle(cache):
     for controller in cache.hicache_controllers.values():
         controller.drain_pending()
@@ -182,10 +189,60 @@ def shutdown(cache):
 
 
 @pytest.mark.parametrize("backend", ["jax", "raiden"])
+@pytest.mark.parametrize("threshold", [1, 2])
+def test_write_through_counts_reuse_not_initial_insert(backend, threshold):
+    cache, allocator, _ = make_cache(backend=backend)
+    if threshold == 1:
+        assert cache.write_through_threshold == 1
+    else:
+        cache.write_through_threshold = threshold
+    try:
+        _, node = insert(cache, allocator, range(8))
+        settle(cache)
+        assert node.hit_count == 0
+        assert all(cd.host_value is None for cd in node.component_data)
+        assert all(pool.available_size() == pool.total_size() for pool in cache.host_pools.values())
+
+        for reuse in range(1, threshold + 1):
+            # Use the real insertion path; duplicate request slots are released
+            # by the cache and the existing prefix receives one reuse hit.
+            _, reused_node = insert(cache, allocator, range(8))
+            assert reused_node is node
+            settle(cache)
+            assert node.hit_count == reuse
+            for component in (CT.FULL, CT.SWA):
+                assert (node.component_data[component].host_value is not None) == (
+                    reuse == threshold
+                )
+        assert allocator.full_available_size() + cache.full_evictable_size() == allocator.size_full
+        assert allocator.swa_available_size() + cache.swa_evictable_size() == allocator.size_swa
+    finally:
+        shutdown(cache)
+
+
+@pytest.mark.parametrize("backend", ["jax", "raiden"])
+def test_write_back_keeps_first_insert_and_reuse_device_only(backend):
+    cache, allocator, _ = make_cache(backend=backend, policy="write_back")
+    try:
+        for _ in range(2):
+            _, node = insert(cache, allocator, range(8))
+            settle(cache)
+            assert all(cd.host_value is None for cd in node.component_data)
+            assert all(
+                pool.available_size() == pool.total_size() for pool in cache.host_pools.values()
+            )
+        cache.evict(EvictParams(num_tokens=8))
+        settle(cache)
+        assert all(node.component_data[ct].host_value is not None for ct in (CT.FULL, CT.SWA))
+    finally:
+        shutdown(cache)
+
+
+@pytest.mark.parametrize("backend", ["jax", "raiden"])
 def test_component_pools_and_swa_only_restore_preserve_full_addresses(backend):
     cache, allocator, pool = make_cache(backend=backend)
     try:
-        full, node = insert(cache, allocator, range(8))
+        full, node = insert_and_backup(cache, allocator, range(8))
         settle(cache)
         old_swa = node.component_data[CT.SWA].value.copy()
         assert cache.host_pools[CT.FULL] is not cache.host_pools[CT.SWA]
@@ -224,6 +281,7 @@ def test_dual_restore_after_overwriting_device_slots(policy, backend):
                 subpool.kv_buffer[layer] = jnp.full_like(buffer, 20 + int(component) * 10 + layer)
         full, node = insert(cache, allocator, range(8))
         if policy == "write_through":
+            cache.write_backup(node)
             settle(cache)
         cache.evict(EvictParams(num_tokens=8, dp_rank=0))
         settle(cache)
@@ -266,6 +324,9 @@ def test_paged_dp2_component_contents_and_rank_isolation(backend, policy, page, 
                 subpool.kv_buffer[layer] = jax.device_put(data, buffer.sharding)
         _, quiet = insert(cache, allocator, range(page * 2), rank=0)
         full, node = insert(cache, allocator, range(page * 2), rank=1)
+        if policy == "write_through":
+            cache.write_backup(quiet)
+            cache.write_backup(node)
         settle(cache)
         quiet_state = (
             allocator.full_available_size(0),

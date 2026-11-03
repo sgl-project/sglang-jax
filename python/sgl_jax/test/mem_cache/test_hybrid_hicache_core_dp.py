@@ -1,12 +1,18 @@
 """Multi-device CPU regression for SWA lock receipts after split (CPU4 suite)."""
 
+from concurrent.futures import Future
+
 import jax
 import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import Req
 from sgl_jax.srt.managers.schedule_policy import PrefillAdder
-from sgl_jax.srt.mem_cache.base_prefix_cache import EvictParams
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -15,6 +21,7 @@ from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType as CT
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.test.mem_cache.test_hybrid_hicache import (
     insert,
+    key,
     make_cache,
     settle,
     shutdown,
@@ -110,6 +117,9 @@ def test_jax_restore_reclaims_other_cache_after_pinning_sources(monkeypatch, pol
                 pool.kv_buffer[layer] = jax.device_put(data, buffer.sharding)
         _, quiet = insert(cache, alloc, range(4 * page), rank=0)
         full, node = insert(cache, alloc, range(8 * page), rank=1)
+        if policy == "write_through":
+            cache.write_backup(quiet)
+            cache.write_backup(node)
         settle(cache)
         fragments = [node]
         if mode == "mixed":
@@ -141,6 +151,8 @@ def test_jax_restore_reclaims_other_cache_after_pinning_sources(monkeypatch, pol
                     data[buffer.shape[0] // 2 + ids] = -99
                     pool.kv_buffer[layer] = jax.device_put(data, buffer.sharding)
         _, victim = insert(cache, alloc, range(100 * page, 128 * page), rank=1)
+        if policy == "write_through":
+            cache.write_backup(victim)
         settle(cache)
         assert alloc.swa_available_size(1) < (4 if mode == "mixed" else 8) * page
         assert cache.swa_evictable_size(1) >= 28 * page
@@ -257,3 +269,112 @@ def test_jax_restore_reclaims_other_cache_after_pinning_sources(monkeypatch, pol
 
 def test_rank1_page128_receipt_acquired_after_split():
     check_receipt_acquired_after_split(page=128, dp_size=2, rank=1)
+
+
+def seed_reused_prefix(cache, alloc, tokens, rank=0):
+    indices, node = insert(cache, alloc, tokens, rank=rank)
+    # Reinsert an already tree-owned prefix as a reuse hit, without requiring
+    # a second full request allocation in these deliberately small pools.
+    cache.insert(InsertParams(key=key(tokens, rank), value=indices, prev_prefix_len=len(tokens)))
+    settle(cache)
+    return node
+
+
+@pytest.mark.parametrize("backend", ["jax", "raiden"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_full_host_pressure_preserves_reachable_prefix_and_quiet_rank(backend, rank):
+    cache, alloc, _ = make_cache(window=4, full_pages=32, swa_pages=32, backend=backend, dp_size=2)
+    try:
+        quiet = seed_reused_prefix(cache, alloc, range(500, 504), rank=1 - rank)
+        cache.evict(EvictParams(num_tokens=4, dp_rank=1 - rank))
+        quiet_handles = quiet.component_data[CT.FULL].host_value.copy()
+        quiet_free = cache.host_pools[CT.FULL].available_size(1 - rank)
+        tail = seed_reused_prefix(cache, alloc, range(12), rank=rank)
+        path = cache._hybrid_coordinator.path(tail)
+        assert [len(n.key) for n in path] == [4, 4, 4]
+        cache.evict(EvictParams(num_tokens=12, dp_rank=rank))
+        capacity = cache.host_pools[CT.FULL].available_size(rank)
+        for i in range(capacity // 4):
+            seed_reused_prefix(cache, alloc, range(100 + 10 * i, 104 + 10 * i), rank=rank)
+            cache.evict(EvictParams(num_tokens=4, dp_rank=rank))
+        assert cache.host_pools[CT.FULL].available_size(rank) == 0
+        seed_reused_prefix(cache, alloc, range(400, 404), rank=rank)
+        assert tail.component_data[CT.FULL].host_value is None
+        assert all(n.component_data[CT.FULL].host_value is not None for n in path[:-1])
+        match = cache.match_prefix(MatchPrefixParams(key=key(range(12), rank)))
+        assert match.host_hit_length == 8
+        restored, _, _ = cache.init_load_back(match.last_host_node, match.host_hit_length)
+        assert len(restored) == 8
+        np.testing.assert_array_equal(quiet.component_data[CT.FULL].host_value, quiet_handles)
+        assert cache.host_pools[CT.FULL].available_size(1 - rank) == quiet_free
+    finally:
+        shutdown(cache)
+
+
+@pytest.mark.parametrize("backend", ["jax", "raiden"])
+def test_full_host_eviction_retains_ancestors_of_pinned_descendant(backend):
+    cache, alloc, _ = make_cache(window=4, backend=backend)
+    try:
+        tail = seed_reused_prefix(cache, alloc, range(12))
+        path = cache._hybrid_coordinator.path(tail)
+        cache.evict(EvictParams(num_tokens=12))
+        handles = list(map(int, tail.component_data[CT.FULL].host_value))
+        cache.host_pools[CT.FULL].pin(handles)
+        tail.component_data[CT.FULL].host_lock_ref += 1
+        try:
+            assert cache.evict_host(12, component_type=CT.FULL) == 0
+            assert all(n.component_data[CT.FULL].host_value is not None for n in path)
+        finally:
+            tail.component_data[CT.FULL].host_lock_ref -= 1
+            cache.host_pools[CT.FULL].unpin(handles)
+        assert cache.evict_host(12, component_type=CT.FULL) == 12
+        assert all(n.component_data[CT.FULL].host_value is None for n in path)
+    finally:
+        shutdown(cache)
+
+
+@pytest.mark.parametrize("length", [8, 12])
+def test_full_host_eviction_protects_pending_descendants(monkeypatch, length):
+    cache, alloc, _ = make_cache(window=4, policy="write_back")
+    try:
+        _, tail = insert(cache, alloc, range(length))
+        parent = cache._hybrid_coordinator.path(tail)[0]
+        cache._hybrid_coordinator.backup_component(parent, CT.FULL)
+        settle(cache)
+        future = Future()
+        monkeypatch.setattr(cache.hicache_controllers[CT.FULL], "write", lambda *args: future)
+        cache._hybrid_coordinator.backup_component(tail, CT.FULL)
+        try:
+            assert cache.evict_host(4, component_type=CT.FULL) == 0
+            assert parent.component_data[CT.FULL].host_value is not None
+        finally:
+            future.set_result(None)
+            cache._hybrid_coordinator.settle(wait=True)
+        assert cache.evict_host(4, component_type=CT.FULL) == 4
+        assert parent.component_data[CT.FULL].host_value is not None
+        assert tail.component_data[CT.FULL].host_value is None
+    finally:
+        shutdown(cache)
+
+
+def test_full_host_eviction_crosses_empty_host_nodes_and_respects_leaf_lru():
+    cache, alloc, _ = make_cache(window=4, policy="write_back")
+    try:
+        _, tail = insert(cache, alloc, range(12))
+        path = cache._hybrid_coordinator.path(tail)
+        _, other = insert(cache, alloc, range(100, 104))
+        for node in (path[0], tail, other):
+            cache._hybrid_coordinator.backup_component(node, CT.FULL)
+        settle(cache)
+        assert path[1].component_data[CT.FULL].host_value is None
+        path[0].last_access_time = 1
+        other.last_access_time = 2
+        tail.last_access_time = 3
+        assert cache.evict_host(4, component_type=CT.FULL) == 4
+        assert other.component_data[CT.FULL].host_value is None
+        assert path[0].component_data[CT.FULL].host_value is not None
+        assert cache.evict_host(8, component_type=CT.FULL) == 8
+        assert path[0].component_data[CT.FULL].host_value is None
+        assert tail.component_data[CT.FULL].host_value is None
+    finally:
+        shutdown(cache)

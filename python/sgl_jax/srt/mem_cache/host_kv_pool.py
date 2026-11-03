@@ -23,6 +23,7 @@ import abc
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -345,11 +346,17 @@ class LRUHostKVPool(HostKVPool):
         self._pad_to_page_bucket = _pad_to_page_bucket
 
         self._lock = threading.Lock()
-        self._free_ids: list[int] = list(range(pool_size))
+        # Rank-local FIFO queues keep small allocations independent of pool size.
+        self._free_ids_by_rank: list[deque[int]] = []
+        start = 0
+        for capacity in self._rank_capacity:
+            self._free_ids_by_rank.append(deque(range(start, start + capacity)))
+            start += capacity
+        self._free_count = pool_size
         self._slots: list[jax.Array | None] = [None] * pool_size
         self._lock_ref: list[int] = [0] * pool_size
-        # Allocated-state mirror of the free-list (O(1) membership for the
-        # page-id boundary checks below; a bare ``in self._free_ids`` is O(n)).
+        # O(1) allocation checks, including double-free validation, avoid
+        # searching the free queues.
         self._allocated: list[bool] = [False] * pool_size
         # Per-slot allocation epoch, bumped on every alloc (reserve/alloc). A
         # transfer captures the epoch at entry and re-checks it at publish: a
@@ -383,8 +390,8 @@ class LRUHostKVPool(HostKVPool):
         # evict (only the tree cache knows which buffer_id a node points at), so
         # the tree cache must release an LRU slot before retrying.
         with self._lock:
-            free_rank0 = next((pid for pid in self._free_ids if self._handle_rank[pid] == 0), None)
-            if free_rank0 is None:
+            free_rank0 = self._free_ids_by_rank[0]
+            if not free_rank0:
                 self._exhaust_count += 1
                 now = time.time()
                 if now - self._last_exhaust_log >= 1.0:
@@ -398,11 +405,11 @@ class LRUHostKVPool(HostKVPool):
                         self._exhaust_count,
                     )
                 return None
-            buffer_id = free_rank0
-            self._free_ids.remove(buffer_id)
+            buffer_id = free_rank0.popleft()
+            self._free_count -= 1
             self._allocated[buffer_id] = True
             self._generation[buffer_id] += 1
-            used = self._pool_size - len(self._free_ids)
+            used = self._pool_size - self._free_count
             if used > self._peak_used:
                 self._peak_used = used
             return buffer_id
@@ -411,7 +418,7 @@ class LRUHostKVPool(HostKVPool):
         with self._lock:
             if not (0 <= buffer_id < self._pool_size):
                 raise ValueError(f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})")
-            if buffer_id in self._free_ids:
+            if not self._allocated[buffer_id]:
                 raise RuntimeError(f"double free of buffer_id={buffer_id}")
             if self._lock_ref[buffer_id] != 0:
                 raise RuntimeError(
@@ -421,7 +428,8 @@ class LRUHostKVPool(HostKVPool):
             self._drop_pending(buffer_id)
             self._slots[buffer_id] = None
             self._allocated[buffer_id] = False
-            self._free_ids.append(buffer_id)
+            self._free_ids_by_rank[self._handle_rank[buffer_id]].append(buffer_id)
+            self._free_count += 1
 
     # Page-batch alloc/free: the batched, page-addressed counterparts of
     # reserve/release. The control plane speaks PAGE ids; each slot holds exactly
@@ -438,7 +446,7 @@ class LRUHostKVPool(HostKVPool):
             raise ValueError(f"need_pages must be positive, got {need_pages}")
         self._validate_rank(dp_rank)
         with self._lock:
-            free_rank = [pid for pid in self._free_ids if self._handle_rank[pid] == dp_rank]
+            free_rank = self._free_ids_by_rank[dp_rank]
             if len(free_rank) < need_pages:
                 self._exhaust_count += 1
                 now = time.time()
@@ -454,13 +462,12 @@ class LRUHostKVPool(HostKVPool):
                         self._exhaust_count,
                     )
                 return None
-            pages = free_rank[:need_pages]
-            for pid in pages:
-                self._free_ids.remove(pid)
+            pages = [free_rank.popleft() for _ in range(need_pages)]
+            self._free_count -= need_pages
             for pid in pages:
                 self._allocated[pid] = True
                 self._generation[pid] += 1
-            used = self._pool_size - len(self._free_ids)
+            used = self._pool_size - self._free_count
             if used > self._peak_used:
                 self._peak_used = used
         return np.asarray(pages, dtype=np.int64)
@@ -479,7 +486,7 @@ class LRUHostKVPool(HostKVPool):
             for pid in unique:
                 if not (0 <= pid < self._pool_size):
                     raise ValueError(f"page id={pid} outside pool range [0, {self._pool_size})")
-                if pid in self._free_ids:
+                if not self._allocated[pid]:
                     raise RuntimeError(f"double free of page id={pid}")
                 if self._lock_ref[pid] != 0:
                     raise RuntimeError(
@@ -489,7 +496,8 @@ class LRUHostKVPool(HostKVPool):
                 self._drop_pending(pid)
                 self._slots[pid] = None
                 self._allocated[pid] = False
-                self._free_ids.append(pid)
+                self._free_ids_by_rank[self._handle_rank[pid]].append(pid)
+                self._free_count += 1
 
     def stage_backup(self, device_indices: list[int], host_buffer_ids: list[int]) -> None:
         """D2H phase 1: gather live device pages into per-buffer staging arrays.
@@ -854,8 +862,8 @@ class LRUHostKVPool(HostKVPool):
             self._validate_rank(dp_rank)
         with self._lock:
             if dp_rank is None:
-                return len(self._free_ids)
-            return sum(self._handle_rank[pid] == dp_rank for pid in self._free_ids)
+                return self._free_count
+            return len(self._free_ids_by_rank[dp_rank])
 
     def total_size(self, dp_rank: int | None = None) -> int:
         """Total page slots in the pool (free + in-use)."""

@@ -7,6 +7,7 @@ finishes at the donation barrier before the scheduler builds SWA request indices
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import replace
 
 import numpy as np
@@ -100,7 +101,26 @@ class HybridHiCache:
             node = stack.pop()
             stack.extend(node.children.values())
             nodes.append(node)
-        for node in sorted(nodes, key=lambda n: n.last_access_time):
+        if ct == CT.FULL:
+            # A FULL host copy must outlive its host-backed descendants. Count
+            # pending backups too: their handles are not published yet, but
+            # they will need the same ancestor prefix when they complete.
+            subtree = {}
+            for node in reversed(nodes):
+                cd = node.component_data[ct]
+                subtree[node] = int(
+                    cd.host_value is not None or cd.metadata.get("host_pending", False)
+                ) + sum(subtree[child] for child in node.children.values())
+            candidates = [
+                node
+                for node in nodes
+                if node.component_data[ct].host_value is not None and subtree[node] == 1
+            ]
+        else:
+            candidates = nodes
+        heapq.heapify(candidates)
+        while freed < count and candidates:
+            node = heapq.heappop(candidates)
             cd = node.component_data[ct]
             if cd.host_value is None or cd.host_lock_ref or cd.lock_ref:
                 continue
@@ -113,12 +133,21 @@ class HybridHiCache:
             controller.evict_callback(handles)
             cd.host_value = None
             freed += len(handles)
+            if ct == CT.FULL:
+                current = node
+                while current is not self.cache.root_node:
+                    subtree[current] -= 1
+                    if (
+                        current is not node
+                        and subtree[current] == 1
+                        and current.component_data[ct].host_value is not None
+                    ):
+                        heapq.heappush(candidates, current)
+                    current = current.parent
             self.cache._update_evictable_leaf_sets(node)
             # Keep ancestors while descendants own resources, and prune only
             # empty leaves after their final component relinquishes ownership.
             self.prune_empty(node)
-            if freed >= count:
-                break
         return freed
 
     def backup_component(self, node, ct):
