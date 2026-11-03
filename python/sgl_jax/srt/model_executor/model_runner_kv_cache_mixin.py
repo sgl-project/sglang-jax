@@ -20,6 +20,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     get_dtype_packing,
     get_tpu_version,
+    is_fp8_dtype,
 )
 from sgl_jax.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -516,15 +517,20 @@ class ModelRunnerKVCacheMixin:
     def _init_kv_cache_dtype(self: ModelRunner):
         """Resolve kv_cache_dtype from server_args."""
         kv_cache_dtype = self.server_args.kv_cache_dtype
+        fp8_mapping = {
+            "fp8": jnp.float8_e4m3fn,
+            "fp8_e4m3": jnp.float8_e4m3fn,
+            "fp8_e5m2": jnp.float8_e5m2,
+        }
         if kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif kv_cache_dtype in ("bfloat16", "bf16"):
             self.kv_cache_dtype = jnp.bfloat16
-        elif kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        elif kv_cache_dtype in fp8_mapping:
             tpu_version = get_tpu_version()
-            if 0 < tpu_version < 6:
+            if 0 < tpu_version < 7:
                 logger.warning(
-                    "FP8 KV cache is only validated on TPU v6e/v7x, but detected TPU v%d. "
+                    "FP8 KV cache is only validated on TPU v7x, but detected TPU v%d. "
                     "Execution may encounter unsupported operations or degraded performance.",
                     tpu_version,
                 )
@@ -533,21 +539,7 @@ class ModelRunnerKVCacheMixin:
                 "accuracy may degrade for models with large K/V activations (e.g. Qwen2.5). "
                 "Validate accuracy for your model."
             )
-            self.kv_cache_dtype = jnp.float8_e4m3fn
-        elif kv_cache_dtype == "fp8_e5m2":
-            tpu_version = get_tpu_version()
-            if 0 < tpu_version < 6:
-                logger.warning(
-                    "FP8 KV cache is only validated on TPU v6e/v7x, but detected TPU v%d. "
-                    "Execution may encounter unsupported operations or degraded performance.",
-                    tpu_version,
-                )
-            logger.warning(
-                "FP8 KV cache is using scale 1.0 (no calibrated k/v scales); "
-                "accuracy may degrade for models with large K/V activations (e.g. Qwen2.5). "
-                "Validate accuracy for your model."
-            )
-            self.kv_cache_dtype = jnp.float8_e5m2
+            self.kv_cache_dtype = fp8_mapping[kv_cache_dtype]
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {kv_cache_dtype}. "
@@ -555,16 +547,8 @@ class ModelRunnerKVCacheMixin:
             )
 
         # Validate backend compatibility for FP8 KV cache
-        if self.kv_cache_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
-            if self.server_args.attention_backend == "tt":
-                raise ValueError("TT attention backend does not support FP8 KV cache.")
-            from sgl_jax.srt.layers.attention.msa_backend import msa_sparse_config
-
-            if getattr(self, "is_msa", False) or (
-                getattr(self, "model_config", None) is not None
-                and msa_sparse_config(self.model_config) is not None
-            ):
-                raise ValueError("MSA models (MiniMax-M3) do not currently support FP8 KV cache.")
+        if is_fp8_dtype(self.kv_cache_dtype) and self.server_args.attention_backend == "tt":
+            raise ValueError("TT attention backend does not support FP8 KV cache.")
 
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
 

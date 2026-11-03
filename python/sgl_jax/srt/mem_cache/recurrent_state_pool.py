@@ -12,6 +12,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.kernels.ragged_paged_attention.util import is_fp8_dtype
+
 # Module-level cache for jitted zero-allocators (recurrent/conv buffers).
 _RECURRENT_ZERO_ALLOCATOR_CACHE: dict = {}
 
@@ -104,10 +106,7 @@ class RecurrentStatePool:
             temporal_dtype = state_dtype.temporal
         if conv_dtype is None:
             conv_dtype = state_dtype.conv
-        if temporal_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2) or conv_dtype in (
-            jnp.float8_e4m3fn,
-            jnp.float8_e5m2,
-        ):
+        if is_fp8_dtype(temporal_dtype) or is_fp8_dtype(conv_dtype):
             raise ValueError(
                 f"RecurrentStatePool does not support FP8 state ({temporal_dtype=}, {conv_dtype=}). "
                 "State must remain BF16/FP32."

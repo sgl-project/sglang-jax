@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     get_dtype_packing,
+    is_fp8_dtype,
     quantize_to_kv_dtype,
 )
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
@@ -813,7 +814,7 @@ class MSATokenToKVPool(MHATokenToKVPool):
         self.index_head_dim = index_head_dim
         self._sparse_map = {g: i for i, g in enumerate(self.sparse_layer_ids)}
         dtype = kwargs.get("dtype")
-        if dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+        if is_fp8_dtype(dtype):
             raise ValueError(f"MSATokenToKVPool does not support FP8 KV cache ({dtype}).")
         super().__init__(**kwargs)
 

@@ -70,6 +70,14 @@ def next_power_of_2(x):
     return x + 1
 
 
+def is_fp8_dtype(dtype) -> bool:
+    """Return True if dtype is an FP8 floating point format."""
+    try:
+        return jnp.dtype(dtype) in (jnp.float8_e4m3fn, jnp.float8_e5m2)
+    except (TypeError, ValueError):
+        return False
+
+
 def quantize_to_kv_dtype(
     x: jax.Array,
     dtype: jnp.dtype,
@@ -87,7 +95,7 @@ def quantize_to_kv_dtype(
         return x
 
     target_dtype = jnp.dtype(dtype)
-    if target_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+    if is_fp8_dtype(target_dtype):
         finfo = jnp.finfo(target_dtype)
         x_f32 = x.astype(jnp.float32)
         if not is_unscaled:

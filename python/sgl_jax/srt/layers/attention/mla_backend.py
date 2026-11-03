@@ -304,10 +304,8 @@ class MLAAttentionBackend(AttentionBackend):
         q_pe = q_rope
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
-        k_scale = getattr(layer, "k_scale", None) if layer is not None else None
-        v_scale = getattr(layer, "v_scale", None) if layer is not None else None
-        new_kv_c = quantize_to_kv_dtype(new_kv_c, cache.dtype, scale=k_scale)
-        new_k_pe = quantize_to_kv_dtype(new_k_pe, cache.dtype, scale=k_scale)
+        new_kv_c = quantize_to_kv_dtype(new_kv_c, cache.dtype)
+        new_k_pe = quantize_to_kv_dtype(new_k_pe, cache.dtype)
 
         sm_scale = (
             (1.0 / jnp.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
@@ -358,8 +356,6 @@ class MLAAttentionBackend(AttentionBackend):
                 cu_kv_lens_,
                 distribution_,
                 sm_scale=sm_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
                 num_kv_pages_per_block=self.num_kv_pages_per_block,
