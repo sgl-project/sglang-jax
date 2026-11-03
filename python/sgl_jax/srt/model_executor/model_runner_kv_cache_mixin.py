@@ -555,8 +555,13 @@ class ModelRunnerKVCacheMixin:
             )
 
         # Validate backend compatibility for FP8 KV cache
-        if is_fp8_dtype(self.kv_cache_dtype) and self.server_args.attention_backend == "tt":
-            raise ValueError("TT attention backend does not support FP8 KV cache.")
+        if is_fp8_dtype(self.kv_cache_dtype):
+            if self.server_args.attention_backend == "tt":
+                raise ValueError("TT attention backend does not support FP8 KV cache.")
+            if self.server_args.attention_backend == "dsa_sparse":
+                raise ValueError(
+                    "DSA attention backend does not support FP8 KV cache (tracked in #1776)."
+                )
 
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
 

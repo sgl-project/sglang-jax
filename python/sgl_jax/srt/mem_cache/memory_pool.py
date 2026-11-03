@@ -1680,6 +1680,11 @@ class MLATokenToKVPool(KVCache):
             raise ValueError("cache feature dimensions must be non-negative")
         if num_indexer_layers and not indexer_key_dim:
             raise ValueError("indexer layers require a positive indexer_key_dim")
+        if is_fp8_dtype(dtype) and (indexer_key_dim > 0 or num_indexer_layers > 0):
+            raise ValueError(
+                f"MLATokenToKVPool does not support FP8 KV cache with DSA indexer layers "
+                f"({indexer_key_dim=}, {num_indexer_layers=}); DSA FP8 KV is tracked in #1776."
+            )
 
         latent_shape = cls._latent_cache_shape(
             total_num_pages=1,
@@ -1716,6 +1721,11 @@ class MLATokenToKVPool(KVCache):
         num_indexer_layers: int = 0,
         abstract: bool = False,
     ):
+        if is_fp8_dtype(dtype) and (indexer_key_dim > 0 or num_indexer_layers > 0):
+            raise ValueError(
+                f"MLATokenToKVPool does not support FP8 KV cache with DSA indexer layers "
+                f"({indexer_key_dim=}, {num_indexer_layers=}); DSA FP8 KV is tracked in #1776."
+            )
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim

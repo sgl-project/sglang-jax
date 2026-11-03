@@ -29,6 +29,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
 from sgl_jax.srt.mem_cache.hca_pool import HCAKVPool
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
+    MLATokenToKVPool,
     MSATokenToKVPool,
     merge_kv,
 )
@@ -609,6 +610,28 @@ def test_runner_rejects_tt_backend_fp8():
     """ModelRunnerKVCacheMixin must raise ValueError if backend is 'tt' with FP8."""
     with pytest.raises(ValueError, match="TT attention backend does not support FP8"):
         _DummyRunner(kv_cache_dtype_str="fp8", attention_backend="tt")
+
+
+def test_runner_rejects_dsa_backend_fp8():
+    """ModelRunnerKVCacheMixin must raise ValueError if backend is 'dsa_sparse' with FP8."""
+    with pytest.raises(ValueError, match="DSA attention backend does not support FP8 KV cache"):
+        _DummyRunner(kv_cache_dtype_str="fp8", attention_backend="dsa_sparse")
+
+
+def test_mla_pool_rejects_dsa_indexer_fp8():
+    """MLATokenToKVPool must raise ValueError for FP8 dtypes when DSA indexer layers are present."""
+    with pytest.raises(ValueError, match="DSA FP8 KV is tracked in #1776"):
+        MLATokenToKVPool(
+            size=128,
+            page_size=128,
+            dtype=jnp.float8_e4m3fn,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=2,
+            mesh=None,
+            indexer_key_dim=64,
+            num_indexer_layers=2,
+        )
 
 
 # ==============================================================================
