@@ -192,6 +192,56 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class KimiK2Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Kimi-K2 thinking models (e.g. Kimi-K2.5).
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    The chat template ends the generation prompt with `<think>` (or `<think></think>` when
+    `thinking=False`, which serving_chat gates out in `_get_reasoning_from_request`), so the
+    completion starts mid-reasoning without the start tag.
+
+    Kimi-K2 can open the tool-call section before it emits `</think>`. Reasoning therefore ends
+    at whichever of `</think>` / `<|tool_calls_section_begin|>` comes first, and a `</think>`
+    that shows up after that point is dropped instead of leaking into the content (same as
+    vLLM's kimi_k2 parser). All markers are single tokens, so they never straddle two chunks.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<|tool_calls_section_begin|>",
+        )
+
+    def _drop_think_end_after_tool_start(self, text: str) -> str:
+        tool_idx = text.find(self.tool_start_token)
+        end_idx = text.find(self.think_end_token)
+        if tool_idx == -1 or -1 < end_idx < tool_idx:
+            return text
+        return text[:tool_idx] + text[tool_idx:].replace(self.think_end_token, "")
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = super().detect_and_parse(self._drop_think_end_after_tool_start(text))
+        ret.normal_text = ret.normal_text.replace(self.think_end_token, "")
+        return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if not self._in_reasoning:
+            # Reasoning already ended: pass content through, minus any late `</think>`.
+            return StreamingParseResult(normal_text=new_text.replace(self.think_end_token, ""))
+        ret = super().parse_streaming_increment(self._drop_think_end_after_tool_start(new_text))
+        ret.normal_text = ret.normal_text.replace(self.think_end_token, "")
+        return ret
+
+
 class Glm45Detector(BaseReasoningFormatDetector):
     """
     Detector for GLM-4.5 / 4.6 / 4.7 models.
@@ -328,6 +378,7 @@ class ReasoningParser:
         "qwen3": Qwen3Detector,
         "mimo": Qwen3Detector,
         "kimi": KimiDetector,
+        "kimi_k2": KimiK2Detector,
         "glm45": Glm45Detector,
         "gemma4": Gemma4Detector,
         "ling3": Ling3Detector,
