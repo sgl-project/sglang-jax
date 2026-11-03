@@ -41,6 +41,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     get_dtype_bitwidth,
     get_dtype_packing,
     get_tpu_version,
+    is_fp8_dtype,
     next_power_of_2,
     quantize_to_kv_dtype,
 )
@@ -1568,6 +1569,30 @@ def get_default_block_sizes(
     sliding_window: int | None = None,
 ):
     """Get (bq_sz, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas."""
+    if is_fp8_dtype(kv_dtype):
+        # FP8 uses BF16's default block sizes: identical tiles avoid oversized
+        # padded tiles (min_bkv_sz_to_peak doubles for fp8 and smaller VMEM footprint
+        # prevents halving), and VMEM is guaranteed <= BF16.
+        defaults = get_default_block_sizes(
+            q_dtype,
+            jnp.bfloat16,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            head_dim,
+            page_size,
+            max_num_tokens,
+            max_num_seqs,
+            pages_per_seq,
+            case=case,
+            vmem_limit_bytes=vmem_limit_bytes,
+            use_custom_mask=use_custom_mask,
+            sliding_window=sliding_window,
+        )
+        bkv_alignment = max(page_size, get_dtype_packing(kv_dtype))
+        defaults["bkv_sz"] = align_to(defaults["bkv_sz"], bkv_alignment)
+        defaults["bkv_csz"] = align_to(defaults["bkv_csz"], bkv_alignment)
+        return defaults
+
     tpu_version = get_tpu_version()
 
     kv_packing = get_dtype_packing(kv_dtype)
@@ -2115,6 +2140,35 @@ def ragged_paged_attention(
             if tuned is not None:
                 block_sizes = tuned
             else:
+                default_kv_dtype = kv_cache_fused_processed.dtype
+                if is_fp8_dtype(default_kv_dtype):
+                    # FP8 uses BF16's default block sizes: identical tiles,
+                    # VMEM footprint is <= BF16, and avoids oversized padded
+                    # tiles from min_bkv_sz_to_peak doubling.
+                    default_block_sizes = get_default_block_sizes(
+                        q.dtype,
+                        jnp.bfloat16,
+                        actual_num_q_heads,
+                        actual_num_kv_heads,
+                        head_dim,
+                        page_size,
+                        max_num_tokens,
+                        max_num_seqs,
+                        pages_per_seq,
+                        case=case,
+                        vmem_limit_bytes=vmem_limit_bytes,
+                        use_custom_mask=custom_mask is not None,
+                        sliding_window=sliding_window,
+                    )
+                    bkv_alignment = max(page_size, get_dtype_packing(default_kv_dtype))
+                    default_block_sizes["bkv_sz"] = align_to(
+                        default_block_sizes["bkv_sz"], bkv_alignment
+                    )
+                    default_block_sizes["bkv_csz"] = align_to(
+                        default_block_sizes["bkv_csz"], bkv_alignment
+                    )
+                    return default_block_sizes
+
                 return get_default_block_sizes(
                     q.dtype,
                     kv_cache_fused_processed.dtype,
