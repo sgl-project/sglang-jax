@@ -142,6 +142,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.debug("Disabling thinking mode: incompatible with structural_tag grammar")
             request.chat_template_kwargs.setdefault("enable_thinking", False)
 
+        # tool_choice="required"/named uses a json_schema grammar that applies from the first
+        # generated token, but Kimi-K2's template opens <think> in the prompt, so the forced
+        # JSON would be parsed as reasoning and the tool call lost. Default Kimi's template
+        # switch (`thinking`, not `enable_thinking`) off so the prompt ends with <think></think>.
+        if (
+            tool_call_constraint
+            and tool_call_constraint[0] == "json_schema"
+            and self.tokenizer_manager.server_args.reasoning_parser == "kimi_k2"
+        ):
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            request.chat_template_kwargs.setdefault("thinking", False)
+
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
@@ -713,6 +726,7 @@ Assistant: {% endif %}"""
                     tool_call_parser,
                     finish_reason,
                     tool_choice=request.tool_choice,
+                    history_tool_calls_cnt=self._get_history_tool_calls_cnt(request),
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -804,6 +818,7 @@ Assistant: {% endif %}"""
         tool_call_parser: str | None,
         finish_reason: dict[str, Any],
         tool_choice: ToolChoice | str = "auto",
+        history_tool_calls_cnt: int = 0,
     ) -> tuple[list[ToolCall] | None, str, dict[str, Any]]:
         """Process tool calls in the response"""
         parser = FunctionCallParser(tools, tool_call_parser)
@@ -815,12 +830,12 @@ Assistant: {% endif %}"""
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = [
                     ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:24]}",
+                        id=self._process_tool_call_id(call_info.name, i, history_tool_calls_cnt),
                         function=FunctionResponse(
                             name=call_info.name, arguments=call_info.parameters
                         ),
                     )
-                    for call_info in call_info_list
+                    for i, call_info in enumerate(call_info_list)
                 ]
                 return tool_calls, text, finish_reason
             except Exception as e:
@@ -843,13 +858,15 @@ Assistant: {% endif %}"""
                         finish_reason["matched"] = None
                     tool_calls = [
                         ToolCall(
-                            id=f"call_{uuid.uuid4().hex[:24]}",
+                            id=self._process_tool_call_id(
+                                call_info.name, i, history_tool_calls_cnt
+                            ),
                             function=FunctionResponse(
                                 name=call_info.name,
                                 arguments=call_info.parameters,
                             ),
                         )
-                        for call_info in call_info_list
+                        for i, call_info in enumerate(call_info_list)
                     ]
                     return tool_calls, "", finish_reason
             except Exception as e:
@@ -857,6 +874,25 @@ Assistant: {% endif %}"""
                 return None, text, finish_reason
 
         return None, text, finish_reason
+
+    def _process_tool_call_id(self, name: str, tool_index: int, history_tool_calls_cnt: int) -> str:
+        """Generate a new and unique `tool_call_id`.
+
+        Kimi-K2 IDs are `functions.{name}:{idx}`, where idx counts tool calls across the whole
+        conversation; the chat template renders these IDs back into the prompt on the next turn.
+        A random ID is sufficient for every other parser.
+        """
+        if self.tokenizer_manager.server_args.tool_call_parser != "kimi_k2":
+            return f"call_{uuid.uuid4().hex[:24]}"
+        return f"functions.{name}:{history_tool_calls_cnt + tool_index}"
+
+    def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
+        """Count the tool calls made by assistant messages in the request history."""
+        return sum(
+            len(getattr(msg, "tool_calls", None) or [])
+            for msg in request.messages
+            if msg.role == "assistant"
+        )
 
     def _process_streaming_logprobs(
         self, content: dict[str, Any], n_prev_token: int
@@ -903,6 +939,9 @@ Assistant: {% endif %}"""
             return kwargs.get("enable_thinking") is not False
         if parser == "mimo":
             return kwargs.get("enable_thinking") is True
+        if parser == "kimi_k2":
+            # Kimi-K2.5's template reads `thinking` (default on) and ignores `enable_thinking`.
+            return kwargs.get("thinking") is not False
         return True
 
     async def _process_tool_call_stream(
@@ -944,7 +983,11 @@ Assistant: {% endif %}"""
             # Tool call ID should be generated only once per tool call
             if call_item.name:
                 # First chunk: include ID and function name
-                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_call_id = self._process_tool_call_id(
+                    call_item.name,
+                    call_item.tool_index,
+                    self._get_history_tool_calls_cnt(request),
+                )
                 function_name = call_item.name
             else:
                 # Subsequent chunks: null ID and name for argument deltas
@@ -964,8 +1007,11 @@ Assistant: {% endif %}"""
                 actual_call = parser.detector.streamed_args_for_tool[index]
                 if latest_delta_len > 0:
                     actual_call = actual_call[:-latest_delta_len]
-                remaining_call = expected_call.replace(actual_call, "", 1)
-                call_item.parameters = remaining_call
+                # Only top up when the streamed arguments (incl. this delta) are a prefix of the
+                # parsed ones. Detectors that stream raw argument text (e.g. kimi_k2) keep
+                # "arguments" as {}, and overwriting their delta would corrupt the JSON.
+                if expected_call.startswith(actual_call + call_item.parameters):
+                    call_item.parameters = expected_call[len(actual_call) :]
                 finish_reason_type = "tool_calls"
 
             tool_call = ToolCall(
