@@ -2140,35 +2140,6 @@ def ragged_paged_attention(
             if tuned is not None:
                 block_sizes = tuned
             else:
-                default_kv_dtype = kv_cache_fused_processed.dtype
-                if is_fp8_dtype(default_kv_dtype):
-                    # FP8 uses BF16's default block sizes: identical tiles,
-                    # VMEM footprint is <= BF16, and avoids oversized padded
-                    # tiles from min_bkv_sz_to_peak doubling.
-                    default_block_sizes = get_default_block_sizes(
-                        q.dtype,
-                        jnp.bfloat16,
-                        actual_num_q_heads,
-                        actual_num_kv_heads,
-                        head_dim,
-                        page_size,
-                        max_num_tokens,
-                        max_num_seqs,
-                        pages_per_seq,
-                        case=case,
-                        vmem_limit_bytes=vmem_limit_bytes,
-                        use_custom_mask=custom_mask is not None,
-                        sliding_window=sliding_window,
-                    )
-                    bkv_alignment = max(page_size, get_dtype_packing(default_kv_dtype))
-                    default_block_sizes["bkv_sz"] = align_to(
-                        default_block_sizes["bkv_sz"], bkv_alignment
-                    )
-                    default_block_sizes["bkv_csz"] = align_to(
-                        default_block_sizes["bkv_csz"], bkv_alignment
-                    )
-                    return default_block_sizes
-
                 return get_default_block_sizes(
                     q.dtype,
                     kv_cache_fused_processed.dtype,
