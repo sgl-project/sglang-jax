@@ -217,6 +217,12 @@ class FusedEPMoE(nnx.Module):
             return
         if is_static and is_int4_dtype(self.quantized_dtype):
             raise ValueError("Static INT4 checkpoints require moe_backend='epmoe'.")
+        if (
+            not is_static
+            and self.w1_scale is not None
+            and getattr(self.w1.value, "dtype", None) == self.quantized_dtype
+        ):
+            return
 
         # Determine quant_block_k. The v1 kernel requires a block size when
         # scales are provided, so per-channel fp8 must tile to block-256; the v2
@@ -329,7 +335,12 @@ class FusedEPMoE(nnx.Module):
 
                 return
 
-            # Replace original weights with quantized versions
+            # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
+            ep_sharding = P(("data", "tensor"), None, None)
+            ep_scale_sharding = P(("data", "tensor"), None, None, None)
+
+            # Replace original weights with quantized versions one by one so
+            # each BF16 expert tensor is freed before quantizing the next.
             if self.quant_block_n is not None:
                 # 2D block-wise quantization: scale shape (E, K//block_k, N//block_n)
                 w1_value, w1_scale = quantize_tensor(
@@ -338,18 +349,24 @@ class FusedEPMoE(nnx.Module):
                     axis=(1, 2),
                     block_size=[self.quant_block_k, self.quant_block_n],
                 )
+                self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
+                del w1_value
                 w3_value, w3_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3.value,
                     axis=(1, 2),
                     block_size=[self.quant_block_k, self.quant_block_n],
                 )
+                self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
+                del w3_value
                 w2_value, w2_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2.value,
                     axis=(1, 2),
                     block_size=[self.quant_block_k, self.quant_block_n],
                 )
+                self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
+                del w2_value
             else:
                 # 1D sub-channel quantization: scale shape (E, K//wsz, N)
                 w1_value, w1_scale = quantize_tensor(
@@ -358,26 +375,24 @@ class FusedEPMoE(nnx.Module):
                     axis=1,
                     block_size=self.quant_block_k,
                 )
+                self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
+                del w1_value
                 w3_value, w3_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3.value,
                     axis=1,
                     block_size=self.quant_block_k,
                 )
+                self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
+                del w3_value
                 w2_value, w2_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2.value,
                     axis=1,
                     block_size=self.quant_block_k,
                 )
-
-            # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
-            ep_sharding = P(("data", "tensor"), None, None)
-            ep_scale_sharding = P(("data", "tensor"), None, None, None)
-
-            self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
-            self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
-            self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
+                self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
+                del w2_value
 
             # Update scales (reshape to 4D for GMM kernel)
             if self.quant_block_n is not None:
@@ -488,6 +503,16 @@ class FusedEPMoE(nnx.Module):
     ) -> jax.Array:
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
+        orig_num_tokens = hidden_states.shape[0]
+        mesh_ep_size = self.mesh.shape["data"] * self.mesh.shape["tensor"]
+        if orig_num_tokens % mesh_ep_size != 0:
+            padded_num_tokens = (
+                (orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size
+            ) * mesh_ep_size
+            pad_t = padded_num_tokens - orig_num_tokens
+            hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0.0)
+            topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
@@ -553,6 +578,8 @@ class FusedEPMoE(nnx.Module):
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
         output = jax.sharding.reshard(output, out_sharding)
+        if orig_num_tokens != output.shape[0]:
+            output = output[:orig_num_tokens]
         return output
 
 
@@ -580,6 +607,16 @@ class FusedEPMoEV2(FusedEPMoE):
         )
 
         assert hidden_states.ndim == 2
+        orig_num_tokens = hidden_states.shape[0]
+        mesh_ep_size = self.mesh.shape["data"] * self.mesh.shape["tensor"]
+        if orig_num_tokens % mesh_ep_size != 0:
+            padded_num_tokens = (
+                (orig_num_tokens + mesh_ep_size - 1) // mesh_ep_size
+            ) * mesh_ep_size
+            pad_t = padded_num_tokens - orig_num_tokens
+            hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
+            topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0.0)
+            topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -676,4 +713,6 @@ class FusedEPMoEV2(FusedEPMoE):
             output = jax.sharding.reshard(
                 output, jax.sharding.NamedSharding(self.mesh, P("data", None))
             )
+        if orig_num_tokens != output.shape[0]:
+            output = output[:orig_num_tokens]
         return output

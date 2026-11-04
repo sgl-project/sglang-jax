@@ -296,7 +296,15 @@ class QuantizedLinear(nnx.Module):
                 if weight_scale.ndim == 3
                 else P(kernel_axes[1])
             )
-            weight_scale = jax.device_put(weight_scale, NamedSharding(mesh, scale_spec))
+            scale_sharding = NamedSharding(mesh, scale_spec)
+            if isinstance(weight_scale, jax.Array):
+                weight_scale = jax.sharding.reshard(weight_scale, scale_sharding)
+            else:
+                weight_scale = jax.device_put(weight_scale, scale_sharding)
+            if isinstance(weight_q, jax.Array) and not isinstance(weight_q, jax.ShapeDtypeStruct):
+                weight_q = jax.sharding.reshard(
+                    weight_q, NamedSharding(mesh, P(kernel_axes[1], kernel_axes[0]))
+                )
 
         self.weight_q = nnx.Param(weight_q)
         self.weight_scale = nnx.Param(weight_scale)

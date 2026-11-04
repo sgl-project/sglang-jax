@@ -1276,7 +1276,15 @@ def _mla_ragged_paged_attention_kernel(
 
     @pl.when(batch_start_seq_idx == start_seq_idx)
     def prologue():
+        bq_nope_x2_int32_ref = bq_nope_x2_ref.bitcast(jnp.int32).reshape((2, -1, lkv_dim))
+        bq_nope_zeros = jnp.zeros(bq_nope_x2_int32_ref.shape[1:], jnp.int32)
+        bq_rope_x2_int32_ref = bq_rope_x2_ref.bitcast(jnp.int32).reshape((2, -1, r_dim))
+        bq_rope_zeros = jnp.zeros(bq_rope_x2_int32_ref.shape[1:], jnp.int32)
+        bq_nope_x2_int32_ref[0] = bq_nope_zeros
+        bq_rope_x2_int32_ref[0] = bq_rope_zeros
         start_fetch_bq(start_seq_idx, 0, 0)
+        bq_nope_x2_int32_ref[1] = bq_nope_zeros
+        bq_rope_x2_int32_ref[1] = bq_rope_zeros
 
         # Initialize bkvc_x2_ref and bkpe_x2_ref to zeros to avoid NaN issues from accessing
         # uninitialized memory. Bitcast into int32 to avoid tiling issues.
@@ -1592,11 +1600,16 @@ def mla_ragged_paged_attention(
         # must span a multiple of sublane_tile rows, i.e. bq * padded heads
         # per token divisible by 8 * q_packing (16 for bf16). With >= 16
         # padded heads any bq is fine; with 4 heads/shard bq=4 is exactly one
-        # tile.
+        # tile. When mixed_static_q_len is not a multiple of tile_q (e.g. G=5
+        # draft tokens with 4 heads/shard -> tile_q=4), round up to the next
+        # tile multiple (5 -> 8) instead of dropping to None (which falls back
+        # to bq_sz=64..256). _fetch_bq/_send_bo/causal mask still bound each
+        # sequence by its true cu_q_lens.
         sublane_tile = 8 * q_packing
         heads_padded = align_to(actual_num_q_heads, q_packing)
         if (mixed_static_q_len * heads_padded) % sublane_tile != 0:
-            mixed_static_q_len = None
+            tile_q = sublane_tile // math.gcd(sublane_tile, heads_padded)
+            mixed_static_q_len = align_to(mixed_static_q_len, tile_q)
 
     def run_mla_kernel(
         ql_nope: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]

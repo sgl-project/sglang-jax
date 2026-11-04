@@ -316,6 +316,15 @@ class TopK(nnx.Module):
             routing_spec = P("data", None)
         if not _topk_kernel_enabled():
             return self._biased_grouped_topk_jax(router_logits, correction_bias)
+        if routing_spec != P("data", None) and self.mesh is not None:
+            axes = routing_spec[0] if isinstance(routing_spec[0], tuple) else (routing_spec[0],)
+            num_shards = 1
+            for ax in axes:
+                if ax is not None and ax in self.mesh.shape:
+                    num_shards *= int(self.mesh.shape[ax])
+            local_bs = router_logits.shape[0] // max(num_shards, 1)
+            if local_bs < 128 or local_bs % 128 != 0:
+                return self._biased_grouped_topk_jax(router_logits, correction_bias)
         fn = functools.partial(
             grouped_topk_pallas,
             num_expert_group=self.num_expert_group,

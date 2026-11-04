@@ -224,7 +224,18 @@ def grouped_topk_pallas(
     bias = correction_bias.astype(jnp.float32)
 
     if block_tokens == "auto":
-        bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
+        from sgl_jax.srt.kernels.grouped_topk.tuned_block_sizes import get_tuned_bt
+
+        tuned = get_tuned_bt(bs, e, num_expert_group, topk_group, topk)
+        if (
+            tuned is not None
+            and 0 < tuned <= bs
+            and bs % tuned == 0
+            and (tuned == bs or tuned % 128 == 0)
+        ):
+            bt = tuned
+        else:
+            bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
         if bt > SAFE_AUTO_BT:
             logger.warning(
                 "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
