@@ -19,6 +19,54 @@ from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 logger = logging.getLogger(__name__)
 
+# Issue #1795: with SGLANG_JAX_FIXED_TILE set, bf16 LinearBase matmuls give a token row the
+# same bits regardless of batch size and the row's position in the batch. XLA picks the
+# per-device matmul tiling from the operand shape, and its cross-device sum for row-parallel
+# layers adds the per-device partials in an order that depends on the row layout. Here every
+# device runs the fixed-tile Pallas kernel (kernels/fixed_tile.py); row-parallel layers
+# (o_proj, down_proj) gather the fp32 partials and add them in device order 0..T-1 before the
+# bf16 cast. Off by default: it is slower than the XLA path.
+_FIXED_TILE = os.environ.get("SGLANG_JAX_FIXED_TILE", "0").lower() in ("1", "true")
+if _FIXED_TILE:
+    logger.info("SGLANG_JAX_FIXED_TILE enabled: batch-invariant fixed-tile matmul")
+
+
+def _fixed_tile_column_parallel_matmul(x, w, mesh, out_dtype):
+    """x: [tokens, K] sharded (data, None); w: [K, N] sharded (None, tensor)."""
+    from sgl_jax.srt.kernels.fixed_tile import fixed_tile_matmul
+
+    x = jax.sharding.reshard(x, NamedSharding(mesh, P("data", None)))
+    return shard_map(
+        lambda a, b: fixed_tile_matmul(a, b, out_dtype=out_dtype),
+        mesh=mesh,
+        in_specs=(P("data", None), P(None, "tensor")),
+        out_specs=P("data", "tensor"),
+        check_vma=False,
+    )(x, w)
+
+
+def _fixed_tile_row_parallel_matmul(x, w, mesh, out_dtype):
+    """x: [tokens, K] sharded (data, tensor); w: [K, N] sharded (tensor, None)."""
+
+    from sgl_jax.srt.kernels.fixed_tile import fixed_tile_matmul
+
+    def local(a, b):
+        part = fixed_tile_matmul(a, b, out_dtype=jnp.float32)
+        parts = lax.all_gather(part, "tensor", axis=0)  # [T, tokens_local, N]
+        acc = parts[0]
+        for i in range(1, parts.shape[0]):
+            acc = acc + parts[i]
+        return acc.astype(out_dtype)
+
+    x = jax.sharding.reshard(x, NamedSharding(mesh, P("data", "tensor")))
+    return shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(P("data", "tensor"), P("tensor", None)),
+        out_specs=P("data", None),
+        check_vma=False,
+    )(x, w)
+
 
 def _shard_map_output_partition_dim(
     sharding: jax.sharding.Sharding, axis_name: str | None
@@ -101,13 +149,24 @@ class LinearBase(nnx.Module):
             self.mesh,
             P("data", *([None] * (x.ndim - 2)), self.kernel_axes[-1]),
         )
-        out = lax.dot_general(
-            x,
-            self.weight.value,
-            (((x.ndim - 1,), (0,)), ((), ())),
-            preferred_element_type=self.params_dtype,
-            out_sharding=target,
-        )
+        axes = tuple(self.kernel_axes or ())
+        plain = out_sharding is None and x.ndim == 2
+        if plain and _FIXED_TILE and axes == ("tensor", None):
+            out = _fixed_tile_row_parallel_matmul(
+                x, self.weight.value, self.mesh, self.params_dtype
+            )
+        elif plain and _FIXED_TILE and axes == (None, "tensor"):
+            out = _fixed_tile_column_parallel_matmul(
+                x, self.weight.value, self.mesh, self.params_dtype
+            )
+        else:
+            out = lax.dot_general(
+                x,
+                self.weight.value,
+                (((x.ndim - 1,), (0,)), ((), ())),
+                preferred_element_type=self.params_dtype,
+                out_sharding=target,
+            )
         if self.skip_bias_add:
             return out, self.bias
         if self.bias is not None:

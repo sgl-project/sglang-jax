@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -10,6 +11,39 @@ from jax import lax
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+# Issue #1795: XLA's row reduction tiling depends on the padded batch size, so RMSNorm of the
+# same row can differ between batch sizes. With SGLANG_JAX_FIXED_TILE set (see layers/linear.py),
+# RMSNorm runs the fixed-tile Pallas kernel, one fixed reduction per row. Off by default.
+_FIXED_TILE = os.environ.get("SGLANG_JAX_FIXED_TILE", "0").lower() in ("1", "true")
+
+
+def _fixed_tile_rmsnorm_sharded(x, weight, eps, add_unit_offset):
+    """Runs kernels.fixed_tile.fixed_tile_rmsnorm per device on x's own sharding."""
+    from jax import shard_map
+
+    from sgl_jax.srt.kernels.fixed_tile import fixed_tile_rmsnorm
+
+    sharding = jax.typeof(x).sharding
+    spec = tuple(sharding.spec) + (None,) * (x.ndim - len(sharding.spec))
+    assert spec[-1] is None, f"fixed-tile RMSNorm needs a whole last axis, got {spec}"
+    fn = lambda a, w: fixed_tile_rmsnorm(a, w, eps, add_unit_offset, x.dtype)
+    if weight is None:
+        return shard_map(
+            lambda a: fn(a, None),
+            mesh=sharding.mesh,
+            in_specs=(P(*spec),),
+            out_specs=P(*spec),
+            check_vma=False,
+        )(x)
+    weight = jax.sharding.reshard(jnp.asarray(weight, jnp.float32), P(None))
+    return shard_map(
+        fn,
+        mesh=sharding.mesh,
+        in_specs=(P(*spec), P(None)),
+        out_specs=P(*spec),
+        check_vma=False,
+    )(x, weight)
 
 
 def _canonicalize_axes(rank: int, axes: Axes) -> tuple[int, ...]:
@@ -74,6 +108,15 @@ class RMSNorm(nnx.Module):
 
     @named_scope
     def __call__(self, x, mask: jax.Array | None = None):
+        if (
+            _FIXED_TILE
+            and mask is None
+            and self.axis_name is None
+            and _canonicalize_axes(x.ndim, self.reduction_axes) == (x.ndim - 1,)
+        ):
+            return _fixed_tile_rmsnorm_sharded(
+                x, self.scale[...] if self.scale else None, self.epsilon, False
+            )
         mean, var = _compute_stats(
             x,
             self.reduction_axes,
@@ -209,6 +252,10 @@ class GemmaRMSNorm(nnx.Module):
         if residual is not None:
             x = x + jnp.astype(residual, jnp.float16) if orig_dtype == jnp.float16 else x + residual
             residual = x
+
+        if _FIXED_TILE:
+            y = _fixed_tile_rmsnorm_sharded(x, self.weight[...], self.epsilon, self.add_unit_offset)
+            return y if residual is None else (y, residual)
 
         x = x.astype(jnp.float32)
         variance = jnp.mean(lax.square(x), axis=-1, keepdims=True)
