@@ -9,7 +9,8 @@ the incumbent four-stage ``chunk_kda_fwd`` (``pipeline_impl="incumbent"``) and F
   - Bounded (``lower_bound=-5.0``) and unbounded (``lower_bound=None``) gates.
   - In-kernel gate activation (``A_log`` + ``dt_bias``) and pre-activated gates.
   - In-kernel Q/K L2 normalization and caller-normalized Q/K.
-  - Padded single-sequence logical boundaries (``cu_seqlens[1] < T``).
+  - Padded single-sequence logical boundaries (``cu_seqlens[1] < T``), on both the
+    fast kernel (K, V multiples of 128) and the generic fallback kernel (K or V = 64).
   - Default selection-switch contract on ``chunk_kda_fwd`` and ``kda_forward_packed``.
   - TPU AOT compilation on v6e and v7x topologies (including ``H=32`` VMEM cap).
 """
@@ -71,14 +72,16 @@ def _make_inputs(
     seed: int = 2026,
     beta_dtype=jnp.bfloat16,
     with_initial_state: bool = True,
+    k_dim: int = K,
+    v_dim: int = V,
 ):
     rng = np.random.default_rng(seed)
     logical_t = sum(lengths)
     total_t = physical_t if physical_t is not None else max(1, logical_t)
     assert total_t >= logical_t
 
-    shape_k = (1, total_t, heads, K)
-    shape_v = (1, total_t, heads, V)
+    shape_k = (1, total_t, heads, k_dim)
+    shape_v = (1, total_t, heads, v_dim)
 
     def _bf16_normal(shape, std=1.0):
         return jnp.asarray(rng.standard_normal(shape, dtype=np.float32) * std, dtype=jnp.bfloat16)
@@ -91,10 +94,12 @@ def _make_inputs(
         rng.uniform(0.05, 0.95, (1, total_t, heads)).astype(np.float32), dtype=beta_dtype
     )
     a_log = jnp.asarray(rng.uniform(0.2, 2.5, (heads,)).astype(np.float32))
-    dt_bias = jnp.asarray(rng.uniform(-6.0, -1.0, (heads, K)).astype(np.float32))
+    dt_bias = jnp.asarray(rng.uniform(-6.0, -1.0, (heads, k_dim)).astype(np.float32))
     cu_seqlens = jnp.asarray([0, *np.cumsum(lengths, dtype=np.int32)], dtype=jnp.int32)
     initial_state = (
-        jnp.asarray(rng.standard_normal((len(lengths), heads, K, V), dtype=np.float32) * 0.1)
+        jnp.asarray(
+            rng.standard_normal((len(lengths), heads, k_dim, v_dim), dtype=np.float32) * 0.1
+        )
         if with_initial_state
         else None
     )
@@ -132,6 +137,8 @@ def _run_naive_reference(
     else:
         g_act = case["raw_g"].astype(jnp.float32)
 
+    k_dim = q.shape[-1]
+    v_dim = case["v"].shape[-1]
     outputs = []
     final_states = []
     offset = 0
@@ -141,9 +148,9 @@ def _run_naive_reference(
         )
         if length == 0:
             heads = q.shape[2]
-            outputs.append(jnp.zeros((1, 0, heads, V), dtype=q.dtype))
+            outputs.append(jnp.zeros((1, 0, heads, v_dim), dtype=q.dtype))
             final_states.append(
-                jnp.zeros((heads, K, V), dtype=jnp.float32) if h0_i is None else h0_i[0]
+                jnp.zeros((heads, k_dim, v_dim), dtype=jnp.float32) if h0_i is None else h0_i[0]
             )
             continue
         out_i, state_i = naive_recurrent_kda(
@@ -152,7 +159,7 @@ def _run_naive_reference(
             case["v"][:, offset : offset + length],
             g_act[:, offset : offset + length],
             beta[:, offset : offset + length],
-            scale=SCALE,
+            scale=k_dim**-0.5,
             initial_state=h0_i,
             output_final_state=True,
         )
@@ -163,7 +170,7 @@ def _run_naive_reference(
     out = (
         jnp.concatenate(outputs, axis=1)
         if outputs
-        else jnp.zeros((1, 0, q.shape[2], V), dtype=q.dtype)
+        else jnp.zeros((1, 0, q.shape[2], v_dim), dtype=q.dtype)
     )
     state = jnp.stack(final_states, axis=0)
     return out, state
@@ -261,33 +268,43 @@ def test_resident_matches_incumbent_and_naive_per_position(
     np.testing.assert_allclose(res_s_f32, naive_s_f32, rtol=3e-2, atol=3e-2)
 
 
+# (K, V) = (128, 128) runs the fast multi-head kernel; any head dim that is not a
+# multiple of 128 runs the generic fallback kernel, which must honor cu_seqlens[1] too.
+_PADDED_HEAD_DIMS = [(128, 128), (64, 64), (64, 128), (128, 64)]
+
+
+@pytest.mark.parametrize(("k_dim", "v_dim"), _PADDED_HEAD_DIMS)
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
-def test_padded_single_seq_preserves_logical_boundary(lower_bound: float | None):
+def test_padded_single_seq_preserves_logical_boundary(
+    lower_bound: float | None, k_dim: int, v_dim: int
+):
     """Padded tail (cu_seqlens=[0, 63] inside T=128) must not decay final state."""
     heads = 2
     physical_t = 128
     logical_t = 63
+    scale = k_dim**-0.5
     cu_seqlens = jnp.asarray([0, logical_t], dtype=jnp.int32)
-    zeros_4d = jnp.zeros((1, physical_t, heads, K), dtype=jnp.bfloat16)
+    zeros_qk = jnp.zeros((1, physical_t, heads, k_dim), dtype=jnp.bfloat16)
+    zeros_v = jnp.zeros((1, physical_t, heads, v_dim), dtype=jnp.bfloat16)
     zeros_beta = jnp.zeros(
         (1, physical_t, heads),
         dtype=jnp.float32 if lower_bound is None else jnp.bfloat16,
     )
     if lower_bound is None:
         a_log = jnp.full((heads,), math.log(0.01), dtype=jnp.float32)
-        dt_bias = jnp.zeros((heads, K), dtype=jnp.float32)
+        dt_bias = jnp.zeros((heads, k_dim), dtype=jnp.float32)
     else:
         a_log = jnp.zeros((heads,), dtype=jnp.float32)
-        dt_bias = jnp.full((heads, K), -5.0, dtype=jnp.float32)
-    h0 = jnp.broadcast_to(jnp.eye(K, V, dtype=jnp.float32), (1, heads, K, V))
+        dt_bias = jnp.full((heads, k_dim), -5.0, dtype=jnp.float32)
+    h0 = jnp.broadcast_to(jnp.eye(k_dim, v_dim, dtype=jnp.float32), (1, heads, k_dim, v_dim))
 
     res_out, res_state, *_ = resident_pipeline_kda_fwd(
-        zeros_4d,
-        zeros_4d,
-        zeros_4d,
-        zeros_4d,
+        zeros_qk,
+        zeros_qk,
+        zeros_v,
+        zeros_qk,
         zeros_beta,
-        SCALE,
+        scale,
         h0,
         True,
         cu_seqlens,
@@ -298,14 +315,14 @@ def test_padded_single_seq_preserves_logical_boundary(lower_bound: float | None)
         A_log=a_log,
         dt_bias=dt_bias,
     )
-    g_act = _activate_gate(zeros_4d[:, :logical_t], a_log, dt_bias, lower_bound)
+    g_act = _activate_gate(zeros_qk[:, :logical_t], a_log, dt_bias, lower_bound)
     ref_out, ref_state = naive_recurrent_kda(
-        zeros_4d[:, :logical_t],
-        zeros_4d[:, :logical_t],
-        zeros_4d[:, :logical_t],
+        zeros_qk[:, :logical_t],
+        zeros_qk[:, :logical_t],
+        zeros_v[:, :logical_t],
         g_act,
         zeros_beta[:, :logical_t],
-        scale=SCALE,
+        scale=scale,
         initial_state=h0,
         output_final_state=True,
     )

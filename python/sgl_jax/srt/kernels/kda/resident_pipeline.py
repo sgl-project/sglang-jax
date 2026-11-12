@@ -8,7 +8,7 @@ recurrent [K, V] state kept resident in VMEM across chunks, fusing:
      V=128 columns instead of V+K=256 by subtracting k_eg_beta @ state before
      the solve).
   4. Merged MXU contractions for [k_eg_beta; qg] @ state and [Aqk; kg^T] @ v_new.
-  5. Multi-head batched (MB = H) execution with sublane-aligned BlockSpecs,
+  5. Multi-head batched (MB = min(H, 16)) execution with sublane-aligned BlockSpecs,
      packed gate parameters, bitshift boolean masks, and deferred V load.
 """
 
@@ -1263,7 +1263,10 @@ def resident_pipeline_stage(
             USE_QK_L2NORM=use_qk_l2norm_in_kernel,
             NEED_CUMSUM=need_cumsum,
             SINGLE_SEQ=single_seq,
-            HAS_PARTIAL_CHUNKS=has_partial_chunks,
+            # A single sequence may be padded past cu_seqlens[1] (bucket/DP padding):
+            # mask tokens at or beyond valid_eos so they neither decay nor update the
+            # state, matching the fast kernel's meta_ref[1] mask.
+            HAS_PARTIAL_CHUNKS=has_partial_chunks or single_seq,
             USE_INITIAL_STATE=h0 is not None,
             STORE_FINAL_STATE=output_final_state,
         ),
