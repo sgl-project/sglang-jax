@@ -38,6 +38,7 @@ import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend import core as jax_core
 from jax.sharding import AxisType, Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -926,6 +927,14 @@ def extract_valid_kv_tokens(cache_arr, lens, page_size, cu_kv_lens, page_indices
     return np.stack(rows, axis=0)
 
 
+def _primitive_names(jaxpr):
+    """Primitive names in ``jaxpr`` and its nested jaxprs (``jnp.pad`` traces as a ``jit``)."""
+    names = [eqn.primitive.name for eqn in jaxpr.eqns]
+    for sub in jax_core.subjaxprs(jaxpr):
+        names += _primitive_names(sub)
+    return names
+
+
 def _single_device_mesh():
     return Mesh(
         np.asarray(jax.devices()[:1]).reshape(1, 1),
@@ -1176,7 +1185,7 @@ class TestMLAV2BitExactParity(unittest.TestCase):
             for num_q_heads in (2, 4, 8, 16, 64):
                 q_pe = jnp.ones((8, num_q_heads, 64), dtype=jnp.bfloat16)
                 jaxpr_pe = jax.make_jaxpr(kmod.prepare_q_inputs)(q_pe)
-                primitives_pe = [eqn.primitive.name for eqn in jaxpr_pe.jaxpr.eqns]
+                primitives_pe = _primitive_names(jaxpr_pe.jaxpr)
                 self.assertIn(
                     "optimization_barrier",
                     primitives_pe,
@@ -1185,7 +1194,7 @@ class TestMLAV2BitExactParity(unittest.TestCase):
 
                 ql_nope = jnp.ones((8, num_q_heads, 512), dtype=jnp.bfloat16)
                 jaxpr_nope = jax.make_jaxpr(kmod.prepare_q_inputs)(ql_nope)
-                primitives_nope = [eqn.primitive.name for eqn in jaxpr_nope.jaxpr.eqns]
+                primitives_nope = _primitive_names(jaxpr_nope.jaxpr)
                 self.assertNotIn("pad", primitives_nope)
                 self.assertNotIn("optimization_barrier", primitives_nope)
 
