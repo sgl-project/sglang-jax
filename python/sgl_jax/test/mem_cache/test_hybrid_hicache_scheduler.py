@@ -112,11 +112,32 @@ def test_chunk_rejection_does_not_start_restore():
     assert not calls
 
 
-def test_failed_restore_rechecks_recompute_swa_budget():
-    adder, req, calls = admission(swa_capacity=24, succeeds=False)
-    assert adder.add_one_req(req) is AddReqResult.NO_TOKEN
+@pytest.mark.parametrize("swa_capacity,can_recompute", [(24, False), (50, True)])
+def test_failed_restore_rechecks_recompute_swa_budget(swa_capacity, can_recompute):
+    adder, req, calls = admission(swa_capacity=swa_capacity, succeeds=False)
+    host_candidate = req.last_host_node
+    recompute_swa_budget = adder._swa_budget_for_req(req.extend_input_len, 0)
+    result = adder.add_one_req(req)
     assert len(calls) == 1
-    assert not adder.can_run_list[0]
+    assert req.extend_input_len == 33
+    assert len(req.prefix_indices) == 0
+    if can_recompute:
+        assert result is AddReqResult.CONTINUE
+        assert adder.can_run_list[0] == [req]
+        assert req.host_hit_length == 0
+        assert req.last_host_node is req.last_node
+        assert adder.rem_total_token_offset[0] == 34
+        assert adder.rem_swa_token_offset[0] == recompute_swa_budget
+        assert adder.log_hit_tokens == 0
+        assert adder.log_input_tokens == 33
+    else:
+        assert result is AddReqResult.NO_TOKEN
+        assert not adder.can_run_list[0]
+        # A rejected request may retry its host candidate on the next admission.
+        assert req.host_hit_length == 32
+        assert req.last_host_node is host_candidate
+        assert adder.rem_total_token_offset[0] == 0
+        assert adder.rem_swa_token_offset[0] == 0
 
 
 def test_retract_discards_host_candidate():
@@ -139,9 +160,14 @@ def test_full_admission_charges_only_missing_component_pages(restored_full):
 
 def test_swa_only_restore_failure_rechecks_full_recompute_budget():
     adder, req, calls = admission(full_capacity=8, restored_full=0, succeeds=False)
+    host_candidate = req.last_host_node
     assert adder.add_one_req(req) is AddReqResult.NO_TOKEN
     assert len(calls) == 1
     assert not adder.can_run_list[0]
+    assert req.host_hit_length == 32
+    assert req.last_host_node is host_candidate
+    assert adder.rem_total_token_offset[0] == 0
+    assert adder.rem_swa_token_offset[0] == 0
 
 
 def test_swa_overhang_fallback_requires_full_recompute_capacity():

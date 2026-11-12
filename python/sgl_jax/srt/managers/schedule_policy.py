@@ -767,6 +767,8 @@ class PrefillAdder:
                         dp_rank
                     ):
                         return AddReqResult.NO_TOKEN
+                    req.host_hit_length = 0
+                    req.last_host_node = req.last_node
 
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)

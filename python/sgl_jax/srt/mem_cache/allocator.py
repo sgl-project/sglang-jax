@@ -16,6 +16,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         page_size: int,
         kvcache: KVCache,
         dp_size: int = 1,
+        track_allocations: bool = False,
     ):
         self.size = size
         self.page_size = page_size
@@ -28,6 +29,26 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        # Optional page/slot membership for transactional restore validation.
+        # Ordinary allocators do not pay for this additional state.
+        self._allocated_units = (
+            [np.zeros(size // page_size // dp_size + 1, dtype=np.bool_) for _ in range(dp_size)]
+            if track_allocations
+            else None
+        )
+
+    def _rebuild_allocated_units(self, free_units, released_units=None) -> None:
+        """Rebuild optional membership on the cold snapshot-restore path."""
+        if self._allocated_units is None:
+            return
+        for rank, allocated in enumerate(self._allocated_units):
+            allocated.fill(True)
+            allocated[0] = False
+            allocated[free_units[rank]] = False
+            if released_units is not None:
+                allocated[released_units[rank]] = False
+            for indices in self.free_group[rank]:
+                allocated[np.asarray(indices) // self.page_size] = False
 
     def debug_print(self) -> str:
         return ""
@@ -94,9 +115,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         size: int,
         kvcache: KVCache,
         dp_size: int = 1,
+        track_allocations: bool = False,
     ):
         # super().__init__(size, 1, dtype, kvcache)  # page_size=1 for token-level
-        super().__init__(size, 1, kvcache, dp_size)  # page_size=1 for token-level
+        super().__init__(
+            size, 1, kvcache, dp_size, track_allocations
+        )  # page_size=1 for token-level
 
         # Each rank has independent [1, size_per_rank] indices (shard_map local view)
         self.free_slots = [
@@ -112,11 +136,15 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
         select_index = slots[:need_size].copy()
         self.free_slots[dp_rank] = slots[need_size:]
+        if self._allocated_units is not None:
+            self._allocated_units[dp_rank][select_index] = True
         return select_index
 
     def free(self, free_index: np.ndarray, dp_rank: int = 0):
         if free_index.size == 0:
             return
+        if self._allocated_units is not None:
+            self._allocated_units[dp_rank][free_index] = False
         if self.is_not_in_free_group:
             self.free_slots[dp_rank] = np.concatenate([self.free_slots[dp_rank], free_index])
         else:
@@ -130,6 +158,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         for rank in ranks:
             self.free_slots[rank] = np.arange(1, self.size_per_rank + 1, dtype=np.int32)
             self.free_group[rank] = []
+            if self._allocated_units is not None:
+                self._allocated_units[rank].fill(False)
         self.is_not_in_free_group = True
 
     def free_group_begin(self):
@@ -156,6 +186,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def restore_state(self, state):
         assert len(state) == 2
         self.free_slots, self.release_pages = state
+        self._rebuild_allocated_units(self.free_slots)
 
 
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -166,9 +197,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: KVCache,
         debug_mode: bool = False,
         dp_size: int = 1,
+        track_allocations: bool = False,
     ):
         # super().__init__(size, page_size, dtype, kvcache)
-        super().__init__(size, page_size, kvcache, dp_size)
+        super().__init__(size, page_size, kvcache, dp_size, track_allocations)
         self.num_pages = size // page_size
         self.pages_per_rank = self.num_pages // dp_size
         self.debug_mode = debug_mode
@@ -193,6 +225,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[dp_rank][:num_pages].copy()
         self.free_pages[dp_rank] = self.free_pages[dp_rank][num_pages:]
+        if self._allocated_units is not None:
+            self._allocated_units[dp_rank][out_pages] = True
 
         # Generate contiguous indices using numpy internally
         page_indices = out_pages[:, None] * self.page_size + np.arange(self.page_size)
@@ -297,6 +331,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             allocated_pages, prefix_lens_np, extend_lens, last_loc_np, extend_num_tokens
         )
         self.free_pages[dp_rank] = self.free_pages[dp_rank][pages_used:]
+        if self._allocated_units is not None:
+            self._allocated_units[dp_rank][allocated_pages[:pages_used]] = True
         return out_indices
 
     def _alloc_decode_impl(
@@ -353,12 +389,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             allocated_pages, needs_new_page, last_loc_np, batch_size
         )
         self.free_pages[dp_rank] = self.free_pages[dp_rank][pages_used:]
+        if self._allocated_units is not None:
+            self._allocated_units[dp_rank][allocated_pages[:pages_used]] = True
         return out_indices
 
     def free(self, free_index: np.ndarray, dp_rank: int = 0):
         if free_index.size == 0:
             return
 
+        if self._allocated_units is not None:
+            self._allocated_units[dp_rank][free_index // self.page_size] = False
         if self.is_not_in_free_group:
             free_pages = np.unique(free_index // self.page_size)
             rel_pages = self.release_pages[dp_rank]
@@ -390,6 +430,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_pages[rank] = np.arange(1, self.pages_per_rank + 1, dtype=np.int32)
             self.release_pages[rank] = np.empty(0, dtype=np.int32)
             self.free_group[rank] = []
+            if self._allocated_units is not None:
+                self._allocated_units[rank].fill(False)
         self.is_not_in_free_group = True
 
     def get_cpu_copy(self, indices):
@@ -407,6 +449,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def restore_state(self, state):
         assert len(state) == 2
         self.free_pages, self.release_pages = state
+        self._rebuild_allocated_units(self.free_pages, self.release_pages)
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -430,6 +473,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 size,
                 kvcache.full_kv_pool,
                 dp_size=dp_size,
+                track_allocations=True,
             )
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa,
@@ -443,6 +487,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 kvcache=kvcache.full_kv_pool,
                 debug_mode=False,
                 dp_size=dp_size,
+                track_allocations=True,
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
                 size=size_swa,
@@ -462,6 +507,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 np.zeros(mapping_size, dtype=np.int32) for _ in range(dp_size)
             ]
         self.is_not_in_free_group = True
+        # Only explicit raw reservations can be committed or rolled back.
+        # Track page IDs (slot IDs for page_size=1), not every mapped SWA token.
+        self._raw_swa_reservations = [set() for _ in range(dp_size)]
         self._reset_free_group_state()
         self.clear()
 
@@ -503,7 +551,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _validate_restore_indices(
         self, indices: np.ndarray, allocator, dp_rank: int, component: str
     ) -> np.ndarray:
-        """Require complete, currently allocated rank-local pages or slots."""
+        """Validate candidate FULL ownership or explicit raw SWA reservations."""
         indices = np.asarray(indices)
         if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
             raise ValueError(f"{component} indices must be a one-dimensional integer array")
@@ -512,9 +560,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 np.any(indices < 1)
                 or np.any(indices > allocator.size_per_rank)
                 or len(np.unique(indices)) != len(indices)
-                or np.intersect1d(indices, allocator.free_slots[dp_rank]).size
             ):
                 raise ValueError(f"{component} indices must be distinct allocated slots")
+            units = indices
         else:
             page_size = self.page_size
             if len(indices) % page_size:
@@ -526,16 +574,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 or np.any(pages > allocator.pages_per_rank)
                 or len(np.unique(pages)) != len(pages)
                 or not np.array_equal(indices, expected)
-                or np.intersect1d(pages, allocator.free_pages[dp_rank]).size
-                or np.intersect1d(pages, allocator.release_pages[dp_rank]).size
             ):
                 raise ValueError(f"{component} indices must be distinct allocated complete pages")
+            units = pages
+        if component == "FULL":
+            if not np.all(allocator._allocated_units[dp_rank][units]):
+                raise ValueError("FULL indices must be currently allocated")
+        elif not self._raw_swa_reservations[dp_rank].issuperset(units):
+            raise ValueError("SWA indices must be uncommitted reservations from alloc_swa")
         queued = (
             self._free_group_full_seen[dp_rank]
             if component == "FULL"
             else self._free_group_swa_seen[dp_rank]
         )
-        if any(int(index) in queued for index in indices):
+        if not queued.isdisjoint(indices):
             raise ValueError(f"{component} indices are queued for release")
         return indices.astype(np.int32, copy=False)
 
@@ -551,12 +603,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._validate_restore_rank(dp_rank)
         if need_size < 0 or need_size % self.page_size:
             raise ValueError("SWA reservation size must be nonnegative and page-aligned")
-        return self.swa_attn_allocator.alloc(need_size, dp_rank=dp_rank)
+        indices = self.swa_attn_allocator.alloc(need_size, dp_rank=dp_rank)
+        if indices is not None:
+            self._raw_swa_reservations[dp_rank].update(
+                (indices[:: self.page_size] // self.page_size).tolist()
+            )
+        return indices
 
     def commit_swa_mapping(
         self, full_indices: np.ndarray, swa_indices: np.ndarray, dp_rank: int = 0
     ) -> None:
-        """Map reserved SWA pages to allocated FULL pages after all validation."""
+        """Commit pages from alloc_swa to allocated FULL pages after all validation."""
         self._validate_restore_rank(dp_rank)
         full_indices = self._validate_restore_indices(
             full_indices, self.full_attn_allocator, dp_rank, "FULL"
@@ -573,21 +630,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if np.any(mapping[full_indices] != 0):
             raise ValueError("FULL indices already have SWA mappings")
-        if np.intersect1d(swa_indices, mapping[mapping > 0]).size:
-            raise ValueError("SWA indices are already mapped")
         mapping[full_indices] = swa_indices
+        self._raw_swa_reservations[dp_rank].difference_update(
+            swa_indices[:: self.page_size] // self.page_size
+        )
 
     def free_swa_indices(self, indices: np.ndarray, dp_rank: int = 0) -> None:
-        """Release uncommitted raw SWA indices; mapped SWA uses free_swa(FULL)."""
+        """Roll back alloc_swa reservations; mapped SWA uses free_swa(FULL)."""
         self._validate_restore_rank(dp_rank)
         indices = self._validate_restore_indices(indices, self.swa_attn_allocator, dp_rank, "SWA")
-        mapping = (
-            self.full_to_swa_index_mapping
-            if self.dp_size == 1
-            else self.full_to_swa_index_mapping[dp_rank]
-        )
-        if np.intersect1d(indices, mapping[mapping > 0]).size:
-            raise ValueError("Mapped SWA indices must be released via free_swa(FULL indices)")
         if self.is_not_in_free_group:
             self.swa_attn_allocator.free(indices, dp_rank=dp_rank)
         else:
@@ -597,6 +648,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 queues=self._free_group_swa,
                 seen=self._free_group_swa_seen,
             )
+        self._raw_swa_reservations[dp_rank].difference_update(
+            indices[:: self.page_size] // self.page_size
+        )
 
     def alloc(self, need_size: int, dp_rank: int = 0):
         if need_size > self.full_attn_allocator.available_size(dp_rank=dp_rank):
@@ -805,6 +859,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     self.full_to_swa_index_mapping[rank].fill(0)
             self.is_not_in_free_group = True
             self._reset_free_group_state()
+            for reservations in self._raw_swa_reservations:
+                reservations.clear()
         else:
             # Clear specific rank
             self.swa_attn_allocator.clear(dp_rank=dp_rank)
@@ -814,6 +870,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 self.full_to_swa_index_mapping[dp_rank].fill(0)
             self._clear_free_group_rank(dp_rank)
+            self._raw_swa_reservations[dp_rank].clear()
 
     def free_group_begin(self):
         self.is_not_in_free_group = False

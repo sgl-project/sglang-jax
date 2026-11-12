@@ -660,6 +660,202 @@ class TestSWAAllocatorIndependentRestore(CustomTestCase):
         np.testing.assert_array_equal(allocator.full_to_swa_index_mapping, before)
         self.assertEqual(allocator.swa_available_size(), 2)
 
+    def test_partial_commit_preserves_remaining_reservations_after_alias_rejection(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                allocator = self._allocator(page_size=page_size)
+                full = allocator.alloc_full(3 * page_size)
+                swa = allocator.alloc_swa(3 * page_size)
+                allocator.commit_swa_mapping(full[:page_size], swa[:page_size])
+                ordinary_full = allocator.alloc(page_size)
+                ordinary_swa = allocator.translate_full_to_swa(ordinary_full, dp_rank=0)
+                before = allocator.full_to_swa_index_mapping.copy()
+                # A mixed batch must not consume its still-uncommitted reservation.
+                with self.assertRaises(ValueError):
+                    allocator.commit_swa_mapping(full[page_size:], swa[: 2 * page_size])
+                with self.assertRaises(ValueError):
+                    allocator.free_swa_indices(swa[: 2 * page_size])
+                with self.assertRaises(ValueError):
+                    allocator.commit_swa_mapping(full[:page_size], swa[page_size : 2 * page_size])
+                with self.assertRaises(ValueError):
+                    allocator.commit_swa_mapping(full[page_size : 2 * page_size], ordinary_swa)
+                with self.assertRaises(ValueError):
+                    allocator.free_swa_indices(ordinary_swa)
+                np.testing.assert_array_equal(allocator.full_to_swa_index_mapping, before)
+                allocator.commit_swa_mapping(full[page_size:], swa[page_size:])
+                np.testing.assert_array_equal(allocator.translate_full_to_swa(full, dp_rank=0), swa)
+                allocator.free(ordinary_full)
+                self.assertEqual(allocator.swa_available_size(), page_size)
+
+    def test_raw_reservation_can_be_released_only_once(self):
+        for page_size in (1, 4):
+            for grouped in (False, True):
+                with self.subTest(page_size=page_size, grouped=grouped):
+                    allocator = self._allocator(page_size=page_size)
+                    full = allocator.alloc_full(page_size)
+                    swa = allocator.alloc_swa(page_size)
+                    if grouped:
+                        allocator.free_group_begin()
+                    allocator.free_swa_indices(swa)
+                    with self.assertRaises(ValueError):
+                        allocator.free_swa_indices(swa)
+                    with self.assertRaises(ValueError):
+                        allocator.commit_swa_mapping(full, swa)
+                    if grouped:
+                        self.assertEqual(allocator.swa_available_size(), 3 * page_size)
+                        allocator.free_group_end()
+                    self.assertEqual(allocator.swa_available_size(), 4 * page_size)
+                    replacement = allocator.alloc_swa(4 * page_size)
+                    self.assertEqual(len(np.unique(replacement)), 4 * page_size)
+
+    def test_restore_rejects_unallocated_freed_and_queued_full_pages(self):
+        for page_size in (1, 4):
+            for state in ("unallocated", "freed", "queued"):
+                with self.subTest(page_size=page_size, state=state):
+                    allocator = self._allocator(page_size=page_size)
+                    full = np.arange(page_size, 2 * page_size, dtype=np.int32)
+                    if state != "unallocated":
+                        full = allocator.alloc_full(page_size)
+                        if state == "queued":
+                            allocator.free_group_begin()
+                        # Freeing even one token invalidates ownership of its whole page.
+                        allocator.free_full(full[:1], dp_rank=0)
+                    swa = allocator.alloc_swa(page_size)
+                    before = allocator.full_to_swa_index_mapping.copy()
+                    with self.assertRaises(ValueError):
+                        allocator.commit_swa_mapping(full, swa)
+                    np.testing.assert_array_equal(allocator.full_to_swa_index_mapping, before)
+                    # FULL rejection must leave the independent SWA reservation intact.
+                    allocator.free_swa_indices(swa)
+                    if state == "queued":
+                        allocator.free_group_end()
+                    self.assertEqual(allocator.full_available_size(), 8 * page_size)
+                    self.assertEqual(allocator.swa_available_size(), 4 * page_size)
+
+    def test_extend_and_decode_full_pages_remain_restorable(self):
+        allocator = self._allocator(page_size=4, swa_pages=8)
+        prefix = allocator.alloc(4)
+        extended = allocator.alloc_extend(
+            prefix_lens=[4], seq_lens=[8], last_loc=[int(prefix[-1])], extend_num_tokens=4
+        )
+        decoded = []
+        last_loc = int(extended[-1])
+        for seq_len in range(9, 13):
+            token = allocator.alloc_decode(seq_lens=[seq_len], last_loc=[last_loc])
+            decoded.extend(token)
+            last_loc = int(token[-1])
+        for full in (extended, np.array(decoded, dtype=np.int32)):
+            allocator.free_swa(full)
+            swa = allocator.alloc_swa(4)
+            allocator.commit_swa_mapping(full, swa)
+            np.testing.assert_array_equal(allocator.translate_full_to_swa(full, dp_rank=0), swa)
+        self.assertEqual(allocator.full_available_size(), 20)
+
+    def test_full_snapshot_restore_and_group_free_update_restore_ownership(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                allocator = self._allocator(page_size=page_size)
+                full_allocator = allocator.full_attn_allocator
+                retained = full_allocator.alloc(page_size)
+                snapshot = full_allocator.backup_state()
+                rolled_back = full_allocator.alloc(page_size)
+                full_allocator.restore_state(snapshot)
+                swa = allocator.alloc_swa(2 * page_size)
+                with self.assertRaises(ValueError):
+                    allocator.commit_swa_mapping(rolled_back, swa[page_size:])
+                allocator.commit_swa_mapping(retained, swa[:page_size])
+                np.testing.assert_array_equal(
+                    allocator.translate_full_to_swa(retained, dp_rank=0), swa[:page_size]
+                )
+                allocator.free_swa(retained)
+                # The child allocator also supports grouped frees independently of the wrapper.
+                full_allocator.free_group_begin()
+                full_allocator.free(retained[:1])
+                with self.assertRaises(ValueError):
+                    allocator.commit_swa_mapping(retained, swa[page_size:])
+                full_allocator.free_group_end()
+                allocator.free_swa_indices(swa[page_size:])
+                self.assertEqual(allocator.full_available_size(), 8 * page_size)
+                self.assertEqual(allocator.swa_available_size(), 4 * page_size)
+
+    def test_rank_clear_invalidates_only_its_own_restore_reservations(self):
+        allocator = self._allocator(page_size=4, dp_size=2)
+        full = [allocator.alloc_full(4, dp_rank=rank) for rank in range(2)]
+        swa = [allocator.alloc_swa(4, dp_rank=rank) for rank in range(2)]
+        allocator.clear(dp_rank=0)
+        with self.assertRaises(ValueError):
+            allocator.commit_swa_mapping(full[0], swa[0], dp_rank=0)
+        with self.assertRaises(ValueError):
+            allocator.free_swa_indices(swa[0], dp_rank=0)
+        allocator.commit_swa_mapping(full[1], swa[1], dp_rank=1)
+        np.testing.assert_array_equal(allocator.translate_full_to_swa(full[1], dp_rank=1), swa[1])
+        fresh_full = allocator.alloc_full(4, dp_rank=0)
+        fresh_swa = allocator.alloc_swa(4, dp_rank=0)
+        allocator.commit_swa_mapping(fresh_full, fresh_swa, dp_rank=0)
+        allocator.clear()
+        for rank in range(2):
+            with self.assertRaises(ValueError):
+                allocator.free_swa_indices(swa[rank], dp_rank=rank)
+            self.assertEqual(allocator.full_available_size(dp_rank=rank), 32)
+            self.assertEqual(allocator.swa_available_size(dp_rank=rank), 16)
+
+    def test_restore_validation_does_not_scan_pool_capacity(self):
+        class CandidateMappingOnly:
+            def __init__(self, mapping):
+                self.mapping = mapping
+
+            def __array__(self, *args, **kwargs):
+                raise AssertionError("Restore validation scanned the entire mapping")
+
+            def __getitem__(self, indices):
+                if not isinstance(indices, np.ndarray) or indices.dtype.kind not in "iu":
+                    raise AssertionError("Restore validation must index candidate FULL slots")
+                if len(indices) > 4:
+                    raise AssertionError("Restore validation read beyond its candidate batch")
+                return self.mapping[indices]
+
+            def __setitem__(self, indices, values):
+                self.__getitem__(indices)
+                self.mapping[indices] = values
+
+        class NoFreeArrayRead:
+            def __getitem__(self, rank):
+                raise AssertionError("Restore validation scanned the pool free arrays")
+
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                # Only allocator metadata is needed; do not allocate million-token KV buffers.
+                pool = SWAKVPool.__new__(SWAKVPool)
+                pool.full_kv_pool = pool.swa_kv_pool = None
+                allocator = SWATokenToKVPoolAllocator(
+                    size=1_000_000, size_swa=1_000_000, kvcache=pool, page_size=page_size
+                )
+                full = allocator.alloc_full(page_size)
+                swa = allocator.alloc_swa(2 * page_size)
+                mapping = allocator.full_to_swa_index_mapping
+                allocator.full_to_swa_index_mapping = CandidateMappingOnly(mapping)
+                saved = []
+                for child in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+                    attrs = ("free_slots",) if page_size == 1 else ("free_pages", "release_pages")
+                    for attr in attrs:
+                        saved.append((child, attr, getattr(child, attr)))
+                        setattr(child, attr, NoFreeArrayRead())
+                try:
+                    allocator.commit_swa_mapping(full, swa[:page_size])
+                    allocator.free_group_begin()
+                    allocator.free_swa_indices(swa[page_size:])
+                    with self.assertRaises(ValueError):
+                        allocator.free_swa_indices(swa[:page_size])
+                finally:
+                    allocator.full_to_swa_index_mapping = mapping
+                    for child, attr, value in saved:
+                        setattr(child, attr, value)
+                allocator.free_group_end()
+                np.testing.assert_array_equal(
+                    allocator.translate_full_to_swa(full, dp_rank=0), swa[:page_size]
+                )
+                self.assertEqual(allocator.swa_available_size(), 1_000_000 - page_size)
+
 
 # ---------------------------------------------------------------------------
 # Class 4: SWA Eviction logic
