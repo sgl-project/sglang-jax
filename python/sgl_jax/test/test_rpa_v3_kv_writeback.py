@@ -183,21 +183,41 @@ def test_kv_writeback(
 
 @pytest.mark.skipif(jax.default_backend() != "tpu", reason="Requires TPU DMA support")
 @pytest.mark.parametrize(
-    "sequences,page_size,bkv_sz,bkv_csz,perm_mode",
+    "sequences,page_size,bkv_sz,bkv_csz,perm_mode,num_q_heads,num_kv_heads",
     [
-        ([(393, 273), (137, 512), (65, 191)], 128, 512, 256, "shuffled"),
-        ([(1, 37), (16, 48), (33, 60), (7, 100)], 128, 256, 128, "shuffled"),
-        ([(256, 640), (192, 384), (320, 512)], 128, 512, 256, "reverse_interleaved"),
-        ([(1, 512), (1, 273), (129, 384), (256, 128)], 128, 512, 256, "shuffled"),
+        ([(393, 273), (137, 512), (65, 191)], 128, 512, 256, "shuffled", 8, 2),
+        ([(1, 37), (16, 48), (33, 60), (7, 100)], 128, 256, 128, "shuffled", 8, 2),
+        ([(256, 640), (192, 384), (320, 512)], 128, 512, 256, "reverse_interleaved", 8, 2),
+        ([(1, 512), (1, 273), (129, 384), (256, 128)], 128, 512, 256, "shuffled", 8, 2),
+        # bkv_sz == bkv_csz elides the attention sub-block loop while KV heads
+        # stay pipelined; mixed sits exactly at the 32 * 4 * 512 = 65536 gate.
+        ([(1, 512), (1, 273), (129, 300)], 128, 512, 512, "shuffled", 8, 2),
+        # bkv_sz == page_size (bkv_p == 1): multi-token prefill writeback uses
+        # the single-DMA path, together with loop elision and pipelining.
+        ([(1, 300), (100, 200), (300, 213)], 256, 256, 256, "shuffled", 8, 2),
+        # 32 * 8 * 512 > 65536, so mixed runs QK/PV for each KV head in turn.
+        ([(1, 512), (393, 273), (137, 512)], 128, 1024, 512, "shuffled", 16, 2),
+        # Four KV heads: step1 of each head overlaps step2 of the previous one.
+        ([(1, 700), (64, 350)], 128, 256, 256, "reverse_interleaved", 16, 4),
+        # bkv_csz > 1024, as in the v6e tuned decode and prefill tiles, also
+        # runs KV heads in turn, here with the sub-block loop elided.
+        ([(1, 2100), (1, 1500), (200, 1900)], 128, 2048, 2048, "shuffled", 8, 2),
     ],
     ids=[
         "partial-last-page",
         "single-page-sequences",
         "non-contiguous-strided-pages",
         "mixed-decode-prefill-ragged",
+        "one-subblock-pipelined",
+        "single-page-blocks",
+        "unpipelined-kv-heads",
+        "four-kv-heads",
+        "wide-subblock-unpipelined",
     ],
 )
-def test_ragged_page_table_parity(sequences, page_size, bkv_sz, bkv_csz, perm_mode):
+def test_ragged_page_table_parity(
+    sequences, page_size, bkv_sz, bkv_csz, perm_mode, num_q_heads, num_kv_heads
+):
     q_lens, prefixes = np.array(sequences).T
     kv_lens = q_lens + prefixes
     cu_q_lens = np.r_[0, np.cumsum(q_lens)]
@@ -205,7 +225,7 @@ def test_ragged_page_table_parity(sequences, page_size, bkv_sz, bkv_csz, perm_mo
     page_offsets = np.r_[0, np.cumsum(page_counts)]
     num_tokens = int(cu_q_lens[-1])
     padded_tokens = (num_tokens + 31) // 32 * 32
-    num_q_heads, num_kv_heads, head_dim = 8, 2, 128
+    head_dim = 128
     rng = np.random.default_rng(42)
     total_mapped_pages = int(page_offsets[-1])
     if perm_mode == "shuffled":
