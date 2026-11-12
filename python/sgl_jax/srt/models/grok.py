@@ -114,8 +114,10 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         positions = positions.flatten()
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         freqs = positions.astype(jnp.float32)[..., None] * inv_freq
-        cos = (jnp.cos(freqs) * self.mscale).astype(self.dtype)
-        sin = (jnp.sin(freqs) * self.mscale).astype(self.dtype)
+        # Like the reference ScalingRotaryEmbedding._compute_cos_sin_cache, do not
+        # scale cos/sin by self.mscale (sqrt(scaling_factor), 4.0 for Grok-2).
+        cos = jnp.cos(freqs).astype(self.dtype)
+        sin = jnp.sin(freqs).astype(self.dtype)
         return cos, sin
 
     def _compute_inv_freq(self, scaling_factor: float) -> jax.Array:

@@ -334,7 +334,12 @@ suites = {
         ),
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
-        TestFile("python/sgl_jax/test/layers/test_rotary_embedding.py", 0.2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/layers/test_rotary_embedding.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/layers/test_qsa_indexer.py", 0.1),
         TestFile(
             "python/sgl_jax/test/layers/test_qsa_sparse_backend.py",
