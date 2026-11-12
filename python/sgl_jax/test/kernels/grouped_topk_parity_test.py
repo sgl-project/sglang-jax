@@ -316,6 +316,9 @@ INVALID_CONFIGS = [
     (128, 4, 2, 0, False, "topk"),
     (128, 4, 1, 33, False, "topk"),  # more picks than the one retained group holds (32)
     (128, 4, 4, 129, True, "topk"),  # more picks than experts
+    # one expert per group: the top-2 group score is undefined (main returned ids all 0)
+    (16, 16, 8, 8, False, "one expert per group"),
+    (128, 128, 4, 4, True, "one expert per group"),
 ]
 
 # Boundaries of the contract that must still be accepted (and stay bit-exact with main / REF).
@@ -339,6 +342,23 @@ def test_rejects_out_of_contract_config(E, G, Gtop, k, packed, match):
             interpret=_INTERPRET,
             packed=packed,
         )
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["f32", "packed"])
+def test_one_expert_groups_all_retained_is_plain_topk(packed):
+    # With every group retained the group score never matters, so one expert per group is still
+    # accepted and routes exactly like an ungrouped top-k on the post-bias scores.
+    E = G = Gtop = 128
+    k = 8
+    logits, bias = _cast(*_inputs("dyadic_1/64_ties", BS, E, G), packed)
+    w_live, ids_live = _run("live", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
+    w_main, ids_main = _run("main", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
+    _assert_parity(w_live, ids_live, w_main, ids_main, f"one_expert_groups/packed={packed}")
+    if packed and not _ON_TPU:
+        return  # packed vs REF needs the real Mosaic kernel (see module docstring)
+    ref = ref_biased_grouped_topk_bf16 if packed else ref_biased_grouped_topk
+    w_ref, ids_ref = ref(logits, bias, num_expert_group=1, topk_group=1, topk=k)
+    _assert_ref(w_live, ids_live, np.asarray(w_ref), np.asarray(ids_ref), "one_expert_groups")
 
 
 def test_rejects_mismatched_shapes():

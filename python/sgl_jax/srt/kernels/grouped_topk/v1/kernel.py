@@ -32,8 +32,9 @@ the weight gather). Same pick loop, same arithmetic, bit-identical ids and weigh
 
 Contract (checked in `grouped_topk_pallas` before tracing, `ValueError` otherwise):
 `correction_bias.shape == (E,)`, `1 <= num_expert_group` dividing `E`,
-`1 <= topk_group <= num_expert_group`, `1 <= topk <= topk_group * E / num_expert_group`, and
-`E <= 65536` when `packed=True`.
+`1 <= topk_group <= num_expert_group`, at least 2 experts per group when
+`topk_group < num_expert_group` (the group score is a top-2 sum),
+`1 <= topk <= topk_group * E / num_expert_group`, and `E <= 65536` when `packed=True`.
 """
 
 from __future__ import annotations
@@ -110,6 +111,13 @@ def _validate_config(
             f"topk_group={topk_group} must satisfy 1 <= topk_group <= num_expert_group="
             f"{num_expert_group} (the reference `lax.top_k(group_scores, k=topk_group)` cannot "
             f"select more groups than exist)"
+        )
+    if topk_group < num_expert_group and e // num_expert_group < 2:
+        raise ValueError(
+            f"num_experts={e} / num_expert_group={num_expert_group} leaves one expert per group, "
+            f"so the group score (the sum of each group's top-2 scores) is undefined and "
+            f"topk_group={topk_group} < num_expert_group cannot select groups (the reference "
+            f"`lax.top_k(scores_grouped, k=2)` raises here)"
         )
     retained = topk_group * (e // num_expert_group)
     if not 1 <= topk <= retained:
@@ -294,8 +302,9 @@ def grouped_topk_pallas(
 
     Raises `ValueError` (before tracing the kernel) for configurations outside the routing
     contract: `correction_bias` not `[E]`, `num_expert_group < 1` or not dividing `E`,
-    `topk_group` outside `[1, num_expert_group]`, `topk` outside
-    `[1, topk_group * E / num_expert_group]`, or `packed=True` with more than 65536 experts.
+    `topk_group` outside `[1, num_expert_group]`, one expert per group with
+    `topk_group < num_expert_group`, `topk` outside `[1, topk_group * E / num_expert_group]`, or
+    `packed=True` with more than 65536 experts.
     """
     _validate_config(
         router_logits=router_logits,
