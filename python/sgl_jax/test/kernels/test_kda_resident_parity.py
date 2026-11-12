@@ -12,7 +12,15 @@ the incumbent four-stage ``chunk_kda_fwd`` (``pipeline_impl="incumbent"``) and F
   - Padded single-sequence logical boundaries (``cu_seqlens[1] < T``), on both the
     fast kernel (K, V multiples of 128) and the generic fallback kernel (K or V = 64).
   - Default selection-switch contract on ``chunk_kda_fwd`` and ``kda_forward_packed``.
-  - TPU AOT compilation on v6e and v7x topologies (including ``H=32`` VMEM cap).
+  - Per-position parity against the production-default Mega KDA kernel
+    (``kda_forward_packed(pipeline_impl="incumbent")``).
+  - TPU AOT compilation on v6e and v7x topologies (including ``H=32`` VMEM cap);
+    skipped, not silently passed, when no TPU topology can be built.
+
+Output parity is checked per position (one token of one head): the L2 error of every
+position is normalized by the RMS per-position norm of the reference, so bf16 rounding
+reads ~1e-3 while a systematic few-percent error fails.  Final states are checked the
+same way per (sequence, head).
 """
 
 from __future__ import annotations
@@ -176,6 +184,75 @@ def _run_naive_reference(
     return out, state
 
 
+# Per-position tolerances as (max_rel, mean_rel), relative to the RMS per-position norm
+# of the reference.  Against the FP32 naive recurrence and Mega KDA the resident kernel
+# measures o max_rel <= 2e-3 / mean_rel <= 3e-5 and state max_rel <= 2e-5.  The
+# incumbent four-stage kernel keeps bf16 intermediates, so resident vs. incumbent
+# measures o max_rel <= 1.3e-2 / mean_rel <= 3.2e-3 and state max_rel <= 3.3e-3 /
+# mean_rel <= 2.4e-3.  Scaling the inter-chunk output term by 0.9 (a 4-8% error)
+# measures o max_rel >= 3.6e-2 and mean_rel >= 9e-3 in every multi-chunk or
+# initial-state case below, against every reference.
+O_TOL = (1e-2, 2e-3)
+STATE_TOL = (2e-3, 1e-3)
+O_TOL_INCUMBENT = (3e-2, 6e-3)
+STATE_TOL_INCUMBENT = (1e-2, 6e-3)
+
+
+def _per_position_stats(actual, expected, *, reduce_axes: int = 1) -> dict:
+    """Error statistics of ``actual`` vs ``expected`` per position.
+
+    A position is everything except the trailing ``reduce_axes`` axes: one token of one
+    head for outputs ``[B, T, H, V]`` (``reduce_axes=1``), one (sequence, head) for
+    states ``[N, H, K, V]`` (``reduce_axes=2``).
+    """
+    a = np.asarray(actual, dtype=np.float64)
+    e = np.asarray(expected, dtype=np.float64)
+    assert a.shape == e.shape, (a.shape, e.shape)
+    lead_shape = a.shape[: a.ndim - reduce_axes]
+    a2 = a.reshape(int(np.prod(lead_shape)), -1)
+    e2 = e.reshape(a2.shape)
+    if a2.size == 0:
+        return {"max_rel": 0.0, "mean_rel": 0.0, "max_abs": 0.0, "min_cos": 1.0}
+    err_norm = np.linalg.norm(a2 - e2, axis=1)
+    ref_norm = np.linalg.norm(e2, axis=1)
+    ref_rms = max(float(np.sqrt(np.mean(ref_norm**2))), 1e-12)
+    rel = err_norm / ref_rms
+    act_norm = np.linalg.norm(a2, axis=1)
+    denom = act_norm * ref_norm
+    cos = np.where(denom > 0, np.sum(a2 * e2, axis=1) / np.maximum(denom, 1e-30), 1.0)
+    worst = int(np.argmax(rel))
+    return {
+        "max_rel": float(rel.max()),
+        "mean_rel": float(rel.mean()),
+        "p99_rel": float(np.percentile(rel, 99)),
+        "max_abs": float(np.abs(a2 - e2).max()),
+        "ref_max_abs": float(np.abs(e2).max()),
+        "min_cos": float(cos.min()),
+        "worst_pos": tuple(int(i) for i in np.unravel_index(worst, lead_shape)),
+    }
+
+
+def _assert_per_position_close(
+    actual,
+    expected,
+    *,
+    label: str,
+    reduce_axes: int = 1,
+    tol: tuple[float, float] | None = None,
+):
+    if tol is None:
+        tol = O_TOL if reduce_axes == 1 else STATE_TOL
+    max_rel, mean_rel = tol
+    actual_np = np.asarray(actual, dtype=np.float32)
+    assert np.isfinite(actual_np).all(), f"{label}: non-finite values"
+    stats = _per_position_stats(actual, expected, reduce_axes=reduce_axes)
+    print(f"[per-position] {label}: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    assert stats["max_rel"] <= max_rel and stats["mean_rel"] <= mean_rel, (
+        f"{label}: per-position error exceeds tolerance "
+        f"(max_rel<={max_rel}, mean_rel<={mean_rel}): {stats}"
+    )
+
+
 @pytest.mark.parametrize(
     ("lengths", "heads", "chunk_size", "lower_bound", "safe_gate"),
     [
@@ -253,19 +330,78 @@ def test_resident_matches_incumbent_and_naive_per_position(
     )
     jax.block_until_ready((inc_out, inc_state, res_out, res_state, naive_out, naive_state))
 
-    res_o_f32 = np.asarray(res_out, dtype=np.float32)
-    inc_o_f32 = np.asarray(inc_out, dtype=np.float32)
-    naive_o_f32 = np.asarray(naive_out, dtype=np.float32)
-    res_s_f32 = np.asarray(res_state, dtype=np.float32)
-    inc_s_f32 = np.asarray(inc_state, dtype=np.float32)
-    naive_s_f32 = np.asarray(naive_state, dtype=np.float32)
+    _assert_per_position_close(
+        res_out, inc_out, label="o resident vs incumbent", tol=O_TOL_INCUMBENT
+    )
+    _assert_per_position_close(res_out, naive_out, label="o resident vs naive")
+    _assert_per_position_close(
+        res_state,
+        inc_state,
+        label="state resident vs incumbent",
+        reduce_axes=2,
+        tol=STATE_TOL_INCUMBENT,
+    )
+    _assert_per_position_close(
+        res_state, naive_state, label="state resident vs naive", reduce_axes=2
+    )
 
-    assert np.isfinite(res_o_f32).all()
-    assert np.isfinite(res_s_f32).all()
-    np.testing.assert_allclose(res_o_f32, inc_o_f32, rtol=2e-2, atol=2e-2)
-    np.testing.assert_allclose(res_o_f32, naive_o_f32, rtol=2e-2, atol=2e-2)
-    np.testing.assert_allclose(res_s_f32, inc_s_f32, rtol=3e-2, atol=3e-2)
-    np.testing.assert_allclose(res_s_f32, naive_s_f32, rtol=3e-2, atol=3e-2)
+
+@pytest.mark.parametrize(
+    ("lengths", "heads", "physical_t", "lower_bound"),
+    [
+        ((64,), 8, None, -5.0),
+        ((199,), 4, 256, None),
+        ((100,), 16, 128, -5.0),
+        ((128,), 32, None, None),
+        ((37, 91), 8, 192, -5.0),
+    ],
+)
+def test_resident_matches_mega_per_position(
+    lengths: tuple[int, ...],
+    heads: int,
+    physical_t: int | None,
+    lower_bound: float | None,
+):
+    """Per-position parity of resident vs. the production-default Mega KDA kernel.
+
+    Both run through ``kda_forward_packed`` with the arguments ``KDAAttnBackend`` uses
+    (raw Q/K with in-kernel L2 norm and gate activation), on bucket-padded token layouts.
+    """
+    case = _make_inputs(
+        lengths,
+        heads,
+        physical_t=physical_t,
+        seed=6100 + heads + sum(lengths),
+        beta_dtype=jnp.float32 if lower_bound is None else jnp.bfloat16,
+    )
+    kwargs = dict(
+        cu_seqlens=case["cu_seqlens"],
+        A_log=case["a_log"],
+        dt_bias=case["dt_bias"],
+        scale=SCALE,
+        initial_state=case["initial_state"],
+        lower_bound=lower_bound,
+    )
+    args = (case["q"], case["k"], case["v"], case["raw_g"], case["beta"])
+    mega_out, mega_state = kda_forward_packed(*args, **kwargs, pipeline_impl="incumbent")
+    res_out, res_state = kda_forward_packed(*args, **kwargs, pipeline_impl="fused_resident")
+    naive_out, naive_state = _run_naive_reference(
+        case,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    jax.block_until_ready((mega_out, mega_state, res_out, res_state, naive_out, naive_state))
+
+    logical_t = case["logical_t"]
+    _assert_per_position_close(
+        res_out[:, :logical_t], mega_out[:, :logical_t], label="o resident vs mega"
+    )
+    _assert_per_position_close(res_out[:, :logical_t], naive_out, label="o resident vs naive")
+    _assert_per_position_close(res_state, mega_state, label="state resident vs mega", reduce_axes=2)
+    _assert_per_position_close(
+        res_state, naive_state, label="state resident vs naive", reduce_axes=2
+    )
 
 
 # (K, V) = (128, 128) runs the fast multi-head kernel; any head dim that is not a
@@ -334,6 +470,71 @@ def test_padded_single_seq_preserves_logical_boundary(
     assert abs(float(res_state[0, 0, 0, 0]) - expected_diag) < 2e-4
 
 
+@pytest.mark.parametrize(("k_dim", "v_dim"), _PADDED_HEAD_DIMS)
+@pytest.mark.parametrize(
+    ("lower_bound", "use_gate_in_kernel"), [(None, True), (-5.0, True), (-5.0, False)]
+)
+def test_padded_single_seq_random_tail_matches_naive(
+    lower_bound: float | None, use_gate_in_kernel: bool, k_dim: int, v_dim: int
+):
+    """cu_seqlens=[0, 63] inside T=128 with random (non-zero) tail tokens.
+
+    Only the 63 logical tokens may update the state; per-position outputs over the
+    logical prefix and the final state must match the FP32 naive recurrence.
+    """
+    logical_t = 63
+    case = _make_inputs(
+        (logical_t,),
+        2,
+        physical_t=128,
+        seed=5100 + k_dim + v_dim,
+        beta_dtype=jnp.float32 if lower_bound is None else jnp.bfloat16,
+        k_dim=k_dim,
+        v_dim=v_dim,
+    )
+    if not use_gate_in_kernel:
+        case["raw_g"] = _activate_gate(case["raw_g"], case["a_log"], case["dt_bias"], lower_bound)
+    q_norm = _l2_normalize(case["q"])
+    k_norm = _l2_normalize(case["k"])
+
+    res_out, res_state, *_ = chunk_kda_fwd(
+        q_norm,
+        k_norm,
+        case["v"],
+        case["raw_g"],
+        case["beta"],
+        k_dim**-0.5,
+        case["initial_state"],
+        True,
+        case["cu_seqlens"],
+        chunk_size=64,
+        safe_gate=True,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=case["a_log"] if use_gate_in_kernel else None,
+        dt_bias=case["dt_bias"] if use_gate_in_kernel else None,
+        pipeline_impl="fused_resident",
+    )
+    naive_out, naive_state = _run_naive_reference(
+        case,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_qk_l2norm_in_kernel=True,
+    )
+    jax.block_until_ready((res_out, res_state, naive_out, naive_state))
+
+    assert res_out.shape == (1, 128, 2, v_dim)
+    _assert_per_position_close(
+        res_out[:, :logical_t], naive_out, label=f"o padded K={k_dim} V={v_dim} vs naive"
+    )
+    _assert_per_position_close(
+        res_state,
+        naive_state,
+        label=f"state padded K={k_dim} V={v_dim} vs naive",
+        reduce_axes=2,
+    )
+
+
 def test_zero_length_segments_and_single_chunk_state_elision():
     """Verify zero-length requests and single-chunk zero-initial-state elision."""
     # 1. Single-chunk zero-initial-state elision (N=1, T=64, h0=None, output_final_state=False)
@@ -364,12 +565,7 @@ def test_zero_length_segments_and_single_chunk_state_elision():
         use_qk_l2norm_in_kernel=True,
     )
     assert res_ht is None
-    np.testing.assert_allclose(
-        np.asarray(res_o, dtype=np.float32),
-        np.asarray(naive_o, dtype=np.float32),
-        rtol=2e-2,
-        atol=2e-2,
-    )
+    _assert_per_position_close(res_o, naive_o, label="o elided-state vs naive")
 
     # 2. Packed varlen with a zero-length segment: lengths = (0, 32, 32)
     case_zero_seg = _make_inputs((0, 32, 32), 4, seed=3102)
@@ -404,17 +600,9 @@ def test_zero_length_segments_and_single_chunk_state_elision():
         rtol=1e-6,
         atol=1e-6,
     )
-    np.testing.assert_allclose(
-        np.asarray(res_o2, dtype=np.float32),
-        np.asarray(naive_o2, dtype=np.float32),
-        rtol=2e-2,
-        atol=2e-2,
-    )
-    np.testing.assert_allclose(
-        np.asarray(res_ht2, dtype=np.float32),
-        np.asarray(naive_ht2, dtype=np.float32),
-        rtol=2e-2,
-        atol=2e-2,
+    _assert_per_position_close(res_o2, naive_o2, label="o zero-length varlen vs naive")
+    _assert_per_position_close(
+        res_ht2, naive_ht2, label="state zero-length varlen vs naive", reduce_axes=2
     )
 
 
@@ -524,67 +712,81 @@ def test_selection_switch_contract_and_defaults():
         )
 
 
-def test_resident_tpu_aot_compile_v6e_and_v7x(monkeypatch):
-    """AOT-compile the resident pipeline for v6e and v7x (including H=32 VMEM cap)."""
+@pytest.mark.parametrize(
+    ("topo_name", "chips_bounds", "heads", "tokens", "lower_bound"),
+    [
+        ("v6e:1x1", (1, 1, 1), 8, 64, -5.0),
+        ("v7x:2x2x1", (2, 2, 1), 32, 128, -5.0),
+        ("v7x:2x2x1", (2, 2, 1), 32, 128, None),
+    ],
+)
+def test_resident_tpu_aot_compile_v6e_and_v7x(
+    monkeypatch,
+    topo_name: str,
+    chips_bounds: tuple[int, int, int],
+    heads: int,
+    tokens: int,
+    lower_bound: float | None,
+):
+    """AOT-compile the resident pipeline for v6e and v7x (including H=32 VMEM cap).
+
+    Skipped (never silently passed) when the TPU topology cannot be built here.
+    """
     try:
         from jax.experimental.topologies import get_topology_desc
 
         from sgl_jax.srt.utils.jax_utils import compilation_target
-    except Exception:
-        pytest.skip("TPU topology descriptor unavailable")
+    except Exception as exc:
+        pytest.skip(f"TPU topology descriptor unavailable: {exc}")
+
+    try:
+        devices = get_topology_desc(
+            platform="tpu",
+            topology_name=topo_name,
+            chip_config_name="default",
+            chips_per_host_bounds=chips_bounds,
+            num_slices=1,
+            wrap=(False, False, False),
+        ).devices
+    except Exception as exc:
+        pytest.skip(f"TPU topology {topo_name} unavailable on this host: {exc}")
 
     monkeypatch.setenv("PALLAS_INTERPRET", "0")
 
-    for topo_name, chips_bounds, heads, tokens in [
-        ("v6e:1x1", (1, 1, 1), 8, 64),
-        ("v7x:2x2x1", (2, 2, 1), 32, 128),
-    ]:
-        try:
-            devices = get_topology_desc(
-                platform="tpu",
-                topology_name=topo_name,
-                chip_config_name="default",
-                chips_per_host_bounds=chips_bounds,
-                num_slices=1,
-                wrap=(False, False, False),
-            ).devices
-        except Exception:
-            continue
+    mesh = jax.sharding.Mesh(np.asarray(devices[:1]), ("data",))
+    q_spec = jax.ShapeDtypeStruct((1, tokens, heads, K), jnp.bfloat16)
+    v_spec = jax.ShapeDtypeStruct((1, tokens, heads, V), jnp.bfloat16)
+    b_spec = jax.ShapeDtypeStruct((1, tokens, heads), jnp.bfloat16)
+    a_spec = jax.ShapeDtypeStruct((heads,), jnp.float32)
+    db_spec = jax.ShapeDtypeStruct((heads, K), jnp.float32)
+    h0_spec = jax.ShapeDtypeStruct((1, heads, K, V), jnp.float32)
+    cu_spec = jax.ShapeDtypeStruct((2,), jnp.int32)
 
-        mesh = jax.sharding.Mesh(np.asarray(devices[:1]), ("data",))
-        q_spec = jax.ShapeDtypeStruct((1, tokens, heads, K), jnp.bfloat16)
-        v_spec = jax.ShapeDtypeStruct((1, tokens, heads, V), jnp.bfloat16)
-        b_spec = jax.ShapeDtypeStruct((1, tokens, heads), jnp.bfloat16)
-        a_spec = jax.ShapeDtypeStruct((heads,), jnp.float32)
-        db_spec = jax.ShapeDtypeStruct((heads, K), jnp.float32)
-        h0_spec = jax.ShapeDtypeStruct((1, heads, K, V), jnp.float32)
-        cu_spec = jax.ShapeDtypeStruct((2,), jnp.int32)
+    def _fn(q, k, v, g, b, al, db, h0, cu):
+        return resident_pipeline_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            b,
+            SCALE,
+            h0,
+            True,
+            cu,
+            chunk_size=64,
+            safe_gate=True,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+            A_log=al,
+            dt_bias=db,
+        )[:2]
 
-        def _fn(q, k, v, g, b, al, db, h0, cu):
-            return resident_pipeline_kda_fwd(
-                q,
-                k,
-                v,
-                g,
-                b,
-                SCALE,
-                h0,
-                True,
-                cu,
-                chunk_size=64,
-                safe_gate=True,
-                lower_bound=-5.0,
-                use_gate_in_kernel=True,
-                use_qk_l2norm_in_kernel=True,
-                A_log=al,
-                dt_bias=db,
-            )[:2]
-
-        with compilation_target(mesh):
-            lowered = (
-                jax.jit(_fn)
-                .trace(q_spec, q_spec, v_spec, q_spec, b_spec, a_spec, db_spec, h0_spec, cu_spec)
-                .lower(lowering_platforms=("tpu",))
-            )
-            compiled = lowered.compile()
-            assert compiled is not None
+    with compilation_target(mesh):
+        lowered = (
+            jax.jit(_fn)
+            .trace(q_spec, q_spec, v_spec, q_spec, b_spec, a_spec, db_spec, h0_spec, cu_spec)
+            .lower(lowering_platforms=("tpu",))
+        )
+        compiled = lowered.compile()
+        assert compiled is not None
