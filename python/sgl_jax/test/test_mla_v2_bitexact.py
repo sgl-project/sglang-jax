@@ -291,7 +291,9 @@ class _FakeAsyncCopy:
         self.dst = dst
 
     def start(self):
-        if self.src.shape != self.dst.shape or self.src._get_view().size == 0:
+        if self.src.shape != self.dst.shape:
+            raise ValueError(f"DMA shape mismatch: {self.src.shape} -> {self.dst.shape}")
+        if self.src._get_view().size == 0:
             return
         self.dst[...] = self.src[...]
 
@@ -884,7 +886,8 @@ def make_mla_v2_parity_inputs(
 
     cu_q_lens = jnp.asarray(np.r_[0, np.cumsum(q_lens)], jnp.int32)
     cu_kv_lens = jnp.asarray(np.r_[0, np.cumsum(aligned_kv_lens)], jnp.int32)
-    page_indices = jnp.arange(sum(page_counts), dtype=jnp.int32)
+    # Scattered physical pages, so a kernel that ignores page_indices fails.
+    page_indices = jnp.asarray(rng.permutation(total_pages)[: sum(page_counts)], jnp.int32)
     kv_lens_arr = jnp.asarray(kv_lens, jnp.int32)
 
     is_decode = all(q == 1 for q in q_lens)
