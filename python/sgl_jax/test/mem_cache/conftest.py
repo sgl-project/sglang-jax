@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.mem_cache import memory_pool
@@ -29,22 +28,25 @@ def _cpu_fused_kv_scatter(
     data_partition_axis="data",
     mesh=None,
 ):
-    flat_spec = P(data_partition_axis, kv_partition_axis, None, None)
-    cache_spec = P(data_partition_axis, None, kv_partition_axis, None, None)
-    if mesh is not None:
-        flat_out = NamedSharding(mesh, flat_spec)
-        cache_out = NamedSharding(mesh, cache_spec)
-    else:
-        flat_out, cache_out = flat_spec, cache_spec
-    flat = jax.lax.reshape(
-        kv_cache,
-        (kv_cache.shape[0] * kv_cache.shape[1],) + tuple(kv_cache.shape[2:]),
-        out_sharding=flat_out,
+    # Preserve the production shard_map boundary: loc contains rank-local
+    # indices. A global scatter aliases rank 1 writes into rank 0 on CPU.
+    spec = P(data_partition_axis, None, kv_partition_axis, None, None)
+
+    @jax.shard_map(
+        in_specs=(spec, P(data_partition_axis), spec),
+        out_specs=spec,
+        mesh=mesh,
+        check_vma=False,
     )
-    loc_i = loc.astype(jnp.int32)
-    safe = jnp.where(loc_i == -1, flat.shape[0], loc_i)
-    flat = flat.at[safe].set(fused_kv[:, 0], mode="drop", out_sharding=flat_out)
-    return jax.lax.reshape(flat, kv_cache.shape, out_sharding=cache_out)
+    def scatter(local_kv, local_loc, local_cache):
+        flat = local_cache.reshape(
+            (local_cache.shape[0] * local_cache.shape[1],) + local_cache.shape[2:]
+        )
+        safe = jnp.where(local_loc == -1, flat.shape[0], local_loc).astype(jnp.int32)
+        flat = flat.at[safe].set(local_kv[:, 0], mode="drop")
+        return flat.reshape(local_cache.shape)
+
+    return scatter(fused_kv, loc, kv_cache)
 
 
 if jax.default_backend() != "tpu":

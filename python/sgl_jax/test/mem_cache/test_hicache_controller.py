@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -105,6 +106,7 @@ class _FakeLoadPool:
         self.raise_on_stage = raise_on_stage
         self.staged = []
         self.flushed = []
+        self.discarded = []
 
     def stage_load(self, host_buffer_ids):
         if self.stage_gate is not None:
@@ -115,6 +117,9 @@ class _FakeLoadPool:
 
     def flush_load(self, host_buffer_ids, device_indices):
         self.flushed.append((list(host_buffer_ids), list(device_indices)))
+
+    def discard_load(self, host_buffer_ids):
+        self.discarded.extend(host_buffer_ids)
 
     def free(self, host_buffer_ids):
         pass
@@ -172,6 +177,9 @@ class TestHiCacheControllerAsync(unittest.TestCase):
             ctrl.write([1], [0])
             with self.assertRaises(RuntimeError):
                 ctrl.drain_pending()
+            self.assertFalse(ctrl.has_inflight([0]))
+            ctrl.evict_callback([0])
+            self.assertEqual(pool.released, [0])
         finally:
             ctrl.shutdown()
 
@@ -204,6 +212,69 @@ class TestHiCacheControllerEvict(unittest.TestCase):
             ctrl.shutdown()
 
 
+class TestHiCacheControllerSubmission(unittest.TestCase):
+    def test_shutdown_rejection_releases_inflight_registration(self):
+        for load in (False, True):
+            with self.subTest(load=load):
+                pool = _FakeLoadPool() if load else _FakePool()
+                ctrl = HiCacheController(pool, device_pool=None)
+                ctrl._executor.shutdown(wait=True)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "after shutdown"):
+                        if load:
+                            ctrl.stage_load([0])
+                        else:
+                            ctrl.write([1], [0])
+                    self.assertFalse(ctrl.has_inflight([0]))
+                    self.assertFalse(ctrl._pending_load or ctrl._pending)
+                    if load:
+                        ctrl.discard_load([0])
+                        self.assertEqual(pool.staged, [])
+                        self.assertEqual(pool.discarded, [0])
+                    else:
+                        self.assertEqual(pool.copy_into_calls, [])
+                    ctrl.evict_callback([0])
+                finally:
+                    ctrl.shutdown()
+
+    def test_post_enqueue_submission_error_keeps_inflight_protection(self):
+        for load in (False, True):
+            with self.subTest(load=load):
+                pool = _FakeLoadPool() if load else _FakePool()
+                ctrl = HiCacheController(pool, device_pool=None)
+                try:
+                    # CPython queues the work before trying to start a worker.
+                    # A submit exception here does not mean no transfer exists.
+                    with (
+                        patch.object(
+                            ctrl._executor,
+                            "_adjust_thread_count",
+                            side_effect=RuntimeError("worker start failed"),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "worker start failed"),
+                    ):
+                        if load:
+                            ctrl.stage_load([0])
+                        else:
+                            ctrl.write([1], [0])
+                    self.assertTrue(ctrl.has_inflight([0]))
+                    with self.assertRaisesRegex(RuntimeError, "in-flight"):
+                        ctrl.evict_callback([0])
+                    if load:
+                        with self.assertRaisesRegex(RuntimeError, "in-flight"):
+                            ctrl.discard_load([0])
+                    # Starting a worker proves the previously queued transfer
+                    # still runs, despite its caller never receiving a Future.
+                    ctrl._executor.submit(lambda: None).result(timeout=5)
+                    self.assertFalse(ctrl.has_inflight([0]))
+                    if load:
+                        self.assertEqual(pool.staged, [[0]])
+                    else:
+                        self.assertEqual(pool.copy_into_calls, [([1], [0])])
+                finally:
+                    ctrl.shutdown()
+
+
 class TestHiCacheControllerLoadAsync(unittest.TestCase):
     """The async H2D split used by the overlap scheduler: stage_load (off-thread
     device_put, registers the page in-flight) + flush_load (donation-safe scatter,
@@ -227,6 +298,23 @@ class TestHiCacheControllerLoadAsync(unittest.TestCase):
             gate.set()
             ctrl.shutdown()
 
+    def test_discard_rejects_inflight_stage_until_drain(self):
+        gate = threading.Event()
+        pool = _FakeLoadPool(stage_gate=gate)
+        ctrl = HiCacheController(pool, device_pool=None)
+        try:
+            ctrl.stage_load([0])
+            with self.assertRaisesRegex(RuntimeError, "in-flight stage_load"):
+                ctrl.discard_load([0])
+            self.assertEqual(pool.discarded, [])
+            gate.set()
+            ctrl.drain_loads()
+            ctrl.discard_load([0])
+            self.assertEqual(pool.discarded, [0])
+        finally:
+            gate.set()
+            ctrl.shutdown()
+
     def test_drain_loads_reraises_stage_error(self):
         pool = _FakeLoadPool(raise_on_stage=True)
         ctrl = HiCacheController(pool, device_pool=None)
@@ -234,6 +322,9 @@ class TestHiCacheControllerLoadAsync(unittest.TestCase):
             ctrl.stage_load([1])
             with self.assertRaises(RuntimeError):
                 ctrl.drain_loads()
+            self.assertFalse(ctrl.has_inflight([1]))
+            ctrl.discard_load([1])
+            self.assertEqual(pool.discarded, [1])
         finally:
             ctrl.shutdown()
 
