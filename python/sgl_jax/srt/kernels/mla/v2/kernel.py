@@ -794,8 +794,13 @@ def _mla_ragged_paged_attention_kernel(
                         kv_packing_idx_new += 1
                         curr_kvc_reg = next_kvc_reg
                         curr_kpe_reg = next_kpe_reg
-                        next_kvc_reg = bkvc_vmem_ref[kv_packing_idx_new + 1, :, :]
-                        next_kpe_reg = bkvpe_vmem_ref[kv_packing_idx_new + 1, :, :]
+                        # The last iteration's lookahead is never used and can point one
+                        # word past the buffer; clamp it so the read stays in bounds.
+                        next_kv_packing_idx = jnp.minimum(
+                            kv_packing_idx_new + 1, bkvc_vmem_ref.shape[0] - 1
+                        )
+                        next_kvc_reg = bkvc_vmem_ref[next_kv_packing_idx, :, :]
+                        next_kpe_reg = bkvpe_vmem_ref[next_kv_packing_idx, :, :]
                         return (
                             kv_packing_idx,
                             kv_packing_idx_new,

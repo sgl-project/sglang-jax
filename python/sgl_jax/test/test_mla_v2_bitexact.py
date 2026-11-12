@@ -205,11 +205,11 @@ class _CpuRef:
                 self._on_root_read(self._buf.copy())
             return jnp.asarray(self._get_view())
         view = self._get_view()
-        norm = list(self._norm_idx(idx))
+        norm = self._norm_idx(idx)
         for d, item in enumerate(norm):
-            if isinstance(item, int) and d < view.ndim:
-                norm[d] = min(max(item, 0), view.shape[d] - 1)
-        return jnp.asarray(view[tuple(norm)])
+            if isinstance(item, int) and d < view.ndim and not 0 <= item < view.shape[d]:
+                raise IndexError(f"ref read index {item} out of range for dim {d} of {view.shape}")
+        return jnp.asarray(view[norm])
 
     def __setitem__(self, idx, val):
         cur = self._get_view().copy()
