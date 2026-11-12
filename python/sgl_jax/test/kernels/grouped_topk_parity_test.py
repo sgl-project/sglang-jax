@@ -193,6 +193,19 @@ def _assert_ref(w_live, ids_live, w_ref, ids_ref, msg):
     assert n_bits == 0, f"{msg}: {n_bits} weight words differ from reference"
 
 
+def _assert_ids_in_range(w, ids, logits, bias, *, E, packed, msg):
+    """Valid expert ids are [0, E). The f32 select emits the out-of-range sentinel id E (weight 0)
+    only for a token whose max post-bias score is NaN, since no score compares equal to it; the
+    packed select decodes every id from its key, so it never emits E."""
+    scores = np.asarray(logits, np.float32) + np.asarray(bias, np.float32)[None, :]
+    has_nan = np.isnan(scores).any(axis=1)  # [BS] tokens with a NaN post-bias score
+    clean = np.ones_like(has_nan) if packed else ~has_nan
+    assert ids.min() >= 0, f"{msg}: negative expert id"
+    assert np.all(ids[clean] < E), f"{msg}: id out of [0, E) on a token with no NaN score"
+    assert np.all(ids <= E), f"{msg}: id above the sentinel E"
+    assert np.all(w[ids == E] == 0.0), f"{msg}: sentinel id E carries a nonzero weight"
+
+
 def _cast(logits, bias, packed):
     if packed:  # the caller enables packed only for bf16 router logits
         return logits.astype(jnp.bfloat16), bias.astype(jnp.bfloat16)
@@ -212,7 +225,9 @@ def test_parity_vs_main(E, G, Gtop, k, name, pattern, packed):
     logits, bias = _cast(*_inputs(pattern, BS, E, G), packed)
     w_live, ids_live = _run("live", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
     w_main, ids_main = _run("main", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
-    _assert_parity(w_live, ids_live, w_main, ids_main, f"{name}/{pattern}/packed={packed}")
+    msg = f"{name}/{pattern}/packed={packed}"
+    _assert_parity(w_live, ids_live, w_main, ids_main, msg)
+    _assert_ids_in_range(w_live, ids_live, logits, bias, E=E, packed=packed, msg=msg)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -286,8 +301,10 @@ def test_expert_id_agreement_rate_dsv3(packed):
 
 
 # ---------------------------------------------------------------------------------------------
-# NaN / -inf contract on hardware: NaN scores never produce an out-of-range expert id when any
-# finite candidate exists, and live == main bit-for-bit (the CPU interpreter cannot pin this).
+# NaN / -inf contract on hardware: live == main bit-for-bit (the CPU interpreter cannot pin this),
+# every token without a NaN post-bias score (including all -inf tokens) gets ids in [0, E), and
+# the f32 select emits the out-of-range sentinel id E, with weight 0, only on a token whose max
+# post-bias score is NaN (e.g. a whole-NaN row on the all-groups path), exactly as main does.
 # ---------------------------------------------------------------------------------------------
 @_requires_tpu
 @pytest.mark.parametrize("packed", [False, True], ids=["f32", "packed"])
@@ -297,8 +314,9 @@ def test_nan_and_inf_parity_on_tpu(E, G, Gtop, k, name, pattern, packed):
     logits, bias = _cast(*_inputs(pattern, BS, E, G), packed)
     w_live, ids_live = _run("live", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
     w_main, ids_main = _run("main", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
-    _assert_parity(w_live, ids_live, w_main, ids_main, f"{name}/{pattern}/packed={packed}")
-    assert ids_live.min() >= 0 and ids_live.max() <= E, f"{name}/{pattern}: id out of [0, E]"
+    msg = f"{name}/{pattern}/packed={packed}"
+    _assert_parity(w_live, ids_live, w_main, ids_main, msg)
+    _assert_ids_in_range(w_live, ids_live, logits, bias, E=E, packed=packed, msg=msg)
 
 
 # ---------------------------------------------------------------------------------------------
