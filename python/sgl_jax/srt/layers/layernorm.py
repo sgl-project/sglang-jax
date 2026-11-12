@@ -8,6 +8,7 @@ from flax import nnx
 from flax.nnx.nn import dtypes
 from flax.typing import Array, Axes, Dtype
 from jax import lax
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -16,6 +17,16 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 # same row can differ between batch sizes. With SGLANG_JAX_FIXED_TILE set (see layers/linear.py),
 # RMSNorm runs the fixed-tile Pallas kernel, one fixed reduction per row. Off by default.
 _FIXED_TILE = os.environ.get("SGLANG_JAX_FIXED_TILE", "0").lower() in ("1", "true")
+
+
+def _fixed_tile_supported(x) -> bool:
+    """The fixed-tile RMSNorm needs a mesh-sharded input with an unsharded last axis.
+    Anything else falls back to the XLA path."""
+    sharding = getattr(jax.typeof(x), "sharding", None)
+    if not isinstance(sharding, NamedSharding) or sharding.mesh.empty:
+        return False
+    spec = tuple(sharding.spec) + (None,) * (x.ndim - len(sharding.spec))
+    return spec[-1] is None
 
 
 def _fixed_tile_rmsnorm_sharded(x, weight, eps, add_unit_offset):
@@ -113,6 +124,7 @@ class RMSNorm(nnx.Module):
             and mask is None
             and self.axis_name is None
             and _canonicalize_axes(x.ndim, self.reduction_axes) == (x.ndim - 1,)
+            and _fixed_tile_supported(x)
         ):
             return _fixed_tile_rmsnorm_sharded(
                 x, self.scale[...] if self.scale else None, self.epsilon, False
@@ -253,7 +265,7 @@ class GemmaRMSNorm(nnx.Module):
             x = x + jnp.astype(residual, jnp.float16) if orig_dtype == jnp.float16 else x + residual
             residual = x
 
-        if _FIXED_TILE:
+        if _FIXED_TILE and _fixed_tile_supported(x):
             y = _fixed_tile_rmsnorm_sharded(x, self.weight[...], self.epsilon, self.add_unit_offset)
             return y if residual is None else (y, residual)
 
