@@ -1785,6 +1785,18 @@ def _fused_ep_moe_kernel(
                                 pl.ds(btc_id * btc, btc),
                                 k_slice_bd1c,
                             ] = t_unpacked_bd1c[p_init]
+                elif (
+                    t_2d_vmem is not None and bf_id == 0 and w1_scale_vmem is not None and n_sg > 1
+                ):
+                    # The multi-scale-group path below reads per-group slices and
+                    # never writes the bf-resident x cache itself, but bf_id > 0
+                    # skips HBM token staging and reads only the cache.
+                    for p_init in range(t_packing):
+                        t_2d_vmem[
+                            p_init,
+                            pl.ds(btc_id * btc, btc),
+                            k_slice_bd1c,
+                        ] = t_vmem[pl.ds(btc_id * btc, btc), p_init, k_slice_bd1c]
 
                 for p_id in range(t_packing):
                     is_last_step = (

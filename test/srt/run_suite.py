@@ -344,6 +344,12 @@ suites = {
         TestFile("test/srt/kernels/qsa/test_sparse_gqa_ref.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
+        TestFile(
+            "python/sgl_jax/test/kernels/fused_moe_v1_interpret_test.py",
+            2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
