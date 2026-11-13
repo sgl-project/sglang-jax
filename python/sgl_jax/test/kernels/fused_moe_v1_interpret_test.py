@@ -1,17 +1,19 @@
-"""CPU interpret-mode numeric tests for the FusedEPMoE v1 bf-resident VMEM caches.
+"""CPU interpret-mode numeric tests for the FusedEPMoE v1 kernel.
 
 These tests run the real Pallas kernel (not a simulation) under Pallas TPU
 interpret mode on CPU and compare it against ``ref_moe``. Uninitialized VMEM is
 filled with NaN, so a slice that reads a buffer the kernel never wrote (for
 example the x 2D token cache ``b_x_2d_vmem`` on ``bf_id > 0``) shows up as NaN
-in the output instead of passing on stale data.
+in the output instead of passing on stale data. The interpreter's race detector
+is on, and every case asserts that it reported no DMA race.
 
 Every case uses ``num_bd1 == num_bd2 == 1`` and ``num_bf > 1``, which turns on
 both the x cache and the FFN2 partial-sum cache when ``vmem_2d_tile_relayout``
-is set (the default). The cases keep ``bt <= 16`` so the output accumulation
-runs a single acc tile: with two or more acc tiles both ping-pong buffers share
-``a2a_acc_sems[0]``, a pre-existing ordering hazard that ``on_wait`` DMA mode
-exposes independently of the caches.
+is set (the default).
+
+``on_wait`` DMA mode runs a DMA only when it is waited on, which is a legal
+completion order on hardware. It exposes waits that a different DMA can
+satisfy, such as the output acc ping-pong buffers with ``bt >= 32``.
 """
 
 import contextlib
@@ -22,6 +24,7 @@ import numpy as np
 from absl.testing import absltest, parameterized
 from jax import lax
 from jax._src import test_util as jtu
+from jax._src.pallas.mosaic.interpret import interpret_pallas_call as mosaic_interpret
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
@@ -42,6 +45,12 @@ jax.config.parse_flags_with_absl()
 _REAL_PALLAS_CALL = pl.pallas_call
 
 
+def _interpreter_races_found() -> bool:
+    # Set by the TPU interpreter's race detector for the most recent kernel launch.
+    races = mosaic_interpret.races
+    return races is not None and races.races_found
+
+
 @contextlib.contextmanager
 def _tpu_interpret(dma_execution_mode: str):
     """Run every pallas_call in TPU interpret mode and record its scratch shapes."""
@@ -50,6 +59,7 @@ def _tpu_interpret(dma_execution_mode: str):
     def _interpret_pallas_call(*args, **kwargs):
         kwargs.pop("compiler_params", None)
         kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True,
             uninitialized_memory="nan",
             out_of_bounds_reads="raise",
             dma_execution_mode=dma_execution_mode,
@@ -170,6 +180,9 @@ class FusedMoEV1InterpretTest(jtu.JaxTestCase):
                 tp_axis_name="tensor",
             )
             actual = np.asarray(jax.device_get(actual)).astype(np.float32)
+            races_found = _interpreter_races_found()
+
+        self.assertFalse(races_found, msg="the TPU interpreter detected a DMA race")
 
         # Both bf-resident caches, (t_packing, a2a_max_tokens, hidden // t_packing), must be
         # allocated, otherwise this case does not exercise the cached path at all.
@@ -322,6 +335,40 @@ class FusedMoEV1InterpretTest(jtu.JaxTestCase):
                 bd2c=256,
                 bse=128,
                 bts=8,
+            ),
+            vmem_packed_sublane_transpose=vmem_packed_sublane_transpose,
+        )
+
+    @parameterized.named_parameters(
+        ("bt32", 1, 32, 32, True),
+        ("bt32_no_sublane_transpose", 1, 32, 32, False),
+        ("bt64_ep2", 2, 128, 64, True),
+    )
+    def test_output_acc_with_several_acc_tiles(
+        self, ep_size, num_tokens, bt, vmem_packed_sublane_transpose
+    ):
+        """bt >= 32 gives acc_bt = gcd(bt, 16) = 16 and two or more acc tiles.
+
+        The loads for acc tile i + 1 are in flight while tile i is waited on, so each
+        ping-pong buffer needs its own semaphore. With a shared one, on_wait DMA order
+        lets tile 1's loads satisfy tile 0's wait and tile 0 reads unloaded (NaN) rows.
+        """
+        self._run(
+            ep_size=ep_size,
+            num_tokens=num_tokens,
+            hidden_size=256,
+            intermediate_size=512,
+            block_config=FusedMoEBlockConfig(
+                bt=bt,
+                bf=256,
+                bd1=256,
+                bd2=256,
+                btc=16,
+                bfc=256,
+                bd1c=256,
+                bd2c=256,
+                bse=256,
+                bts=32,
             ),
             vmem_packed_sublane_transpose=vmem_packed_sublane_transpose,
         )

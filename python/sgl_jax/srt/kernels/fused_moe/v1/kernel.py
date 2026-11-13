@@ -605,7 +605,7 @@ def _fused_ep_moe_kernel(
     recv_x2_sems,  # <e_sem_id> (expert_buffer_count,)
     gather_send_x2_sems,  # <e_sem_id> (expert_buffer_count,)
     a2a_gather_sem,
-    a2a_acc_sems,  # DMA(1,)
+    a2a_acc_sems,  # DMA(2,): <acc buf_id>
     barrier_sem,
     *,
     top_k: int,
@@ -2810,7 +2810,7 @@ def _fused_ep_moe_kernel(
                         pltpu.make_async_copy(
                             src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
                             dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
-                            sem=a2a_acc_sems.at[0],
+                            sem=a2a_acc_sems.at[buf_id],
                         ).start()
 
                 if not vmem_packed_sublane_transpose:
@@ -2830,12 +2830,14 @@ def _fused_ep_moe_kernel(
         def wait_load_acc_bt(*, buf_id, num_valid):
             @pl.when(num_valid != 0)
             def _():
-                # Drain all `num_valid * top_k` HBM->VMEM DMAs in a single wait.
+                # Drain all `num_valid * top_k` HBM->VMEM DMAs in a single wait. Each
+                # ping-pong buffer has its own semaphore: the next tile's loads are
+                # already in flight here and must not satisfy this wait.
                 ref = a2a_g_acc_vmem.at[buf_id, pl.ds(0, top_k), pl.ds(0, num_valid)]
                 pltpu.make_async_copy(
                     src_ref=ref,
                     dst_ref=ref,
-                    sem=a2a_acc_sems.at[0],
+                    sem=a2a_acc_sems.at[buf_id],
                 ).wait()
 
         def acc_gather_to_output(*, tile_start, out_offset, buf_id):
@@ -3981,7 +3983,7 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # gather_send_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
-        pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
+        pltpu.SemaphoreType.DMA((2,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
     )
 
