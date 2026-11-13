@@ -346,7 +346,7 @@ suites = {
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
         TestFile(
             "python/sgl_jax/test/kernels/fused_moe_v1_interpret_test.py",
-            2,
+            4,
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
         ),

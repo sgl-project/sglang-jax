@@ -13,10 +13,13 @@ is set (the default).
 
 ``on_wait`` DMA mode runs a DMA only when it is waited on, which is a legal
 completion order on hardware. It exposes waits that a different DMA can
-satisfy, such as the output acc ping-pong buffers with ``bt >= 32``.
+satisfy, such as the output acc ping-pong buffers with ``bt >= 32``, and
+buffers that are refilled before an earlier DMA has read them, such as the
+ring-buffer A2A path (``expert_buffer_count < local_num_experts``).
 """
 
 import contextlib
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.fused_moe.v1 import kernel as fused_moe_v1_kernel
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
     fused_ep_moe,
@@ -129,11 +133,15 @@ class FusedMoEV1InterpretTest(jtu.JaxTestCase):
         has_bias=False,
         vmem_packed_sublane_transpose=True,
         dma_execution_mode="on_wait",
+        device_hbm_bytes=None,
         atol=3e-2,
         rtol=3e-2,
     ):
+        """Runs the kernel, checks it against ref_moe and returns (output, a2a slot count)."""
         if len(jax.devices()) < ep_size:
             self.skipTest(f"needs {ep_size} devices (set JAX_NUM_CPU_DEVICES)")
+        # The a2a slot count and the interpret params are fixed at trace time.
+        jax.clear_caches()
         tokens, w1, w2, w3, b1, b2, b3, gating, topk_weights, topk_ids = _gen_inputs(
             num_experts=num_experts,
             top_k=top_k,
@@ -157,7 +165,14 @@ class FusedMoEV1InterpretTest(jtu.JaxTestCase):
         def shard(x):
             return None if x is None else jax.device_put(x, ep_sharding)
 
-        with _tpu_interpret(dma_execution_mode) as scratch_shapes:
+        hbm_patch = (
+            contextlib.nullcontext()
+            if device_hbm_bytes is None
+            else mock.patch.object(
+                fused_moe_v1_kernel, "_device_hbm_bytes", return_value=device_hbm_bytes
+            )
+        )
+        with hbm_patch, _tpu_interpret(dma_execution_mode) as scratch_shapes:
             actual = fused_ep_moe(
                 mesh=mesh,
                 tokens=shard(tokens),
@@ -183,6 +198,12 @@ class FusedMoEV1InterpretTest(jtu.JaxTestCase):
             races_found = _interpreter_races_found()
 
         self.assertFalse(races_found, msg="the TPU interpreter detected a DMA race")
+        # a2a_s_sends_x2_smem is the only 1D SMEM scratch: (expert_buffer_count,).
+        (a2a_slots,) = [
+            s.shape[0]
+            for s in scratch_shapes
+            if getattr(s, "memory_space", None) == pltpu.SMEM and len(s.shape) == 1
+        ]
 
         # Both bf-resident caches, (t_packing, a2a_max_tokens, hidden // t_packing), must be
         # allocated, otherwise this case does not exercise the cached path at all.
@@ -218,6 +239,7 @@ class FusedMoEV1InterpretTest(jtu.JaxTestCase):
         nan_count = int(np.isnan(actual).sum())
         self.assertEqual(nan_count, 0, msg=f"{nan_count}/{actual.size} NaN outputs")
         self.assertAllClose(actual, expected, atol=atol, rtol=rtol)
+        return actual, a2a_slots
 
     @parameterized.named_parameters(
         ("fp8", jnp.float8_e4m3fn, True, "on_wait"),
@@ -372,6 +394,56 @@ class FusedMoEV1InterpretTest(jtu.JaxTestCase):
             ),
             vmem_packed_sublane_transpose=vmem_packed_sublane_transpose,
         )
+
+    @parameterized.named_parameters(
+        # A 1 KiB HBM gives a scratch budget below one slot, so max(2, 0) = 2 slots.
+        ("ep1_2_slots", 1, 4, 1024, 2, "on_wait"),
+        ("ep2_2_slots", 2, 8, 1024, 2, "on_wait"),
+        ("ep2_2_slots_eager_dma", 2, 8, 1024, 2, "eager"),
+        # bytes_per_slot = 2 * a2a_max_tokens * hidden * 2 = 2 * 16 * 256 * 2 = 16 KiB.
+        ("ep2_3_slots", 2, 8, 1_700_000, 3, "on_wait"),
+        ("ep2_3_slots_8_local_experts", 2, 16, 1_700_000, 3, "on_wait"),
+    )
+    def test_ring_buffer_a2a_matches_full_buffer(
+        self, ep_size, num_experts, device_hbm_bytes, a2a_slots, dma_execution_mode
+    ):
+        """Ring-buffer A2A path (fewer a2a slots than local experts) vs the full-buffer path.
+
+        A tiny HBM size forces expert_buffer_count < local_num_experts, so slots are
+        refilled within a bt tile. Each refill must wait until (a) every device has
+        finished staging the slot's previous expert (else a peer's scatter races with
+        the staging reads, which the race detector reports) and (b) the local gather
+        copy out of the previous expert's a2a_s_acc slot has run (else on_wait DMA
+        order gathers the next expert's FFN2 output). The result must match the
+        full-buffer path bit for bit.
+        """
+        common = dict(
+            ep_size=ep_size,
+            num_experts=num_experts,
+            num_tokens=16 * ep_size,
+            hidden_size=256,
+            intermediate_size=512,
+            block_config=FusedMoEBlockConfig(
+                bt=8,
+                bf=256,
+                bd1=256,
+                bd2=256,
+                btc=16,
+                bfc=256,
+                bd1c=256,
+                bd2c=256,
+                bse=256,
+                bts=16,
+            ),
+            dma_execution_mode=dma_execution_mode,
+        )
+        local_num_experts = num_experts // ep_size
+        full, full_slots = self._run(**common)
+        self.assertEqual(full_slots, local_num_experts)
+        ring, ring_slots = self._run(**common, device_hbm_bytes=device_hbm_bytes)
+        self.assertEqual(ring_slots, a2a_slots)
+        self.assertLess(ring_slots, local_num_experts)
+        np.testing.assert_array_equal(ring, full)
 
 
 if __name__ == "__main__":

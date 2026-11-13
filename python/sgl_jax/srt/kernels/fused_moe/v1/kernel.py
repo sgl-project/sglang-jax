@@ -604,6 +604,7 @@ def _fused_ep_moe_kernel(
     send_x2_sems,  # <e_sem_id> (expert_buffer_count,)
     recv_x2_sems,  # <e_sem_id> (expert_buffer_count,)
     gather_send_x2_sems,  # <e_sem_id> (expert_buffer_count,)
+    gather_local_x2_sems,  # None | <e_sem_id> (expert_buffer_count,): ring-buffer local gathers
     a2a_gather_sem,
     a2a_acc_sems,  # DMA(2,): <acc buf_id>
     barrier_sem,
@@ -650,6 +651,11 @@ def _fused_ep_moe_kernel(
     assert expert_buffer_count >= 1
     assert a2a_s_acc_x2_hbm.shape[0] == expert_buffer_count
     assert expert_buffer_count <= local_num_experts
+    # Ring-buffer A2A: fewer a2a slots than local experts, so a slot is refilled by
+    # expert `local_e_id + expert_buffer_count` within the same bt tile.
+    use_a2a_ring_buffer = expert_buffer_count < local_num_experts
+    assert not use_a2a_ring_buffer or expert_buffer_count >= 2, expert_buffer_count
+    assert (gather_local_x2_sems is not None) == use_a2a_ring_buffer
     assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
     assert local_num_tokens % bt == 0, (local_num_tokens, bt)
     num_bt = local_num_tokens // bt
@@ -1248,7 +1254,12 @@ def _fused_ep_moe_kernel(
                 pltpu.make_async_copy(
                     src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
                     dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
-                    sem=a2a_gather_sem,
+                    # With a ring buffer the source slot is refilled by a later expert,
+                    # so this copy gets a per-slot semaphore that is waited before then
+                    # (see `wait_a2a_gather_local`).
+                    sem=(
+                        gather_local_x2_sems.at[e_sem_id] if use_a2a_ring_buffer else a2a_gather_sem
+                    ),
                 ).start()
 
             @pl.when(remote_sz != 0)
@@ -1291,6 +1302,26 @@ def _fused_ep_moe_kernel(
                 sem=gather_send_x2_sems.at[e_sem_id],
             ).wait()
 
+    def wait_a2a_gather_local(*, bt_sem_id, e_sem_id, local_e_id):
+        # Ring-buffer path only: wait for the local gather copy out of
+        # `a2a_s_acc_x2_hbm[e_sem_id]` before the slot is rewritten by the next expert
+        # that uses it, and before `acc_and_store_output` reads `a2a_g_hbm`.
+        if disable_a2a:
+            return
+        is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
+        my_e_id = my_id * local_num_experts + lax.select(is_valid, local_e_id, 0)
+        local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
+        local_sz = lax.select(is_valid, local_sz, 0)
+
+        @pl.when(local_sz != 0)
+        def _():
+            ref = a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=gather_local_x2_sems.at[e_sem_id],
+            ).wait()
+
     def wait_a2a_gather_recv_all(*, bt_sem_id, total_routed=None):
         if disable_a2a:
             return
@@ -1302,9 +1333,17 @@ def _fused_ep_moe_kernel(
         # We conservatively wait once for every expert that has nonzero tokens
         # routed from `my_id` (local copies for local experts and remote receives
         # for remote experts both signal the same `a2a_gather_sem` on this device).
+        # With a ring buffer the local copies signal `gather_local_x2_sems` instead
+        # and are waited by `wait_a2a_gather_local`, so local experts are skipped.
         def _wait_per_expert():
             def _wait_one_expert(e_id, _):
                 sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, e_id]
+                if use_a2a_ring_buffer:
+                    is_local_e = jnp.logical_and(
+                        e_id >= my_id * local_num_experts,
+                        e_id < (my_id + 1) * local_num_experts,
+                    )
+                    sz = lax.select(is_local_e, jnp.int32(0), sz)
 
                 @pl.when(sz != 0)
                 def _():
@@ -2609,7 +2648,14 @@ def _fused_ep_moe_kernel(
 
                         @pl.when(bd2_id == 0)
                         def _():
+                            # The slot's previous expert must be fully gathered out of
+                            # a2a_s_acc_x2_hbm before FFN2 overwrites it.
                             wait_a2a_gather_send(
+                                bt_sem_id=bt_sem_id,
+                                e_sem_id=e_sem_id,
+                                local_e_id=local_e_id - expert_buffer_count,
+                            )
+                            wait_a2a_gather_local(
                                 bt_sem_id=bt_sem_id,
                                 e_sem_id=e_sem_id,
                                 local_e_id=local_e_id - expert_buffer_count,
@@ -2755,6 +2801,11 @@ def _fused_ep_moe_kernel(
             # we can skip the bd1/bd2 loops when this expert receives no tokens.
             if expert_buffer_count < local_num_experts:
                 wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id,
+                    local_e_id=local_e_id - expert_buffer_count,
+                )
+                wait_a2a_gather_local(
                     bt_sem_id=bt_sem_id,
                     e_sem_id=e_sem_id,
                     local_e_id=local_e_id - expert_buffer_count,
@@ -3282,9 +3333,16 @@ def _fused_ep_moe_kernel(
 
                 @pl.when(next_local_e_id < local_num_experts)
                 def _():
+                    # The scatter below refills the slot of expert
+                    # `next_local_e_id - expert_buffer_count` on every device. A barrier
+                    # at the top of iteration b means every device has finished experts
+                    # <= b - 1 (staging reads and recv waits on their slots), which
+                    # covers the scatters of iterations b .. b + expert_buffer_count - 2.
+                    # So one barrier every `expert_buffer_count - 1` experts, starting at
+                    # the first reuse, fences every reused slot.
                     @pl.when(
                         (next_local_e_id >= expert_buffer_count)
-                        & (next_local_e_id % expert_buffer_count == 0)
+                        & ((next_local_e_id - expert_buffer_count) % (expert_buffer_count - 1) == 0)
                     )
                     def _wait_before_buffer_reuse():
                         sync_barrier()
@@ -3330,13 +3388,21 @@ def _fused_ep_moe_kernel(
             lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+            # The last `expert_buffer_count` experts' slots are not reused in this bt
+            # tile; drain their local gather copies before reading a2a_g_hbm.
+            tail_start = max(local_num_experts - expert_buffer_count, 0)
+            for tail_local_e_id in range(tail_start, local_num_experts):
+                wait_a2a_gather_local(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=(e_sem_id + tail_local_e_id) % expert_buffer_count,
+                    local_e_id=tail_local_e_id,
+                )
             sync_barrier()
 
             acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
 
             start_send_bo(bt_id=bt_id)
 
-            tail_start = max(local_num_experts - expert_buffer_count, 0)
             for tail_local_e_id in range(tail_start, local_num_experts):
                 tail_sem_id = (e_sem_id + tail_local_e_id) % expert_buffer_count
                 wait_a2a_gather_send(
@@ -3982,6 +4048,11 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # gather_send_x2_sems
+        (
+            pltpu.SemaphoreType.DMA((expert_buffer_count,))
+            if expert_buffer_count < local_num_experts
+            else None
+        ),  # gather_local_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((2,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
