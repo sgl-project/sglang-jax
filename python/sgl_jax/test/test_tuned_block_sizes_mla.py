@@ -61,6 +61,7 @@ def test_mixed_hit_returns_2tuple(monkeypatch):
 def test_decode_and_mixed_buckets_are_separate(monkeypatch):
     """Same shape under different case_label must not collide."""
     _patch_env(monkeypatch)
+    tuned_block_sizes.TUNED_BLOCK_SIZES_MLA["TPU v7"].clear()
     tuned_block_sizes.TUNED_BLOCK_SIZES_MLA["TPU v7"][
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 128)
     ] = (3, 2, 8)
@@ -213,3 +214,19 @@ def test_fallback_rejects_bad_case_label():
 
     with pytest.raises(ValueError):
         get_fallback_block_sizes_mla("prefill", jnp.bfloat16, 4, 128)
+
+
+def test_ling26_1t_v7_entries_hit(monkeypatch):
+    _patch_env(monkeypatch)
+    for mnt in (16, 32, 64, 128):
+        assert get_tuned_block_sizes_mla(
+            "decode", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 256, mnt
+        ) == (32, 1, 2)
+    assert get_tuned_block_sizes_mla("mixed", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 256, 128) == (
+        8,
+        128,
+    )
+    for mnt in (256, 512, 1024, 2048, 4096):
+        assert get_tuned_block_sizes_mla(
+            "mixed", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 256, mnt
+        ) == (8, 256)

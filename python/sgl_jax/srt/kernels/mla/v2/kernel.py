@@ -1482,7 +1482,9 @@ def mla_ragged_paged_attention(
         num_kv_pages_per_block is None
         or num_queries_per_block is None
         or (
-            tuple(num_kv_pages_per_block) in ((3, 1, 1), (1, 1, 1))
+            isinstance(num_kv_pages_per_block, (tuple, list))
+            and isinstance(num_queries_per_block, (tuple, list))
+            and tuple(num_kv_pages_per_block) in ((3, 1, 1), (1, 1, 1))
             and tuple(num_queries_per_block) == (1, 1, 16)
         )
     )

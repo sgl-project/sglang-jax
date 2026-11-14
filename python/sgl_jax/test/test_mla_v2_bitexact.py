@@ -1198,6 +1198,45 @@ class TestMLAV2BitExactParity(unittest.TestCase):
                 self.assertNotIn("pad", primitives_nope)
                 self.assertNotIn("optimization_barrier", primitives_nope)
 
+    def test_is_default_blocks_resolves_legacy_tuples_and_accepts_int(self):
+        """Legacy default block tuples and None resolve via get_tuned_block_sizes_mla;
+        scalar int and non-default explicit tuples bypass the table without TypeError."""
+        from sgl_jax.srt.kernels.mla.v2 import tuned_block_sizes
+
+        inputs = make_mla_v2_parity_inputs(
+            [(1, 16), (4, 32)], page_size=128, num_heads=16, dtype=jnp.bfloat16, seed=42
+        )
+        cases = [
+            ("none", None, None, True),
+            ("legacy_3_1_1", (3, 1, 1), (1, 1, 16), True),
+            ("legacy_1_1_1", (1, 1, 1), (1, 1, 16), True),
+            ("scalar_int", 1, 8, False),
+            ("explicit_decode_sweep", (1, 1, 1), (1, 1, 1), False),
+            ("explicit_tuple", (1, 1, 1), (1, 1, 8), False),
+        ]
+        with jax.sharding.set_mesh(_single_device_mesh()):
+            for name, nkv, nq, expect_lookup in cases:
+                with (
+                    self.subTest(case=name),
+                    mock.patch.object(
+                        tuned_block_sizes,
+                        "get_tuned_block_sizes_mla",
+                        return_value=None,
+                    ) as mock_lookup,
+                ):
+                    run = _make_sharded_v2_kernel(
+                        len(inputs),
+                        sm_scale=(512 + 64) ** -0.5,
+                        num_kv_pages_per_block=nkv,
+                        num_queries_per_block=nq,
+                        decode_batch_size=1,
+                    )
+                    jax.jit(run).trace(*inputs)
+                    if expect_lookup:
+                        self.assertEqual(mock_lookup.call_count, 2)
+                    else:
+                        mock_lookup.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
