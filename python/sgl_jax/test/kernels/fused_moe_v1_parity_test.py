@@ -254,6 +254,21 @@ class FusedMoEV1ParityTest(jtu.JaxTestCase):
         self.assertArraysEqual(sublane_only, baseline)
         self.assertArraysEqual(relayout_and_sublane, baseline)
 
+    def _get_v6e_2x4_devices_or_skip(self):
+        try:
+            return get_topology_desc(
+                platform="tpu",
+                topology_name="v6e:2x4",
+                chip_config_name="default",
+                chips_per_host_bounds=(2, 2, 1),
+                num_slices=1,
+                wrap=(False, False, False),
+            ).devices
+        except RuntimeError as exc:
+            if "TPU" in str(exc) or "libtpu" in str(exc).lower():
+                self.skipTest(f"TPU topology unavailable on this host: {exc}")
+            raise
+
     @parameterized.parameters(
         # 1. Standard decode with 2D VMEM relayout active (num_bd1=1, num_bd2=1, num_bf=2)
         dict(
@@ -326,14 +341,7 @@ class FusedMoEV1ParityTest(jtu.JaxTestCase):
         relayout,
         sublane,
     ):
-        devices = get_topology_desc(
-            platform="tpu",
-            topology_name="v6e:2x4",
-            chip_config_name="default",
-            chips_per_host_bounds=(2, 2, 1),
-            num_slices=1,
-            wrap=(False, False, False),
-        ).devices
+        devices = self._get_v6e_2x4_devices_or_skip()
         mesh = create_device_mesh([8, 1], [1, 1], devices=devices, is_full_topology=True)
         ep_sharding = NamedSharding(mesh, P(("data", "tensor"), None))
         w_sharding = NamedSharding(mesh, P(("data", "tensor"), None, None))
@@ -425,14 +433,7 @@ class FusedMoEV1ParityTest(jtu.JaxTestCase):
 
     def test_tpu_aot_compile_pipelined_ring_buffer_path(self):
         """Force expert_buffer_count=2 < local_num_experts=8 to verify the pipelined A2A path."""
-        devices = get_topology_desc(
-            platform="tpu",
-            topology_name="v6e:2x4",
-            chip_config_name="default",
-            chips_per_host_bounds=(2, 2, 1),
-            num_slices=1,
-            wrap=(False, False, False),
-        ).devices
+        devices = self._get_v6e_2x4_devices_or_skip()
         mesh = create_device_mesh([8, 1], [1, 1], devices=devices, is_full_topology=True)
         ep_sharding = NamedSharding(mesh, P(("data", "tensor"), None))
         w_sharding = NamedSharding(mesh, P(("data", "tensor"), None, None))
