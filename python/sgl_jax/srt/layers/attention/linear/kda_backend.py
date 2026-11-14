@@ -12,6 +12,7 @@ from sgl_jax.srt.kernels.kda import (
     is_mega_kda_layout_supported,
     kda_forward_packed,
     naive_recurrent_kda,
+    resident_pipeline_kda_fwd,
 )
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
@@ -364,14 +365,36 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         if lower_bound is None:
             lower_bound = getattr(layer, "kda_lower_bound", None)
         kernel = os.environ.get("SGLANG_JAX_KDA_PREFILL_KERNEL", "mega").strip().lower()
-        if kernel not in {"chunked", "mega"}:
+        if kernel not in {"chunked", "mega", "resident", "fused_resident"}:
             raise ValueError(
-                f"SGLANG_JAX_KDA_PREFILL_KERNEL must be 'chunked' or 'mega', got {kernel!r}"
+                "SGLANG_JAX_KDA_PREFILL_KERNEL must be 'chunked', 'mega', or 'resident', "
+                f"got {kernel!r}"
             )
         use_mega = kernel == "mega"
+        use_resident = kernel in {"resident", "fused_resident"}
 
         def _prefill_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
             operands = (q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias)
+
+            if use_resident:
+                o, final_state, *_ = resident_pipeline_kda_fwd(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    scale,
+                    initial_state,
+                    True,
+                    cu_seqlens,
+                    safe_gate=True,
+                    lower_bound=lower_bound,
+                    use_gate_in_kernel=True,
+                    use_qk_l2norm_in_kernel=True,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                )
+                return o, final_state
 
             def _chunked(args):
                 q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias = args
@@ -391,6 +414,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                     A_log=A_log,
                     dt_bias=dt_bias,
                     lower_bound=lower_bound,
+                    pipeline_impl="incumbent",
                 )
                 return o, final_state
 
@@ -411,6 +435,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                     scale=scale,
                     initial_state=initial_state,
                     lower_bound=lower_bound,
+                    pipeline_impl="incumbent",
                 )
 
             padded_tokens = (q.shape[1] + 63) // 64 * 64
