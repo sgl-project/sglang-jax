@@ -404,6 +404,118 @@ def test_resident_matches_mega_per_position(
     )
 
 
+def _bf16_ulp_diff(actual: jax.Array, expected: jax.Array) -> np.ndarray:
+    a_u16 = np.asarray(actual.astype(jnp.bfloat16)).view(np.uint16).astype(np.int32)
+    e_u16 = np.asarray(expected.astype(jnp.bfloat16)).view(np.uint16).astype(np.int32)
+
+    def _to_ordered(u: np.ndarray) -> np.ndarray:
+        return np.where(u & 0x8000, 0x8000 - (u & 0x7FFF), u + 0x8000)
+
+    return np.abs(_to_ordered(a_u16) - _to_ordered(e_u16))
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads", "lower_bound"),
+    [
+        ((1024,), 4, -5.0),
+        ((1024,), 4, None),
+        ((256, 256, 512), 4, -5.0),
+    ],
+)
+def test_per_position_accuracy_vs_incumbent_and_naive(
+    lengths: tuple[int, ...],
+    heads: int,
+    lower_bound: float | None,
+):
+    """Per-position accuracy profile across token windows [0..63, 64..255, 256..1023].
+
+    Verifies per-window max_abs, mean_abs, and bfloat16 ULP differences against both
+    the incumbent 4-stage kernel and FP32 naive recurrence, plus final_state parity.
+    """
+    case = _make_inputs(
+        lengths,
+        heads,
+        seed=8200 + heads + len(lengths),
+        beta_dtype=jnp.float32 if lower_bound is None else jnp.bfloat16,
+    )
+    q_norm = _l2_normalize(case["q"])
+    k_norm = _l2_normalize(case["k"])
+
+    inc_out, inc_state, *_ = chunk_kda_fwd(
+        q_norm,
+        k_norm,
+        case["v"],
+        case["raw_g"],
+        case["beta"],
+        SCALE,
+        case["initial_state"],
+        True,
+        case["cu_seqlens"],
+        chunk_size=64,
+        safe_gate=True,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=True,
+        A_log=case["a_log"],
+        dt_bias=case["dt_bias"],
+        pipeline_impl="incumbent",
+    )
+    res_out, res_state, *_ = chunk_kda_fwd(
+        q_norm,
+        k_norm,
+        case["v"],
+        case["raw_g"],
+        case["beta"],
+        SCALE,
+        case["initial_state"],
+        True,
+        case["cu_seqlens"],
+        chunk_size=64,
+        safe_gate=True,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=True,
+        A_log=case["a_log"],
+        dt_bias=case["dt_bias"],
+        pipeline_impl="fused_resident",
+    )
+    naive_out, naive_state = _run_naive_reference(
+        case,
+        lower_bound=lower_bound,
+        use_gate_in_kernel=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    jax.block_until_ready((inc_out, inc_state, res_out, res_state, naive_out, naive_state))
+
+    windows = [(0, 64), (64, 256), (256, 1024)]
+    for t_start, t_end in windows:
+        r_slice = res_out[:, t_start:t_end]
+        n_slice = naive_out[:, t_start:t_end]
+        i_slice = inc_out[:, t_start:t_end]
+        ulp_vs_naive = _bf16_ulp_diff(r_slice, n_slice)
+        _assert_per_position_close(
+            r_slice,
+            n_slice,
+            label=f"window[{t_start}:{t_end}] resident vs naive (max_ulp={int(ulp_vs_naive.max())})",
+        )
+        _assert_per_position_close(
+            r_slice,
+            i_slice,
+            label=f"window[{t_start}:{t_end}] resident vs incumbent",
+            tol=O_TOL_INCUMBENT,
+        )
+        assert (
+            float(np.mean(ulp_vs_naive <= 1)) >= 0.98
+        ), f"window[{t_start}:{t_end}]: <98% of elements within 1 BF16 ULP of FP32 naive"
+
+    _assert_per_position_close(res_state, naive_state, label="final_state vs naive", reduce_axes=2)
+    _assert_per_position_close(
+        res_state,
+        inc_state,
+        label="final_state vs incumbent",
+        reduce_axes=2,
+        tol=STATE_TOL_INCUMBENT,
+    )
+
+
 # (K, V) = (128, 128) runs the fast multi-head kernel; any head dim that is not a
 # multiple of 128 runs the generic fallback kernel, which must honor cu_seqlens[1] too.
 _PADDED_HEAD_DIMS = [(128, 128), (64, 64), (64, 128), (128, 64)]
