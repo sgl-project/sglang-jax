@@ -28,6 +28,10 @@ pre-#1733 (``c136c733``) MLA v2 kernel:
 from __future__ import annotations
 
 import contextlib
+import functools
+import importlib.util
+import pathlib
+import sys
 import unittest
 import warnings
 from unittest import mock
@@ -1236,6 +1240,158 @@ class TestMLAV2BitExactParity(unittest.TestCase):
                         self.assertEqual(mock_lookup.call_count, 2)
                     else:
                         mock_lookup.assert_not_called()
+
+
+_MLA_BENCH_DIR = pathlib.Path(__file__).resolve().parents[3] / "benchmark" / "kernels" / "mla"
+
+
+def _load_mla_bench_module(name):
+    """Import ``benchmark/kernels/mla/<name>.py`` with its sibling ``utils`` module."""
+    spec = importlib.util.spec_from_file_location(
+        f"_mla_bench_{name}", _MLA_BENCH_DIR / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    saved_utils = sys.modules.pop("utils", None)
+    sys.path.insert(0, str(_MLA_BENCH_DIR))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(_MLA_BENCH_DIR))
+        sys.modules.pop("utils", None)
+        if saved_utils is not None:
+            sys.modules["utils"] = saved_utils
+    return module
+
+
+def _pallas_call_names(jaxpr):
+    names = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "pallas_call":
+            # JAX < 0.8 keeps the name in `name_and_src_info`; newer releases in `name`.
+            info = eqn.params.get("name_and_src_info")
+            names.append(info.name if info is not None else eqn.params["name"])
+    for sub in jax_core.subjaxprs(jaxpr):
+        names += _pallas_call_names(sub)
+    return names
+
+
+@unittest.skipUnless(_MLA_BENCH_DIR.is_dir(), "benchmark/kernels/mla is not in this checkout")
+class TestMLAV2BenchmarkBlockConfigs(unittest.TestCase):
+    """The MLA tuner and bench time explicit block configs. The kernel must build the
+    pallas_call they request, not replace it with the tuned-table entry."""
+
+    def setUp(self):
+        from sgl_jax.srt.kernels.mla.v2 import tuned_block_sizes
+
+        # Look the table up as on the TPU v7 host that the Ling-2.6-1T entries came from.
+        for name, value in (("get_tpu_version", lambda: 7), ("get_device_name", lambda: "TPU v7")):
+            patcher = mock.patch.object(tuned_block_sizes, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _built_pallas_calls(self, inputs, nkv, nq, dbs, vmem_limit_bytes):
+        args = [
+            inputs[k]
+            for k in (
+                "ql_nope",
+                "q_pe",
+                "new_kv_c",
+                "new_k_pe",
+                "cache_kv",
+                "kv_lens",
+                "page_indices",
+                "cu_q_lens",
+                "cu_kv_lens",
+                "distribution",
+            )
+        ]
+        jaxpr = jax.make_jaxpr(
+            functools.partial(
+                kmod.mla_ragged_paged_attention,
+                sm_scale=(512 + 64) ** -0.5,
+                num_kv_pages_per_block=nkv,
+                num_queries_per_block=nq,
+                decode_batch_size=dbs,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+        )(*args)
+        return _pallas_call_names(jaxpr.jaxpr)
+
+    def test_tuner_candidates_build_the_timed_pallas_call(self):
+        tuner = _load_mla_bench_module("get_block_spec_config_mla")
+        requests = []
+
+        def record(case_label, inputs, sm_scale, nkv, nq, dbs, vmem, tries, scope):
+            requests.append((case_label, inputs, nkv, nq, dbs, vmem, scope))
+            return 1.0
+
+        common = dict(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=256,
+            kv_len=256,
+            vmem_limit_bytes=64 << 20,
+            tries=1,
+            dtype=jnp.bfloat16,
+        )
+        with (
+            mock.patch.object(tuner, "_bench_one", side_effect=record),
+            mock.patch.object(tuner, "_BKV_P_CANDIDATES", (1, 8)),
+            mock.patch.object(tuner, "_BQ_MIXED_CANDIDATES", (16, 128)),
+            mock.patch.object(tuner, "_DBS_CANDIDATES", (2,)),
+        ):
+            tuner._sweep_mixed(max_num_tokens=128, num_q_heads=8, **common)
+            tuner._sweep_decode(max_num_tokens=16, num_q_heads=8, **common)
+
+        # The heuristic baselines are among the timed configs.
+        scopes = {request[-1] for request in requests}
+        self.assertIn("MLA-m-bq_{1}-bkvp_{0}-p_256-bsz_1".format(*tuner._HEURISTIC_MIXED), scopes)
+        self.assertIn("MLA-bd-bq_1-bkvp_{0}-p_256-bsz_{2}".format(*tuner._HEURISTIC_DECODE), scopes)
+        for case, inputs, nkv, nq, dbs, vmem, scope in requests:
+            with self.subTest(case=case, nkv=nkv, nq=nq, dbs=dbs):
+                self.assertIn(scope, self._built_pallas_calls(inputs, nkv, nq, dbs, vmem))
+
+    def test_bench_default_config_builds_hardcoded_blocks(self):
+        bench = _load_mla_bench_module("bench_mla")
+        requests = []
+
+        def record(*args, num_kv_pages_per_block, num_queries_per_block, decode_batch_size, **_):
+            requests.append((num_kv_pages_per_block, num_queries_per_block, decode_batch_size))
+            return args[0], args[4]
+
+        tpu_info = mock.Mock(vmem_capacity_bytes=64 << 20)
+        cases = {
+            "mixed": "MLA-m-bq_{1}-bkvp_{0}-p_256-bsz_1".format(*bench._DEFAULT_MIXED_BLOCK),
+            "decode": f"MLA-bd-bq_1-bkvp_{bench._DEFAULT_DECODE_BLOCK[0]}-p_256-bsz_{bench._DEFAULT_DECODE_DBS}",
+        }
+        for case, expected in cases.items():
+            requests.clear()
+            shape = dict(
+                max_num_tokens=128 if case == "mixed" else 16,
+                num_q_heads=8,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                page_size=256,
+                kv_len=256,
+            )
+            with (
+                self.subTest(case=case),
+                mock.patch.object(bench, "mla_ragged_paged_attention", record),
+                mock.patch.object(
+                    bench, "multiple_iteration_timeit_from_trace", return_value=[1.0]
+                ),
+                mock.patch.object(pltpu, "get_tpu_info", return_value=tpu_info),
+            ):
+                bench.benchmark_backend(case=case, use_lookup=False, tries=1, **shape)
+                self.assertEqual(len(requests), 1)
+                nkv, nq, dbs = requests[0]
+                make_inputs = (
+                    bench.create_mla_mixed_uniform_data
+                    if case == "mixed"
+                    else bench.create_mla_decode_uniform_data
+                )
+                inputs = make_inputs(dtype=jnp.bfloat16, **shape)
+                self.assertIn(expected, self._built_pallas_calls(inputs, nkv, nq, dbs, 64 << 20))
 
 
 if __name__ == "__main__":

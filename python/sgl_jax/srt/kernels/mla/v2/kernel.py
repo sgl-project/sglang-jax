@@ -1470,7 +1470,9 @@ def mla_ragged_paged_attention(
         mixed) cases.
       num_queries_per_block: number of queries to be processed in one flash
         attention block in the pallas kernel. This is a tuple of (decode, prefill,
-        mixed) cases.
+        mixed) cases. If either is None, or the pair is a legacy default
+        ((3, 1, 1) or (1, 1, 1) with (1, 1, 16)), both come from the tuned table
+        (or its fallback), and a tuned decode hit also sets decode_batch_size.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.

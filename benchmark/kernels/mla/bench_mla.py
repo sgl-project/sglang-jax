@@ -92,7 +92,9 @@ def benchmark_backend(
             nq = (_DEFAULT_DECODE_BLOCK[1], 1, 1)
         else:
             nkv = (1, 1, _DEFAULT_MIXED_BLOCK[0])
-            nq = (1, 1, _DEFAULT_MIXED_BLOCK[1])
+            # slot[1] (dead) repeats bq: ((1, 1, 1), (1, 1, 16)) is the kernel's
+            # legacy default, which it resolves through the tuned table.
+            nq = (1, _DEFAULT_MIXED_BLOCK[1], _DEFAULT_MIXED_BLOCK[1])
         dbs = _DEFAULT_DECODE_DBS
 
     # Match production vmem budget: query actual hardware capacity (× 0.9
