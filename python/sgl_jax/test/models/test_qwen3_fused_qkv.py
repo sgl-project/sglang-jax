@@ -249,3 +249,109 @@ def test_decoder_layer_traces_normed_input(monkeypatch):
         expected = np.asarray(layer.input_layernorm(x))
 
     np.testing.assert_allclose(records["input_layernorm_output"], expected, rtol=1e-6, atol=1e-6)
+
+
+def test__token_parallel_prefill_enabled_gating(monkeypatch):
+    """Verify token-parallel prefill gating (_token_parallel_prefill_enabled / _use_token_parallel)."""
+    from sgl_jax.srt.environ import envs
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+    from sgl_jax.srt.models.qwen3 import TOKEN_PARALLEL_MIN_TOKENS, QWen3Model
+
+    mesh = _mesh(2)
+    config = SimpleNamespace(
+        vocab_size=128,
+        hidden_size=HIDDEN,
+        num_hidden_layers=1,
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        rms_norm_eps=EPS,
+        attention_bias=False,
+        intermediate_size=128,
+        max_position_embeddings=4096,
+        rope_parameters={"rope_type": "default", "rope_theta": ROPE_THETA},
+        tie_word_embeddings=False,
+    )
+    with jax.set_mesh(mesh):
+        model = QWen3Model(config, mesh=mesh, dtype=jnp.float32)
+        assert model.supports_token_parallel()
+        model.init_token_parallel_weights()
+        assert model.token_parallel_ready
+
+        num_tokens = TOKEN_PARALLEL_MIN_TOKENS
+        fb_extend = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=jnp.zeros((num_tokens,), dtype=jnp.int32),
+            positions=jnp.arange(num_tokens, dtype=jnp.int32),
+            spec_info=None,
+            input_embedding=None,
+            deepstack_visual_embedding=None,
+        )
+        assert model._use_token_parallel(fb_extend, fb_extend.positions)
+
+        fb_decode = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            input_ids=jnp.zeros((num_tokens,), dtype=jnp.int32),
+            positions=jnp.arange(num_tokens, dtype=jnp.int32),
+            spec_info=None,
+            input_embedding=None,
+            deepstack_visual_embedding=None,
+        )
+        assert not model._use_token_parallel(fb_decode, fb_decode.positions)
+        assert envs.SGLANG_JAX_TOKEN_PARALLEL_PREFILL.get() is True
+
+
+def test__all_gather_tokens_and_qkv_tokens_to_heads():
+    """Verify _replicated (_all_gather_tokens) and _qkv_tokens_to_heads / _heads_to_tokens."""
+    from sgl_jax.srt.models.qwen3 import (
+        _heads_to_tokens,
+        _qkv_tokens_to_heads,
+        _replicated,
+        _token_sharding,
+    )
+
+    mesh = _mesh(2)
+    with jax.set_mesh(mesh):
+        w = jax.device_put(
+            jnp.arange(32, dtype=jnp.float32).reshape(4, 8),
+            NamedSharding(mesh, P(None, "tensor")),
+        )
+        rep = _replicated(w, mesh=mesh)
+        np.testing.assert_array_equal(
+            np.asarray(rep), np.arange(32, dtype=np.float32).reshape(4, 8)
+        )
+
+        tok3 = _token_sharding(mesh, 3)
+        q = jax.device_put(
+            jnp.arange(8 * 4 * 2, dtype=jnp.float32).reshape(8, 4, 2),
+            tok3,
+        )
+        k = jax.device_put(
+            jnp.arange(8 * 2 * 2, dtype=jnp.float32).reshape(8, 2, 2),
+            tok3,
+        )
+        v = k + 1.0
+        qh, kh, vh = _qkv_tokens_to_heads(q, k, v, mesh)
+        np.testing.assert_array_equal(np.asarray(qh), np.asarray(q))
+        np.testing.assert_array_equal(np.asarray(kh), np.asarray(k))
+        np.testing.assert_array_equal(np.asarray(vh), np.asarray(v))
+
+        flat_q = qh.reshape(8, 4 * 2)
+        tok_q = _heads_to_tokens(flat_q, mesh)
+        np.testing.assert_array_equal(np.asarray(tok_q), np.asarray(q.reshape(8, 8)))
+
+
+def test__reduce_scatter_tokens_and_select_token_rows():
+    """Verify _select_token_rows (_reduce_scatter_tokens / sampled-row gather) across shards."""
+    from sgl_jax.srt.models.qwen3 import _select_token_rows, _token_sharding
+
+    mesh = _mesh(4)
+    with jax.set_mesh(mesh):
+        x_np = np.arange(16 * 8, dtype=np.float32).reshape(16, 8)
+        x = jax.device_put(jnp.asarray(x_np), _token_sharding(mesh, 2))
+        indices = jax.device_put(
+            jnp.array([0, 3, 7, 11, 15], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        )
+        selected = _select_token_rows(x, indices, mesh)
+        np.testing.assert_array_equal(np.asarray(selected), x_np[[0, 3, 7, 11, 15]])
