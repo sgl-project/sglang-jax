@@ -706,6 +706,38 @@ class MoEKernelTest(jtu.JaxTestCase):
         )
 
     @parameterized.product(
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn],
+    )
+    def test_sub_channel_quantization_x_2d_cache(self, w_dtype):
+        """Multi-scale-group FFN1 with the bf-resident x 2D VMEM cache active.
+
+        This is the DEFAULT block config shape: bd1=bd1c=hidden_size gives num_bd1=1, and
+        bf=512 < intermediate_size gives num_bf=2, so bf_id=1 reads tokens from b_x_2d_vmem.
+        With bd1c=1024 and quant_block_k=256, n_sg = 1024/2/256 = 2.
+        """
+        self._test_moe(
+            dtype=jnp.bfloat16,
+            top_k=8,
+            num_experts=128,
+            hidden_size=1024,
+            intermediate_size=1024,
+            num_tokens=8 * 32,
+            seed=1234,
+            renormalize_topk_logits=False,
+            w_dtype=w_dtype,
+            quant_block_k=256,
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+
+    @parameterized.product(
         w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_shared_expert_quantized(self, w_dtype):

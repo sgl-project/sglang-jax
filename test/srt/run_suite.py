@@ -280,6 +280,7 @@ suites = {
         TestFile("test/srt/kernels/hca/test_backend.py", 15, runner="pytest"),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
+        TestFile("python/sgl_jax/test/kernels/fused_moe_v1_parity_test.py", 2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/grouped_topk_test.py", 1, runner="pytest"),
@@ -351,6 +352,12 @@ suites = {
         TestFile("test/srt/kernels/qsa/test_sparse_gqa_ref.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
+        TestFile(
+            "python/sgl_jax/test/kernels/fused_moe_v1_interpret_test.py",
+            4,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
         TestFile("python/sgl_jax/test/kernels/test_mhc_tune.py", 0.1, runner="pytest"),
         TestFile(
