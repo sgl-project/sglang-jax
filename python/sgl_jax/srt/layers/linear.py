@@ -59,6 +59,8 @@ class LinearBase(nnx.Module):
         scope_name: str = "linear_base",
     ):
         """Initialize parameters and quantization method."""
+        self.input_size = input_size
+        self.output_size = output_size
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
         self.kernel_axes = kernel_axes

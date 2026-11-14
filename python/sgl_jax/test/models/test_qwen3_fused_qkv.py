@@ -1,11 +1,13 @@
 """Qwen3 fused RMSNorm + QKV projection on a CPU (data=1, tensor=tp) mesh.
 
 ``QWen3Attention.forward_fused_rmsnorm_qkv`` replaces the q/k/v ``LinearBase``
-calls with direct ``dot_general``s and picks one of two branches by token
-count and layer id: separate dots (``T > 64`` or ``layer_id < 6``) and the
-shard-local merged dot (otherwise). Each branch must produce the same q/k/v as
-``QWen3Attention.__call__`` on the normed input, including the attention bias,
-and its compiled tp=8 program must not move q/k/v weights between devices.
+calls with one ``MergedColumnParallelLinear.shard_local_merged_column_dot`` for
+every token count and layer. It used to pick separate dots (``T > 64`` or
+``layer_id < 6``), a shard-local merged dot (``T == 1``) or a
+concatenated-weight dot (otherwise), so the cases still straddle those
+thresholds. Each must produce the same q/k/v as ``QWen3Attention.__call__`` on
+the normed input, including the attention bias, and its compiled tp=8 program
+must not move q/k/v weights between devices.
 
 The attention kernel is replaced with a stub that records the q/k/v it is fed.
 """
@@ -107,7 +109,8 @@ def _hidden(num_tokens, seed=0):
     )
 
 
-# (layer_id, num_tokens) pairs reaching each branch of forward_fused_rmsnorm_qkv.
+# (layer_id, num_tokens) pairs on each side of the former branch thresholds
+# (layer_id < 6, T == 1, T > 64) of forward_fused_rmsnorm_qkv.
 BRANCH_CASES = [
     pytest.param(0, 8, id="layer0-T8"),
     pytest.param(6, 65, id="layer6-T65"),

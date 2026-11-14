@@ -168,13 +168,12 @@ class QWen3Attention(nnx.Module):
         out_sharding: jax.sharding.Sharding | None = None,
         cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Input RMSNorm followed by the q/k/v projections as direct dot_generals.
+        """Input RMSNorm followed by the q/k/v projections as one direct dot.
 
-        When q/k/v_proj are plain ``LinearBase`` layers, more than 64 tokens or
-        ``layer_id < 6`` use three separate dots, and everything else uses one
-        ``MergedColumnParallelLinear.shard_local_merged_column_dot``, which
-        concatenates and splits each device's own q/k/v columns. Neither path
-        moves weight data between devices. Other projections (quantized, LoRA)
+        When q/k/v_proj are plain ``LinearBase`` layers, every token count and
+        layer uses one ``MergedColumnParallelLinear.shard_local_merged_column_dot``,
+        which concatenates and splits each device's own q/k/v columns, so no
+        weight data moves between devices. Other projections (quantized, LoRA)
         go through their own ``__call__``.
         """
         normed_states = input_layernorm(hidden_states)
@@ -186,47 +185,16 @@ class QWen3Attention(nnx.Module):
             w_q = getattr(self.q_proj.weight, "value", self.q_proj.weight)
             w_k = getattr(self.k_proj.weight, "value", self.k_proj.weight)
             w_v = getattr(self.v_proj.weight, "value", self.v_proj.weight)
-            if normed_states.shape[0] > 64 or self.layer_id < 6:
-                target = NamedSharding(
-                    self.mesh,
-                    P("data", *([None] * (normed_states.ndim - 2)), "tensor"),
-                )
-                dims = (((normed_states.ndim - 1,), (0,)), ((), ()))
-                q = jax.lax.dot_general(
-                    normed_states,
-                    w_q,
-                    dims,
-                    preferred_element_type=jnp.float32,
-                    out_sharding=target,
-                ).astype(normed_states.dtype)
-                k = jax.lax.dot_general(
-                    normed_states,
-                    w_k,
-                    dims,
-                    preferred_element_type=jnp.float32,
-                    out_sharding=target,
-                ).astype(normed_states.dtype)
-                v = jax.lax.dot_general(
-                    normed_states,
-                    w_v,
-                    dims,
-                    preferred_element_type=jnp.float32,
-                    out_sharding=target,
-                ).astype(normed_states.dtype)
-            else:
-                # A global concat of the P(None, "tensor") weights would move
-                # weight columns between devices on every step; merge and split
-                # each device's own columns instead.
-                q, k, v = MergedColumnParallelLinear.shard_local_merged_column_dot(
-                    normed_states,
-                    (w_q, w_k, w_v),
-                    (self.q_size, self.kv_size, self.kv_size),
-                    self.mesh,
-                    preferred_element_type=jnp.float32,
-                    out_dtype=normed_states.dtype,
-                )
-            # None of the branches above goes through LinearBase.__call__, so
-            # add the attention_bias once here to cover all of them.
+            q, k, v = MergedColumnParallelLinear.shard_local_merged_column_dot(
+                normed_states,
+                (w_q, w_k, w_v),
+                (w_q.shape[-1], w_k.shape[-1], w_v.shape[-1]),
+                self.mesh,
+                preferred_element_type=jnp.float32,
+                out_dtype=normed_states.dtype,
+            )
+            # The merged dot does not go through LinearBase.__call__, so add
+            # the attention_bias here.
             if getattr(self.q_proj, "bias", None) is not None:
                 q = q + self.q_proj.bias.value
             if getattr(self.k_proj, "bias", None) is not None:
@@ -279,6 +247,7 @@ class Qwen3MLP(nnx.Module):
     ) -> None:
         self.layer_id = layer_id
         self.mesh = mesh
+        self.intermediate_size = intermediate_size
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -322,35 +291,14 @@ class Qwen3MLP(nnx.Module):
         if type(self.gate_proj) is LinearBase and type(self.up_proj) is LinearBase:
             w_g = getattr(self.gate_proj.weight, "value", self.gate_proj.weight)
             w_u = getattr(self.up_proj.weight, "value", self.up_proj.weight)
-            w_gu = getattr(self, "_cached_w_gu", None)
-            if w_gu is not None:
-                gu = jax.lax.dot_general(
-                    hidden_states,
-                    w_gu,
-                    (((hidden_states.ndim - 1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                ).astype(hidden_states.dtype)
-                a1, a2 = jnp.split(gu, 2, axis=-1)
-            else:
-                target = NamedSharding(
-                    self.mesh,
-                    P("data", *([None] * (hidden_states.ndim - 2)), "tensor"),
-                )
-                dims = (((hidden_states.ndim - 1,), (0,)), ((), ()))
-                a1 = jax.lax.dot_general(
-                    hidden_states,
-                    w_g,
-                    dims,
-                    preferred_element_type=jnp.float32,
-                    out_sharding=target,
-                ).astype(hidden_states.dtype)
-                a2 = jax.lax.dot_general(
-                    hidden_states,
-                    w_u,
-                    dims,
-                    preferred_element_type=jnp.float32,
-                    out_sharding=target,
-                ).astype(hidden_states.dtype)
+            a1, a2 = MergedColumnParallelLinear.shard_local_merged_column_dot(
+                hidden_states,
+                (w_g, w_u),
+                (w_g.shape[-1], w_u.shape[-1]),
+                self.mesh,
+                preferred_element_type=jnp.float32,
+                out_dtype=hidden_states.dtype,
+            )
         else:
             a1, _ = self.gate_proj(hidden_states)
             a2, _ = self.up_proj(hidden_states)
@@ -465,11 +413,14 @@ class QWen3Model(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        embed_sharding = (
+            ("tensor", None) if getattr(config, "tie_word_embeddings", False) else (None, None)
+        )
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
-            kernel_axes=("tensor", None),
+            kernel_axes=embed_sharding,
             param_dtype=dtype,
             mesh=mesh,
         )
@@ -594,10 +545,13 @@ class Qwen3ForCausalLM(nnx.Module):
         logger.info("Qwen3 weights loaded successfully!")
 
     def _create_qwen3_weight_mappings(self) -> dict:
+        embed_sharding = (
+            ("tensor", None) if getattr(self.config, "tie_word_embeddings", False) else (None, None)
+        )
         mappings = {
             "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
-                sharding=("tensor", None),
+                sharding=embed_sharding,
                 transpose=False,
             ),
             "model.norm.weight": WeightSpec(
