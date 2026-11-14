@@ -828,6 +828,15 @@ class FlashAttention(AttentionBackend):
                 else None
             )
 
+            is_decode_only = (
+                forward_batch is not None
+                and forward_batch.forward_mode == ForwardMode.DECODE
+                and getattr(forward_batch, "spec_info", None) is None
+            )
+            skip_decode_stage = (
+                forward_batch is not None and forward_batch.forward_mode != ForwardMode.DECODE
+            )
+
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention_v3(
                 queries,
@@ -844,6 +853,11 @@ class FlashAttention(AttentionBackend):
                 ),
                 softmax_dtype=layer.softmax_dtype,
                 m_block_sizes=target_verify_m_block_sizes,
+                predicate_cache_dma=True,
+                elide_single_tile_loops=True,
+                compact_span_mask=True,
+                decode_only=is_decode_only,
+                skip_decode=skip_decode_stage,
             )
 
             return result, updated_kv_cache_fused

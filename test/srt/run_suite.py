@@ -276,6 +276,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7, runner="pytest"),
         TestFile("python/sgl_jax/test/test_rpa_v3_kv_writeback.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_rpa_v3_flags.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("test/srt/kernels/hca/test_backend.py", 15, runner="pytest"),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
@@ -342,6 +343,12 @@ suites = {
         ),
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/layers/test_rotary_embedding.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/layers/test_qsa_indexer.py", 0.1),
         TestFile(
             "python/sgl_jax/test/layers/test_qsa_sparse_backend.py",
@@ -460,6 +467,18 @@ suites = {
         ),
         TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/test_flashattention_rpa_stage_flags.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/models/test_qwen3_fused_qkv.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
+        ),
         TestFile(
             "python/sgl_jax/test/models/test_minimax_m3_msa.py",
             3,
