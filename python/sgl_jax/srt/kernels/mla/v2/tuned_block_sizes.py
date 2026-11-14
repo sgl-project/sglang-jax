@@ -139,10 +139,12 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         #   mixed mnt=4096: +88.4%  (2.616ms vs 22.638ms)
         #
         # See benchmark/kernels/mla/get_block_spec_config_mla.py.
-        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 16): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 16): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 32): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 64): (32, 1, 2),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 128): (32, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 128): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 256): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 512): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 1024): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 2048): (8, 256),

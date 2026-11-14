@@ -28,6 +28,10 @@ pre-#1733 (``c136c733``) MLA v2 kernel:
 from __future__ import annotations
 
 import contextlib
+import functools
+import importlib.util
+import pathlib
+import sys
 import unittest
 import warnings
 from unittest import mock
@@ -38,6 +42,7 @@ import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend import core as jax_core
 from jax.sharding import AxisType, Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -205,11 +210,11 @@ class _CpuRef:
                 self._on_root_read(self._buf.copy())
             return jnp.asarray(self._get_view())
         view = self._get_view()
-        norm = list(self._norm_idx(idx))
+        norm = self._norm_idx(idx)
         for d, item in enumerate(norm):
-            if isinstance(item, int) and d < view.ndim:
-                norm[d] = min(max(item, 0), view.shape[d] - 1)
-        return jnp.asarray(view[tuple(norm)])
+            if isinstance(item, int) and d < view.ndim and not 0 <= item < view.shape[d]:
+                raise IndexError(f"ref read index {item} out of range for dim {d} of {view.shape}")
+        return jnp.asarray(view[norm])
 
     def __setitem__(self, idx, val):
         cur = self._get_view().copy()
@@ -291,7 +296,9 @@ class _FakeAsyncCopy:
         self.dst = dst
 
     def start(self):
-        if self.src.shape != self.dst.shape or self.src._get_view().size == 0:
+        if self.src.shape != self.dst.shape:
+            raise ValueError(f"DMA shape mismatch: {self.src.shape} -> {self.dst.shape}")
+        if self.src._get_view().size == 0:
             return
         self.dst[...] = self.src[...]
 
@@ -884,7 +891,8 @@ def make_mla_v2_parity_inputs(
 
     cu_q_lens = jnp.asarray(np.r_[0, np.cumsum(q_lens)], jnp.int32)
     cu_kv_lens = jnp.asarray(np.r_[0, np.cumsum(aligned_kv_lens)], jnp.int32)
-    page_indices = jnp.arange(sum(page_counts), dtype=jnp.int32)
+    # Scattered physical pages, so a kernel that ignores page_indices fails.
+    page_indices = jnp.asarray(rng.permutation(total_pages)[: sum(page_counts)], jnp.int32)
     kv_lens_arr = jnp.asarray(kv_lens, jnp.int32)
 
     is_decode = all(q == 1 for q in q_lens)
@@ -921,6 +929,14 @@ def extract_valid_kv_tokens(cache_arr, lens, page_size, cu_kv_lens, page_indices
             w_row, w_col = in_page // kv_packing, in_page % kv_packing
             rows.append(cache_arr[p_i, w_row, w_col])
     return np.stack(rows, axis=0)
+
+
+def _primitive_names(jaxpr):
+    """Primitive names in ``jaxpr`` and its nested jaxprs (``jnp.pad`` traces as a ``jit``)."""
+    names = [eqn.primitive.name for eqn in jaxpr.eqns]
+    for sub in jax_core.subjaxprs(jaxpr):
+        names += _primitive_names(sub)
+    return names
 
 
 def _single_device_mesh():
@@ -1173,7 +1189,7 @@ class TestMLAV2BitExactParity(unittest.TestCase):
             for num_q_heads in (2, 4, 8, 16, 64):
                 q_pe = jnp.ones((8, num_q_heads, 64), dtype=jnp.bfloat16)
                 jaxpr_pe = jax.make_jaxpr(kmod.prepare_q_inputs)(q_pe)
-                primitives_pe = [eqn.primitive.name for eqn in jaxpr_pe.jaxpr.eqns]
+                primitives_pe = _primitive_names(jaxpr_pe.jaxpr)
                 self.assertIn(
                     "optimization_barrier",
                     primitives_pe,
@@ -1182,9 +1198,200 @@ class TestMLAV2BitExactParity(unittest.TestCase):
 
                 ql_nope = jnp.ones((8, num_q_heads, 512), dtype=jnp.bfloat16)
                 jaxpr_nope = jax.make_jaxpr(kmod.prepare_q_inputs)(ql_nope)
-                primitives_nope = [eqn.primitive.name for eqn in jaxpr_nope.jaxpr.eqns]
+                primitives_nope = _primitive_names(jaxpr_nope.jaxpr)
                 self.assertNotIn("pad", primitives_nope)
                 self.assertNotIn("optimization_barrier", primitives_nope)
+
+    def test_is_default_blocks_resolves_legacy_tuples_and_accepts_int(self):
+        """Legacy default block tuples and None resolve via get_tuned_block_sizes_mla;
+        scalar int and non-default explicit tuples bypass the table without TypeError."""
+        from sgl_jax.srt.kernels.mla.v2 import tuned_block_sizes
+
+        inputs = make_mla_v2_parity_inputs(
+            [(1, 16), (4, 32)], page_size=128, num_heads=16, dtype=jnp.bfloat16, seed=42
+        )
+        cases = [
+            ("none", None, None, True),
+            ("legacy_3_1_1", (3, 1, 1), (1, 1, 16), True),
+            ("legacy_1_1_1", (1, 1, 1), (1, 1, 16), True),
+            ("scalar_int", 1, 8, False),
+            ("explicit_decode_sweep", (1, 1, 1), (1, 1, 1), False),
+            ("explicit_tuple", (1, 1, 1), (1, 1, 8), False),
+        ]
+        with jax.sharding.set_mesh(_single_device_mesh()):
+            for name, nkv, nq, expect_lookup in cases:
+                with (
+                    self.subTest(case=name),
+                    mock.patch.object(
+                        tuned_block_sizes,
+                        "get_tuned_block_sizes_mla",
+                        return_value=None,
+                    ) as mock_lookup,
+                ):
+                    run = _make_sharded_v2_kernel(
+                        len(inputs),
+                        sm_scale=(512 + 64) ** -0.5,
+                        num_kv_pages_per_block=nkv,
+                        num_queries_per_block=nq,
+                        decode_batch_size=1,
+                    )
+                    jax.jit(run).trace(*inputs)
+                    if expect_lookup:
+                        self.assertEqual(mock_lookup.call_count, 2)
+                    else:
+                        mock_lookup.assert_not_called()
+
+
+_MLA_BENCH_DIR = pathlib.Path(__file__).resolve().parents[3] / "benchmark" / "kernels" / "mla"
+
+
+def _load_mla_bench_module(name):
+    """Import ``benchmark/kernels/mla/<name>.py`` with its sibling ``utils`` module."""
+    spec = importlib.util.spec_from_file_location(
+        f"_mla_bench_{name}", _MLA_BENCH_DIR / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    saved_utils = sys.modules.pop("utils", None)
+    sys.path.insert(0, str(_MLA_BENCH_DIR))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(_MLA_BENCH_DIR))
+        sys.modules.pop("utils", None)
+        if saved_utils is not None:
+            sys.modules["utils"] = saved_utils
+    return module
+
+
+def _pallas_call_names(jaxpr):
+    names = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "pallas_call":
+            # JAX < 0.8 keeps the name in `name_and_src_info`; newer releases in `name`.
+            info = eqn.params.get("name_and_src_info")
+            names.append(info.name if info is not None else eqn.params["name"])
+    for sub in jax_core.subjaxprs(jaxpr):
+        names += _pallas_call_names(sub)
+    return names
+
+
+@unittest.skipUnless(_MLA_BENCH_DIR.is_dir(), "benchmark/kernels/mla is not in this checkout")
+class TestMLAV2BenchmarkBlockConfigs(unittest.TestCase):
+    """The MLA tuner and bench time explicit block configs. The kernel must build the
+    pallas_call they request, not replace it with the tuned-table entry."""
+
+    def setUp(self):
+        from sgl_jax.srt.kernels.mla.v2 import tuned_block_sizes
+
+        # Look the table up as on the TPU v7 host that the Ling-2.6-1T entries came from.
+        for name, value in (("get_tpu_version", lambda: 7), ("get_device_name", lambda: "TPU v7")):
+            patcher = mock.patch.object(tuned_block_sizes, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _built_pallas_calls(self, inputs, nkv, nq, dbs, vmem_limit_bytes):
+        args = [
+            inputs[k]
+            for k in (
+                "ql_nope",
+                "q_pe",
+                "new_kv_c",
+                "new_k_pe",
+                "cache_kv",
+                "kv_lens",
+                "page_indices",
+                "cu_q_lens",
+                "cu_kv_lens",
+                "distribution",
+            )
+        ]
+        jaxpr = jax.make_jaxpr(
+            functools.partial(
+                kmod.mla_ragged_paged_attention,
+                sm_scale=(512 + 64) ** -0.5,
+                num_kv_pages_per_block=nkv,
+                num_queries_per_block=nq,
+                decode_batch_size=dbs,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+        )(*args)
+        return _pallas_call_names(jaxpr.jaxpr)
+
+    def test_tuner_candidates_build_the_timed_pallas_call(self):
+        tuner = _load_mla_bench_module("get_block_spec_config_mla")
+        requests = []
+
+        def record(case_label, inputs, sm_scale, nkv, nq, dbs, vmem, tries, scope):
+            requests.append((case_label, inputs, nkv, nq, dbs, vmem, scope))
+            return 1.0
+
+        common = dict(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=256,
+            kv_len=256,
+            vmem_limit_bytes=64 << 20,
+            tries=1,
+            dtype=jnp.bfloat16,
+        )
+        with (
+            mock.patch.object(tuner, "_bench_one", side_effect=record),
+            mock.patch.object(tuner, "_BKV_P_CANDIDATES", (1, 8)),
+            mock.patch.object(tuner, "_BQ_MIXED_CANDIDATES", (16, 128)),
+            mock.patch.object(tuner, "_DBS_CANDIDATES", (2,)),
+        ):
+            tuner._sweep_mixed(max_num_tokens=128, num_q_heads=8, **common)
+            tuner._sweep_decode(max_num_tokens=16, num_q_heads=8, **common)
+
+        # The heuristic baselines are among the timed configs.
+        scopes = {request[-1] for request in requests}
+        self.assertIn("MLA-m-bq_{1}-bkvp_{0}-p_256-bsz_1".format(*tuner._HEURISTIC_MIXED), scopes)
+        self.assertIn("MLA-bd-bq_1-bkvp_{0}-p_256-bsz_{2}".format(*tuner._HEURISTIC_DECODE), scopes)
+        for case, inputs, nkv, nq, dbs, vmem, scope in requests:
+            with self.subTest(case=case, nkv=nkv, nq=nq, dbs=dbs):
+                self.assertIn(scope, self._built_pallas_calls(inputs, nkv, nq, dbs, vmem))
+
+    def test_bench_default_config_builds_hardcoded_blocks(self):
+        bench = _load_mla_bench_module("bench_mla")
+        requests = []
+
+        def record(*args, num_kv_pages_per_block, num_queries_per_block, decode_batch_size, **_):
+            requests.append((num_kv_pages_per_block, num_queries_per_block, decode_batch_size))
+            return args[0], args[4]
+
+        tpu_info = mock.Mock(vmem_capacity_bytes=64 << 20)
+        cases = {
+            "mixed": "MLA-m-bq_{1}-bkvp_{0}-p_256-bsz_1".format(*bench._DEFAULT_MIXED_BLOCK),
+            "decode": f"MLA-bd-bq_1-bkvp_{bench._DEFAULT_DECODE_BLOCK[0]}-p_256-bsz_{bench._DEFAULT_DECODE_DBS}",
+        }
+        for case, expected in cases.items():
+            requests.clear()
+            shape = dict(
+                max_num_tokens=128 if case == "mixed" else 16,
+                num_q_heads=8,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                page_size=256,
+                kv_len=256,
+            )
+            with (
+                self.subTest(case=case),
+                mock.patch.object(bench, "mla_ragged_paged_attention", record),
+                mock.patch.object(
+                    bench, "multiple_iteration_timeit_from_trace", return_value=[1.0]
+                ),
+                mock.patch.object(pltpu, "get_tpu_info", return_value=tpu_info),
+            ):
+                bench.benchmark_backend(case=case, use_lookup=False, tries=1, **shape)
+                self.assertEqual(len(requests), 1)
+                nkv, nq, dbs = requests[0]
+                make_inputs = (
+                    bench.create_mla_mixed_uniform_data
+                    if case == "mixed"
+                    else bench.create_mla_decode_uniform_data
+                )
+                inputs = make_inputs(dtype=jnp.bfloat16, **shape)
+                self.assertIn(expected, self._built_pallas_calls(inputs, nkv, nq, dbs, 64 << 20))
 
 
 if __name__ == "__main__":

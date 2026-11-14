@@ -344,8 +344,11 @@ def _sweep_mixed(
     dbs_for_mixed = 1
     for i, (bkv_p, bq) in enumerate(candidates):
         # slot[0] (decode) and slot[1] (prefill) are unused — placeholders.
+        # slot[1] repeats bq so the heuristic (1, 16) is not sent as the
+        # legacy default ((1, 1, 1), (1, 1, 16)), which the kernel resolves
+        # through the tuned table instead of running the requested blocks.
         nkv = (1, 1, bkv_p)
-        nq = (1, 1, bq)
+        nq = (1, bq, bq)
         # Scope matches the kernel's MIXED pallas_call name. MIXED has
         # static_q_len=None so bq_sz = num_queries_per_block[2] = our `bq`
         # (no clamping). batch_size=1 always for MIXED.

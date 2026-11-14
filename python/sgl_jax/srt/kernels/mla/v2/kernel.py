@@ -794,8 +794,13 @@ def _mla_ragged_paged_attention_kernel(
                         kv_packing_idx_new += 1
                         curr_kvc_reg = next_kvc_reg
                         curr_kpe_reg = next_kpe_reg
-                        next_kvc_reg = bkvc_vmem_ref[kv_packing_idx_new + 1, :, :]
-                        next_kpe_reg = bkvpe_vmem_ref[kv_packing_idx_new + 1, :, :]
+                        # The last iteration's lookahead is never used and can point one
+                        # word past the buffer; clamp it so the read stays in bounds.
+                        next_kv_packing_idx = jnp.minimum(
+                            kv_packing_idx_new + 1, bkvc_vmem_ref.shape[0] - 1
+                        )
+                        next_kvc_reg = bkvc_vmem_ref[next_kv_packing_idx, :, :]
+                        next_kpe_reg = bkvpe_vmem_ref[next_kv_packing_idx, :, :]
                         return (
                             kv_packing_idx,
                             kv_packing_idx_new,
@@ -1465,7 +1470,9 @@ def mla_ragged_paged_attention(
         mixed) cases.
       num_queries_per_block: number of queries to be processed in one flash
         attention block in the pallas kernel. This is a tuple of (decode, prefill,
-        mixed) cases.
+        mixed) cases. If either is None, or the pair is a legacy default
+        ((3, 1, 1) or (1, 1, 1) with (1, 1, 16)), both come from the tuned table
+        (or its fallback), and a tuned decode hit also sets decode_batch_size.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
@@ -1473,7 +1480,17 @@ def mla_ragged_paged_attention(
     Returns:
       The output of attention and the updated kv cache.
     """
-    if num_kv_pages_per_block is None or num_queries_per_block is None:
+    is_default_blocks = (
+        num_kv_pages_per_block is None
+        or num_queries_per_block is None
+        or (
+            isinstance(num_kv_pages_per_block, (tuple, list))
+            and isinstance(num_queries_per_block, (tuple, list))
+            and tuple(num_kv_pages_per_block) in ((3, 1, 1), (1, 1, 1))
+            and tuple(num_queries_per_block) == (1, 1, 16)
+        )
+    )
+    if is_default_blocks:
         # Look up the auto-tuned block-size table when caller (e.g. the
         # production attention backend) hasn't specified block params.
         # The kernel runs three pallas_calls (BATCHED_DECODE, DECODE-tail,
