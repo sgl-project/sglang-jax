@@ -275,6 +275,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7, runner="pytest"),
         TestFile("python/sgl_jax/test/test_rpa_v3_kv_writeback.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_rpa_v3_flags.py", 3, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_rpa_v3_page_coalescing.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("test/srt/kernels/hca/test_backend.py", 15, runner="pytest"),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
