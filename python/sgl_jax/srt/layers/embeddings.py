@@ -15,6 +15,7 @@
 """Embedding Layers."""
 
 import math
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -219,7 +220,25 @@ class ParallelLMHead(Embed):
         raise RuntimeError("LMHead's weights should be used in the sampler.")
 
 
-class RotaryEmbedding:
+class RotaryEmbeddingBase(ABC):
+    """Abstract base class for Rotary Position Embedding implementations."""
+
+    @abstractmethod
+    def get_cos_sin(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Compute (cos, sin) tensors for the given positions in model dtype."""
+
+    @abstractmethod
+    def __call__(
+        self,
+        positions: jax.Array,
+        query: jax.Array,
+        key: jax.Array,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Apply rotary positional embeddings to query and key tensors."""
+
+
+class RotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding (safe to initialize inside JIT if needed)."""
 
     def __init__(
@@ -242,21 +261,24 @@ class RotaryEmbedding:
         inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
         self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
 
+    def get_cos_sin(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Compute (cos, sin) tensors for standard 1D positions in model dtype."""
+        positions = positions.flatten()  # [num_tokens]
+        cos, sin = self._compute_cos_sin(positions)
+        return cos.astype(self.dtype), sin.astype(self.dtype)
+
     @named_scope
     def __call__(
         self,
         positions: jax.Array,
         query: jax.Array,
         key: jax.Array,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        positions = positions.flatten()  # [num_tokens]
-
-        cos, sin = self._compute_cos_sin(positions)
-        cos = cos.astype(self.dtype)
-        sin = sin.astype(self.dtype)
+        cos, sin = self.get_cos_sin(positions) if cos_sin is None else cos_sin
 
         query_shape = query.shape
-        num_tokens = positions.shape[0]
+        num_tokens = cos.shape[0]
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
@@ -386,11 +408,44 @@ class MRotaryEmbedding(RotaryEmbedding):
             # mrope_section is like [16, 24, 24], split indices should be [16, 40]
             self.split_indices = np.cumsum(self.mrope_section)[:-1].tolist()
 
+    def _expand_positions(self, positions: jax.Array) -> jax.Array:
+        if positions.ndim == 1:
+            return jnp.tile(positions[None, :], (3, 1))
+        if positions.ndim == 2 and positions.shape[0] == 1:
+            return jnp.tile(positions, (3, 1))
+        return positions
+
+    def get_cos_sin(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
+        positions = self._expand_positions(positions)
+        if positions.ndim != 2 or positions.shape[0] != 3:
+            return super().get_cos_sin(positions)
+
+        cos_all, sin_all = self._compute_cos_sin(positions)
+        cos_all = cos_all.astype(self.dtype)
+        sin_all = sin_all.astype(self.dtype)
+
+        if self.mrope_interleaved:
+            cos = apply_interleaved_rope(cos_all, self.mrope_section)
+            sin = apply_interleaved_rope(sin_all, self.mrope_section)
+        else:
+            cos_splits = jnp.split(cos_all, self.split_indices, axis=-1)
+            sin_splits = jnp.split(sin_all, self.split_indices, axis=-1)
+            cos = jnp.concatenate(
+                [split_tensor[i] for i, split_tensor in enumerate(cos_splits)],
+                axis=-1,
+            )
+            sin = jnp.concatenate(
+                [split_tensor[i] for i, split_tensor in enumerate(sin_splits)],
+                axis=-1,
+            )
+        return cos, sin
+
     def __call__(
         self,
         positions: jax.Array,
         query: jax.Array,
         key: jax.Array,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         """
         Args:
@@ -398,21 +453,51 @@ class MRotaryEmbedding(RotaryEmbedding):
                        [3, num_tokens] (Multimodal T/H/W positions)
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
+            cos_sin: Optional precomputed (cos, sin) tuple from get_cos_sin(positions).
         """
-        # Handle Multimodal 3D Positions
-        # If positions is 1D ([num_tokens]) or single-row ([1, num_tokens]),
-        # expand it to shape [3, num_tokens] by duplicating the row so that
-        # downstream multimodal MRoPE logic has three channels (T/H/W).
-        if positions.ndim == 1:
-            positions = jnp.tile(positions[None, :], (3, 1))  # [3, num_tokens]
-        elif positions.ndim == 2 and positions.shape[0] == 1:
-            positions = jnp.tile(positions, (3, 1))
+        if cos_sin is None:
+            positions = self._expand_positions(positions)
+            if positions.ndim == 2 and positions.shape[0] == 3:
+                return self._forward_mrope(positions, query, key)
+            return super().__call__(positions, query, key)
 
-        if positions.ndim == 2 and positions.shape[0] == 3:
-            return self._forward_mrope(positions, query, key)
+        cos, sin = cos_sin
+        return self._apply_mrope_qk(query, key, cos, sin)
 
-        # Fallback to standard RoPE for 1D positions
-        return super().__call__(positions, query, key)
+    def _apply_mrope_qk(
+        self,
+        query: jax.Array,
+        key: jax.Array,
+        cos: jax.Array,
+        sin: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        num_tokens = cos.shape[0]
+
+        query_real = query[:num_tokens] if num_tokens < query.shape[0] else query
+        query_shape = query_real.shape
+        query_real = query_real.reshape(num_tokens, -1, self.head_size)
+        query_rot = query_real[..., : self.rotary_dim]
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        if self.rotary_dim < self.head_size:
+            query_pass = query_real[..., self.rotary_dim :]
+            query_real = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        else:
+            query_real = query_rot.reshape(query_shape)
+        query = query.at[:num_tokens].set(query_real) if num_tokens < query.shape[0] else query_real
+
+        key_real = key[:num_tokens] if num_tokens < key.shape[0] else key
+        key_shape = key_real.shape
+        key_real = key_real.reshape(num_tokens, -1, self.head_size)
+        key_rot = key_real[..., : self.rotary_dim]
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        if self.rotary_dim < self.head_size:
+            key_pass = key_real[..., self.rotary_dim :]
+            key_real = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        else:
+            key_real = key_rot.reshape(key_shape)
+        key = key.at[:num_tokens].set(key_real) if num_tokens < key.shape[0] else key_real
+
+        return query, key
 
     def _forward_mrope(
         self,
@@ -420,66 +505,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: jax.Array,
         key: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
-        # positions: [3, num_tokens]
-        num_tokens = positions.shape[-1]
-
-        # Compute all three axes in float32, then cast the resulting
-        # trigonometric values to the model dtype.
-        cos_all, sin_all = self._compute_cos_sin(positions)
-        cos_all = cos_all.astype(self.dtype)
-        sin_all = sin_all.astype(self.dtype)
-
-        if self.mrope_interleaved:
-            # --- Interleaved Mode ---
-            # Direct manipulation on the [3, N, D] tensor
-            cos = apply_interleaved_rope(cos_all, self.mrope_section)
-            sin = apply_interleaved_rope(sin_all, self.mrope_section)
-        else:
-            # --- Chunked Mode (Existing Logic) ---
-            # 2. Split and Select based on mrope_section
-            cos_splits = jnp.split(cos_all, self.split_indices, axis=-1)
-            sin_splits = jnp.split(sin_all, self.split_indices, axis=-1)
-
-            # Select specific rows for specific sections
-            # section 0 uses row 0 (Time), section 1 uses row 1 (Height), section 2 uses row 2 (Width)
-            final_cos_list = []
-            final_sin_list = []
-
-            for i, split_tensor in enumerate(cos_splits):
-                # split_tensor shape: [3, num_tokens, section_dim]
-                # We take the i-th row: [num_tokens, section_dim]
-                final_cos_list.append(split_tensor[i])
-
-            for i, split_tensor in enumerate(sin_splits):
-                final_sin_list.append(split_tensor[i])
-
-            # Concatenate back: [num_tokens, rotary_dim // 2]
-            cos = jnp.concatenate(final_cos_list, axis=-1)
-            sin = jnp.concatenate(final_sin_list, axis=-1)
-
-        # 3. Apply RoPE
-        # Reshape query/key to [num_tokens, num_heads, head_size]
-        query_real = query[:num_tokens]
-        query_shape = query_real.shape
-        query_real = query_real.reshape(num_tokens, -1, self.head_size)
-        query_rot = query_real[..., : self.rotary_dim]
-        query_pass = query_real[..., self.rotary_dim :]
-
-        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query_real = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
-        query = query.at[:num_tokens].set(query_real)
-
-        key_real = key[:num_tokens]
-        key_shape = key_real.shape
-        key_real = key_real.reshape(num_tokens, -1, self.head_size)
-        key_rot = key_real[..., : self.rotary_dim]
-        key_pass = key_real[..., self.rotary_dim :]
-
-        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key_real = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
-        key = key.at[:num_tokens].set(key_real)
-
-        return query, key
+        cos, sin = self.get_cos_sin(positions)
+        return self._apply_mrope_qk(query, key, cos, sin)
 
 
 class ProportionalRotaryEmbedding(RotaryEmbedding):
@@ -540,6 +567,30 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         self.high_freq_factor = high_freq_factor
         self.orig_max_position = orig_max_position
         super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
+        self._inv_freq_np = self._compute_llama3_inv_freq()
+
+    def _compute_llama3_inv_freq(self) -> np.ndarray:
+        inv_freqs = self._inv_freq_np
+        low_freq_wavelen = self.orig_max_position / self.low_freq_factor
+        high_freq_wavelen = self.orig_max_position / self.high_freq_factor
+
+        wave_len = 2 * math.pi / inv_freqs
+        if self.low_freq_factor != self.high_freq_factor:
+            smooth = (self.orig_max_position / wave_len - self.low_freq_factor) / (
+                self.high_freq_factor - self.low_freq_factor
+            )
+        else:
+            smooth = 0.0
+        new_freqs = np.where(
+            wave_len < high_freq_wavelen,
+            inv_freqs,
+            np.where(
+                wave_len > low_freq_wavelen,
+                inv_freqs / self.scaling_factor,
+                (1 - smooth) * inv_freqs / self.scaling_factor + smooth * inv_freqs,
+            ),
+        )
+        return np.asarray(new_freqs, dtype=np.float32)
 
     def _compute_inv_freq(self, base: int | float) -> jax.Array:
         inv_freqs = super()._compute_inv_freq(base)
@@ -640,7 +691,7 @@ def apply_rotary_emb(
         return stacked.reshape(*stacked.shape[:-2], -1)
 
 
-_ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
+_ROPE_DICT: dict[tuple, RotaryEmbeddingBase] = {}
 
 
 def get_rope(
@@ -653,7 +704,7 @@ def get_rope(
     dtype: jnp.dtype | None = jnp.bfloat16,
     partial_rotary_factor: float = 1.0,
     dual_chunk_attention_config: dict[str, Any] | None = None,
-) -> RotaryEmbedding:
+) -> RotaryEmbeddingBase:
     if rope_scaling is not None:
         # Transforms every value that is a list into a tuple for caching calls
         rope_scaling_tuple = {
@@ -877,38 +928,19 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         inv_freq_mask = 1.0 - np.clip((np.arange(dim // 2, dtype=np.float32) - low) / max_val, 0, 1)
         return freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
 
+    def get_cos_sin(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
+        positions = positions.flatten()
+        cos, sin = self._compute_cos_sin(positions)
+        cos = (cos * self._rope_mscale).astype(self.dtype)
+        sin = (sin * self._rope_mscale).astype(self.dtype)
+        return cos, sin
+
     @named_scope
     def __call__(
         self,
         positions: jax.Array,
         query: jax.Array,
         key: jax.Array,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        positions = positions.flatten()
-
-        cos, sin = self._compute_cos_sin(positions)
-        cos = (cos * self._rope_mscale).astype(self.dtype)
-        sin = (sin * self._rope_mscale).astype(self.dtype)
-
-        query_shape = query.shape
-        num_tokens = positions.shape[0]
-        query = query.reshape(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
-        else:
-            query = query_rot.reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.reshape(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        if self.rotary_dim < self.head_size:
-            key_pass = key[..., self.rotary_dim :]
-            key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
-        else:
-            key = key_rot.reshape(key_shape)
-
-        return query, key
+        return super().__call__(positions, query, key, cos_sin=cos_sin)

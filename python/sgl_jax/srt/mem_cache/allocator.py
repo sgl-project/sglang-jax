@@ -7,6 +7,38 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache, SWAKVPool
 
 logger = logging.getLogger(__name__)
 
+# First window size scanned by _first_contiguous_window; it doubles per step.
+_FIRST_FIT_SCAN_CHUNK = 4096
+
+
+def _merge_sorted(sorted_slots: np.ndarray, new_slots: np.ndarray) -> np.ndarray:
+    """np.sort(np.concatenate([sorted_slots, new_slots])) without re-sorting the
+    already sorted free list: O(n + k log k) instead of O((n + k) log(n + k))."""
+    new_slots = np.sort(new_slots)
+    sorted_slots = sorted_slots.astype(np.result_type(sorted_slots, new_slots), copy=False)
+    return np.insert(sorted_slots, np.searchsorted(sorted_slots, new_slots), new_slots)
+
+
+def _first_contiguous_window(sorted_slots: np.ndarray, need_size: int) -> int:
+    """Start of the first run of at least need_size consecutive slots, or -1.
+
+    The free list is sorted and has no duplicates, so the window
+    sorted_slots[s : s + need_size] is consecutive iff its endpoints are
+    need_size - 1 apart, and the first such window starts the first long enough
+    run. Windows are checked in growing chunks, so a run near the front of the
+    list is found without scanning the whole list.
+    """
+    span = need_size - 1
+    num_windows = len(sorted_slots) - span
+    lo, chunk = 0, _FIRST_FIT_SCAN_CHUNK
+    while lo < num_windows:
+        hi = min(lo + chunk, num_windows)
+        hits = np.flatnonzero(sorted_slots[lo + span : hi + span] - sorted_slots[lo:hi] == span)
+        if hits.size:
+            return lo + int(hits[0])
+        lo, chunk = hi, 2 * chunk
+    return -1
+
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
@@ -110,6 +142,24 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         slots = self.free_slots[dp_rank]
         if need_size > len(slots):
             return None
+        if need_size <= 1:
+            select_index = slots[:need_size].copy()
+            self.free_slots[dp_rank] = slots[need_size:]
+            return select_index
+
+        # Fast path: check if prefix is contiguous
+        if slots[need_size - 1] - slots[0] == need_size - 1:
+            select_index = slots[:need_size].copy()
+            self.free_slots[dp_rank] = slots[need_size:]
+            return select_index
+
+        # Search for the first contiguous block of length >= need_size
+        start = _first_contiguous_window(slots, need_size)
+        if start >= 0:
+            select_index = slots[start : start + need_size].copy()
+            self.free_slots[dp_rank] = np.concatenate([slots[:start], slots[start + need_size :]])
+            return select_index
+
         select_index = slots[:need_size].copy()
         self.free_slots[dp_rank] = slots[need_size:]
         return select_index
@@ -118,7 +168,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.size == 0:
             return
         if self.is_not_in_free_group:
-            self.free_slots[dp_rank] = np.concatenate([self.free_slots[dp_rank], free_index])
+            self.free_slots[dp_rank] = _merge_sorted(self.free_slots[dp_rank], free_index)
         else:
             self.free_group[dp_rank].append(free_index)
 
@@ -139,8 +189,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         for rank in range(self.dp_size):
             if self.free_group[rank]:
-                self.free_slots[rank] = np.concatenate(
-                    [self.free_slots[rank]] + self.free_group[rank]
+                self.free_slots[rank] = _merge_sorted(
+                    self.free_slots[rank], np.concatenate(self.free_group[rank])
                 )
                 self.free_group[rank] = []
 

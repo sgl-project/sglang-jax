@@ -50,5 +50,10 @@ class Envs:
     # identical; escape hatch only.
     SGLANG_JAX_INDEXER_ROPE_CONCAT = EnvBool(True)
 
+    # Qwen3 dense prefill: run large EXTEND/MIXED batches token-parallel on
+    # replicated dense weights (all-to-all around attention) instead of
+    # tensor-parallel with two all-reduces per layer. Escape hatch only.
+    SGLANG_JAX_TOKEN_PARALLEL_PREFILL = EnvBool(True)
+
 
 envs = Envs()

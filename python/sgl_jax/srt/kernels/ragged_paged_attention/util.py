@@ -7,7 +7,21 @@ from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 def cdiv(a, b):
     assert b != 0
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return (a + b - 1) >> (b.bit_length() - 1)
     return (a + b - 1) // b
+
+
+def floor_div_pow2(a, b):
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return a >> (b.bit_length() - 1)
+    return a // b
+
+
+def mod_pow2(a, b):
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return a & (b - 1)
+    return a % b
 
 
 def align_to(x, a):
