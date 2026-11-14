@@ -1,6 +1,7 @@
 """Numerical parity, metadata edge-case, and TPU AOT compilation tests for FusedEPMoE v1."""
 
 import functools
+import sys
 from unittest import mock
 
 import jax
@@ -265,9 +266,35 @@ class FusedMoEV1ParityTest(jtu.JaxTestCase):
                 wrap=(False, False, False),
             ).devices
         except RuntimeError as exc:
-            if "TPU" in str(exc) or "libtpu" in str(exc).lower():
+            # Skip only when no TPU runtime (libtpu) is installed. Any other TPU error,
+            # for example on the TPU CI runner, must fail the AOT tests instead of
+            # skipping them.
+            if "TPU support not installed" in str(exc):
                 self.skipTest(f"TPU topology unavailable on this host: {exc}")
             raise
+
+    def test_tpu_topology_helper_skips_only_without_tpu_runtime(self):
+        not_installed = RuntimeError(
+            "JAX TPU support not installed; cannot generate TPU topology. See"
+            " https://github.com/jax-ml/jax#installation"
+        )
+        this_module = sys.modules[__name__]
+        with (
+            mock.patch.object(this_module, "get_topology_desc", side_effect=not_installed),
+            self.assertRaises(absltest.SkipTest),
+        ):
+            self._get_v6e_2x4_devices_or_skip()
+
+        runtime_error = RuntimeError("INTERNAL: TPU initialization failed: no TPU chips found")
+        with mock.patch.object(this_module, "get_topology_desc", side_effect=runtime_error):
+            try:
+                self._get_v6e_2x4_devices_or_skip()
+            except absltest.SkipTest:
+                self.fail("a TPU runtime error was reported as a skip")
+            except RuntimeError as exc:
+                self.assertIs(exc, runtime_error)
+            else:
+                self.fail("the TPU runtime error was swallowed")
 
     @parameterized.parameters(
         # 1. Standard decode with 2D VMEM relayout active (num_bd1=1, num_bd2=1, num_bf=2)
