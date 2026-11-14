@@ -18,6 +18,7 @@ from sgl_jax.srt.layers.embeddings import (
     apply_rotary_emb,
 )
 from sgl_jax.srt.models.grok import ScalingRotaryEmbedding, get_rope_scaling
+from sgl_jax.srt.models.qwen3 import QWen3Model
 
 _HEAD_SIZE = 128
 _BASE = 1_000_000
@@ -450,5 +451,74 @@ def test_mrotary_get_cos_sin_and_sharded_positions(interleaved: bool, pos_mode: 
     _assert_close(expected_k, _np_apply_neox(key, ref_cos, ref_sin), _QK_ATOL)
     actual_q, actual_k = rotary_emb(positions, query, key, cos_sin=cos_sin)
 
+    _assert_array_equal(actual_q, expected_q)
+    _assert_array_equal(actual_k, expected_k)
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_qwen3_model_hoisted_get_cos_sin_preserves_3d_mrope_positions(interleaved: bool):
+    rotary_emb = MRotaryEmbedding(
+        head_size=_HEAD_SIZE,
+        rotary_dim=_HEAD_SIZE,
+        max_position_embeddings=32768,
+        base=_BASE,
+        is_neox_style=True,
+        dtype=jnp.bfloat16,
+        mrope_section=_MROPE_SECTION,
+        mrope_interleaved=interleaved,
+    )
+    positions = jnp.asarray(
+        [
+            [0, 127, 1023, 4095],
+            [0, 63, 511, 2047],
+            [0, 31, 255, 1023],
+        ],
+        dtype=jnp.int32,
+    )
+    captured = {}
+
+    def capture_layer(
+        layer_positions,
+        hidden_states,
+        forward_batch,
+        token_to_kv_pool,
+        residual=None,
+        *,
+        cos_sin=None,
+    ):
+        captured["positions"] = layer_positions
+        captured["cos_sin"] = cos_sin
+        return hidden_states, residual, None, []
+
+    stub_model = SimpleNamespace(
+        rotary_emb=rotary_emb,
+        layers=[capture_layer],
+        layers_to_capture=[],
+        norm=lambda x: x,
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=jnp.zeros((positions.shape[-1],), dtype=jnp.int32),
+        input_embedding=jnp.ones((positions.shape[-1], _HEAD_SIZE), dtype=jnp.bfloat16),
+        positions=positions,
+        apply_for_deepstack=False,
+        deepstack_visual_embedding=None,
+    )
+
+    QWen3Model.__call__(stub_model, forward_batch, None)
+
+    assert captured["positions"].shape == positions.shape
+    _assert_array_equal(captured["positions"], positions)
+    cos_sin = captured["cos_sin"]
+    assert cos_sin is not None
+    assert cos_sin[0].shape == (positions.shape[-1], _HEAD_SIZE // 2)
+    ref_cos, ref_sin = _np_mrope_cos_sin(
+        positions, _np_default_inv_freq(_BASE, _HEAD_SIZE), _MROPE_SECTION, interleaved
+    )
+    _assert_close(cos_sin[0], ref_cos, _COS_SIN_ATOL)
+    _assert_close(cos_sin[1], ref_sin, _COS_SIN_ATOL)
+
+    query, key = _make_qk(positions.shape[-1])
+    expected_q, expected_k = rotary_emb(positions, query, key)
+    actual_q, actual_k = rotary_emb(positions, query, key, cos_sin=cos_sin)
     _assert_array_equal(actual_q, expected_q)
     _assert_array_equal(actual_k, expected_k)
