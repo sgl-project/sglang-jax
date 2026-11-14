@@ -386,18 +386,30 @@ def test_moe_model_routing_agreement_vs_main(
             topk_group=Gtop,
             routed_scaling_factor=routed_scaling_factor,
         )
+        calls = {"live": 0, "main": 0}
+
+        def _counted(which, fn):
+            def wrapped(*args, **kwargs):
+                calls[which] += 1
+                return fn(*args, interpret=_INTERPRET, **kwargs)
+
+            return wrapped
+
         old_fn = gate_mod.grouped_topk_pallas
+        old_enabled = gate_mod._topk_kernel_enabled
         try:
-            gate_mod.grouped_topk_pallas = functools.partial(
-                grouped_topk_pallas, interpret=_INTERPRET
-            )
+            # TopK falls back to the pure-JAX `_biased_grouped_topk_jax` unless the server args
+            # enable the topk kernel on TPU (never the case in this test process), which would make
+            # both calls below run the same reference. Force the kernel dispatch.
+            gate_mod._topk_kernel_enabled = lambda: True
+            gate_mod.grouped_topk_pallas = _counted("live", grouped_topk_pallas)
             w_mod_live, ids_mod_live = topk_layer(router_scores, correction_bias)
-            gate_mod.grouped_topk_pallas = functools.partial(
-                grouped_topk_pallas_main, interpret=_INTERPRET
-            )
+            gate_mod.grouped_topk_pallas = _counted("main", grouped_topk_pallas_main)
             w_mod_main, ids_mod_main = topk_layer(router_scores, correction_bias)
         finally:
             gate_mod.grouped_topk_pallas = old_fn
+            gate_mod._topk_kernel_enabled = old_enabled
+        assert calls == {"live": 1, "main": 1}, f"gate.TopK did not run the kernels: {calls}"
         np.testing.assert_array_equal(np.asarray(ids_mod_live), np.asarray(ids_mod_main))
         np.testing.assert_array_equal(
             np.asarray(w_mod_live, np.float32).view(np.uint32),
