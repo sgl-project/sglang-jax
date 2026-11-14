@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from sgl_jax.srt.kernels.ragged_paged_attention import ragged_paged_attention_v3
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     ragged_paged_attention,
     ref_ragged_paged_attention,
@@ -318,13 +319,45 @@ def test_ragged_page_table_parity(
     np.testing.assert_array_equal(updated_cache_host.astype(np.float32), expected_cache)
 
 
+def _pallas_calls(jaxpr):
+    """All pallas_call equations in `jaxpr`, including those inside nested jits.
+
+    On TPU v7 each pallas_call is wrapped in one more jax.jit (for the HBM
+    memory-space constraints), so it is not a top-level equation there.
+    """
+    found = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "pallas_call":
+            found.append(eqn)
+            continue
+        for val in eqn.params.values():
+            for sub in val if isinstance(val, (tuple, list)) else (val,):
+                if hasattr(sub, "eqns"):  # a (closed) jaxpr: jit, cond, while, ...
+                    found.extend(_pallas_calls(sub))
+    return found
+
+
+@pytest.fixture(params=[None, 7], ids=["host-tpu-generation", "tpu-v7"])
+def tpu_generation(request, monkeypatch):
+    """Trace for the host's TPU generation and, faked, for TPU v7.
+
+    The trace cache is not keyed on the TPU generation, so it is cleared on
+    both sides to keep a faked trace from leaking into other tests.
+    """
+    if request.param is not None:
+        monkeypatch.setattr(ragged_paged_attention_v3, "get_tpu_version", lambda: request.param)
+    jax.clear_caches()
+    yield request.param
+    jax.clear_caches()
+
+
 @pytest.mark.parametrize(
     "sequences,page_size,bkv_sz,bkv_csz,perm_mode,num_q_heads,num_kv_heads",
     _RAGGED_PAGE_TABLE_CASES,
     ids=_RAGGED_PAGE_TABLE_IDS,
 )
 def test_ragged_page_table_trace_cpu(
-    sequences, page_size, bkv_sz, bkv_csz, perm_mode, num_q_heads, num_kv_heads
+    tpu_generation, sequences, page_size, bkv_sz, bkv_csz, perm_mode, num_q_heads, num_kv_heads
 ):
     """Verify Pallas kernel jaxpr tracing for every ragged and benchmark shape on CPU."""
     del perm_mode
@@ -378,12 +411,10 @@ def test_ragged_page_table_trace_cpu(
         cu_kv_lens_s,
         distribution_s,
     )
-    inner_jaxpr = traced.jaxpr.eqns[0].params["jaxpr"]
-    pallas_eqns = [eqn for eqn in inner_jaxpr.eqns if eqn.primitive.name == "pallas_call"]
-    assert len(pallas_eqns) >= 2
+    assert len(_pallas_calls(traced.jaxpr)) >= 2
 
 
-def test_prologue_skips_bkv_zeroing_unless_skip_kv_mask_cpu():
+def test_prologue_skips_bkv_zeroing_unless_skip_kv_mask_cpu(tpu_generation):
     """Verify prologue only emits VMEM bkv_x2_ref zero-fill when skip_kv_mask=True."""
     page_size, hq, hkv, hd = 128, 8, 2, 128
     queries = jax.ShapeDtypeStruct((1024, hq, hd), jnp.bfloat16)
@@ -418,8 +449,7 @@ def test_prologue_skips_bkv_zeroing_unless_skip_kv_mask_cpu():
         traced = jax.make_jaxpr(_fn)(
             queries, kv, kv, cache, kv_lens_s, page_indices_s, cu_lens_s, cu_lens_s, dist_s
         )
-        inner = traced.jaxpr.eqns[0].params["jaxpr"]
-        pallas_calls = [e for e in inner.eqns if e.primitive.name == "pallas_call"]
+        pallas_calls = _pallas_calls(traced.jaxpr)
         assert len(pallas_calls) == 2
         zero_prims = []
         for pc in pallas_calls:
