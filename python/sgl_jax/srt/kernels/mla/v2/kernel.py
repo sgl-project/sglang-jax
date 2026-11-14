@@ -1478,7 +1478,15 @@ def mla_ragged_paged_attention(
     Returns:
       The output of attention and the updated kv cache.
     """
-    if num_kv_pages_per_block is None or num_queries_per_block is None:
+    is_default_blocks = (
+        num_kv_pages_per_block is None
+        or num_queries_per_block is None
+        or (
+            tuple(num_kv_pages_per_block) in ((3, 1, 1), (1, 1, 1))
+            and tuple(num_queries_per_block) == (1, 1, 16)
+        )
+    )
+    if is_default_blocks:
         # Look up the auto-tuned block-size table when caller (e.g. the
         # production attention backend) hasn't specified block params.
         # The kernel runs three pallas_calls (BATCHED_DECODE, DECODE-tail,
