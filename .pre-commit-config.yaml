@@ -79,7 +79,10 @@ repos:
       - id: mypy
         additional_dependencies: [
           # package list reference: python/sgl_jax/check_env.py, python/pyproject.toml
-          jax,
+          # jax is pinned to the version in python/pyproject.toml: with an unpinned jax the
+          # hook picked up jax 0.12.0 (2026-10-19), whose dtype typing fails mypy on
+          # untouched files (python/sgl_jax/srt/models/grok.py, 14 errors).
+          jax==0.11.1,
           flax
           # jaxlib,
           # triton,
