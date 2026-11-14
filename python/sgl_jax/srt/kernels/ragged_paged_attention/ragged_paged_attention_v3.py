@@ -1264,13 +1264,16 @@ def _ragged_paged_attention_kernel_loop(
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
         start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
-        # Initialize bkv_x2_ref to zeros to avoid NaN issues.
-        # Use bitcast to int32 and preserve actual shape (which may include bank conflict padding)
-        bkv_x2_int32_ref = bkv_x2_ref.bitcast(jnp.int32)
-        zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
-        bkv_x2_int32_ref[0] = zeros
-        start_fetch_bkv(seq_idx=start_seq_idx, bkv_idx=cur_seq_start_bkv_idx, bkv_sem_idx=0)
-        bkv_x2_int32_ref[1] = zeros
+        if skip_kv_mask:
+            # Initialize bkv_x2_ref to zeros to avoid NaN issues when KV masking is skipped.
+            # Use bitcast to int32 and preserve actual shape (which may include bank conflict padding)
+            bkv_x2_int32_ref = bkv_x2_ref.bitcast(jnp.int32)
+            zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
+            bkv_x2_int32_ref[0] = zeros
+            start_fetch_bkv(seq_idx=start_seq_idx, bkv_idx=cur_seq_start_bkv_idx, bkv_sem_idx=0)
+            bkv_x2_int32_ref[1] = zeros
+        else:
+            start_fetch_bkv(seq_idx=start_seq_idx, bkv_idx=cur_seq_start_bkv_idx, bkv_sem_idx=0)
         if custom_mask_ref is not None:
             start_fetch_mask(start_seq_idx, 0, 0, 0)
 

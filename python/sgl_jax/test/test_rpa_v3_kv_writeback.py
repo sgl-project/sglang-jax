@@ -181,39 +181,53 @@ def test_kv_writeback(
     np.testing.assert_array_equal(decoded_cache.astype(np.float32), expected_cache)
 
 
+_RAGGED_PAGE_TABLE_CASES = [
+    ([(393, 273), (137, 512), (65, 191)], 128, 512, 256, "shuffled", 8, 2),
+    ([(1, 37), (16, 48), (33, 60), (7, 100)], 128, 256, 128, "shuffled", 8, 2),
+    ([(256, 640), (192, 384), (320, 512)], 128, 512, 256, "reverse_interleaved", 8, 2),
+    ([(1, 512), (1, 273), (129, 384), (256, 128)], 128, 512, 256, "shuffled", 8, 2),
+    # bkv_sz == bkv_csz elides the attention sub-block loop while KV heads
+    # stay pipelined; mixed sits exactly at the 32 * 4 * 512 = 65536 gate.
+    ([(1, 512), (1, 273), (129, 300)], 128, 512, 512, "shuffled", 8, 2),
+    # bkv_sz == page_size (bkv_p == 1): multi-token prefill writeback uses
+    # the single-DMA path, together with loop elision and pipelining.
+    ([(1, 300), (100, 200), (300, 213)], 256, 256, 256, "shuffled", 8, 2),
+    # 32 * 8 * 512 > 65536, so mixed runs QK/PV for each KV head in turn.
+    ([(1, 512), (393, 273), (137, 512)], 128, 1024, 512, "shuffled", 16, 2),
+    # Four KV heads: step1 of each head overlaps step2 of the previous one.
+    ([(1, 700), (64, 350)], 128, 256, 256, "reverse_interleaved", 16, 4),
+    # bkv_csz > 1024, as in the v6e tuned decode and prefill tiles, also
+    # runs KV heads in turn, here with the sub-block loop elided.
+    ([(1, 2100), (1, 1500), (200, 1900)], 128, 2048, 2048, "shuffled", 8, 2),
+    # Reported TPU v7x benchmark shapes (Hq/Hkv=8/2, head_dim=128, page_size=128).
+    ([(512, 4096), (512, 4096)], 128, 1024, 512, "contiguous", 8, 2),
+    ([(512, 4096), (512, 4096)], 128, 1024, 512, "shuffled", 8, 2),
+    ([(1, 8191)] * 8, 128, 1024, 1024, "contiguous", 8, 2),
+    ([(1, 8191)] * 8, 128, 1024, 1024, "shuffled", 8, 2),
+]
+
+_RAGGED_PAGE_TABLE_IDS = [
+    "partial-last-page",
+    "single-page-sequences",
+    "non-contiguous-strided-pages",
+    "mixed-decode-prefill-ragged",
+    "one-subblock-pipelined",
+    "single-page-blocks",
+    "unpipelined-kv-heads",
+    "four-kv-heads",
+    "wide-subblock-unpipelined",
+    "bench-prefill-contiguous",
+    "bench-prefill-shuffled",
+    "bench-decode-contiguous",
+    "bench-decode-shuffled",
+]
+
+
 @pytest.mark.skipif(jax.default_backend() != "tpu", reason="Requires TPU DMA support")
 @pytest.mark.parametrize(
     "sequences,page_size,bkv_sz,bkv_csz,perm_mode,num_q_heads,num_kv_heads",
-    [
-        ([(393, 273), (137, 512), (65, 191)], 128, 512, 256, "shuffled", 8, 2),
-        ([(1, 37), (16, 48), (33, 60), (7, 100)], 128, 256, 128, "shuffled", 8, 2),
-        ([(256, 640), (192, 384), (320, 512)], 128, 512, 256, "reverse_interleaved", 8, 2),
-        ([(1, 512), (1, 273), (129, 384), (256, 128)], 128, 512, 256, "shuffled", 8, 2),
-        # bkv_sz == bkv_csz elides the attention sub-block loop while KV heads
-        # stay pipelined; mixed sits exactly at the 32 * 4 * 512 = 65536 gate.
-        ([(1, 512), (1, 273), (129, 300)], 128, 512, 512, "shuffled", 8, 2),
-        # bkv_sz == page_size (bkv_p == 1): multi-token prefill writeback uses
-        # the single-DMA path, together with loop elision and pipelining.
-        ([(1, 300), (100, 200), (300, 213)], 256, 256, 256, "shuffled", 8, 2),
-        # 32 * 8 * 512 > 65536, so mixed runs QK/PV for each KV head in turn.
-        ([(1, 512), (393, 273), (137, 512)], 128, 1024, 512, "shuffled", 16, 2),
-        # Four KV heads: step1 of each head overlaps step2 of the previous one.
-        ([(1, 700), (64, 350)], 128, 256, 256, "reverse_interleaved", 16, 4),
-        # bkv_csz > 1024, as in the v6e tuned decode and prefill tiles, also
-        # runs KV heads in turn, here with the sub-block loop elided.
-        ([(1, 2100), (1, 1500), (200, 1900)], 128, 2048, 2048, "shuffled", 8, 2),
-    ],
-    ids=[
-        "partial-last-page",
-        "single-page-sequences",
-        "non-contiguous-strided-pages",
-        "mixed-decode-prefill-ragged",
-        "one-subblock-pipelined",
-        "single-page-blocks",
-        "unpipelined-kv-heads",
-        "four-kv-heads",
-        "wide-subblock-unpipelined",
-    ],
+    _RAGGED_PAGE_TABLE_CASES,
+    ids=_RAGGED_PAGE_TABLE_IDS,
 )
 def test_ragged_page_table_parity(
     sequences, page_size, bkv_sz, bkv_csz, perm_mode, num_q_heads, num_kv_heads
@@ -228,7 +242,9 @@ def test_ragged_page_table_parity(
     head_dim = 128
     rng = np.random.default_rng(42)
     total_mapped_pages = int(page_offsets[-1])
-    if perm_mode == "shuffled":
+    if perm_mode == "contiguous":
+        page_indices = np.arange(1, total_mapped_pages + 1, dtype=np.int32)
+    elif perm_mode == "shuffled":
         page_indices = rng.permutation(np.arange(1, total_mapped_pages + 1, dtype=np.int32))
     else:
         all_p = np.arange(1, total_mapped_pages * 2 + 1, 2, dtype=np.int32)[::-1]
@@ -300,3 +316,122 @@ def test_ragged_page_table_parity(
         rtol=0.03,
     )
     np.testing.assert_array_equal(updated_cache_host.astype(np.float32), expected_cache)
+
+
+@pytest.mark.parametrize(
+    "sequences,page_size,bkv_sz,bkv_csz,perm_mode,num_q_heads,num_kv_heads",
+    _RAGGED_PAGE_TABLE_CASES,
+    ids=_RAGGED_PAGE_TABLE_IDS,
+)
+def test_ragged_page_table_trace_cpu(
+    sequences, page_size, bkv_sz, bkv_csz, perm_mode, num_q_heads, num_kv_heads
+):
+    """Verify Pallas kernel jaxpr tracing for every ragged and benchmark shape on CPU."""
+    del perm_mode
+    q_lens, prefixes = np.array(sequences).T
+    kv_lens = q_lens + prefixes
+    cu_q_lens = np.r_[0, np.cumsum(q_lens)]
+    page_counts = (kv_lens + page_size - 1) // page_size
+    page_offsets = np.r_[0, np.cumsum(page_counts)]
+    padded_tokens = (int(cu_q_lens[-1]) + 31) // 32 * 32
+    head_dim = 128
+    total_mapped_pages = int(page_offsets[-1])
+
+    queries = jax.ShapeDtypeStruct((padded_tokens, num_q_heads, head_dim), jnp.bfloat16)
+    keys = jax.ShapeDtypeStruct((padded_tokens, num_kv_heads, head_dim), jnp.bfloat16)
+    values = jax.ShapeDtypeStruct((padded_tokens, num_kv_heads, head_dim), jnp.bfloat16)
+    cache = jax.ShapeDtypeStruct(
+        (total_mapped_pages + 2, page_size, num_kv_heads, 2, head_dim), jnp.bfloat16
+    )
+    kv_lens_s = jax.ShapeDtypeStruct((len(sequences),), jnp.int32)
+    page_indices_s = jax.ShapeDtypeStruct((total_mapped_pages,), jnp.int32)
+    cu_q_lens_s = jax.ShapeDtypeStruct((len(sequences) + 1,), jnp.int32)
+    cu_kv_lens_s = jax.ShapeDtypeStruct((len(sequences) + 1,), jnp.int32)
+    distribution_s = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+    def _run(q, k, v, c, kvl, pi, cql, ckvl, dist):
+        return ragged_paged_attention(
+            q,
+            k,
+            v,
+            c,
+            kvl,
+            pi,
+            cql,
+            ckvl,
+            dist,
+            None,
+            d_block_sizes=(1, bkv_sz, 1, bkv_csz),
+            p_block_sizes=(32, bkv_sz, 32, bkv_csz),
+            m_block_sizes=(32, bkv_sz, 32, bkv_csz),
+            sm_scale=head_dim**-0.5,
+        )
+
+    traced = jax.make_jaxpr(_run)(
+        queries,
+        keys,
+        values,
+        cache,
+        kv_lens_s,
+        page_indices_s,
+        cu_q_lens_s,
+        cu_kv_lens_s,
+        distribution_s,
+    )
+    inner_jaxpr = traced.jaxpr.eqns[0].params["jaxpr"]
+    pallas_eqns = [eqn for eqn in inner_jaxpr.eqns if eqn.primitive.name == "pallas_call"]
+    assert len(pallas_eqns) >= 2
+
+
+def test_prologue_skips_bkv_zeroing_unless_skip_kv_mask_cpu():
+    """Verify prologue only emits VMEM bkv_x2_ref zero-fill when skip_kv_mask=True."""
+    page_size, hq, hkv, hd = 128, 8, 2, 128
+    queries = jax.ShapeDtypeStruct((1024, hq, hd), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((1024, hkv, hd), jnp.bfloat16)
+    cache = jax.ShapeDtypeStruct((74, page_size, hkv, 2, hd), jnp.bfloat16)
+    kv_lens_s = jax.ShapeDtypeStruct((2,), jnp.int32)
+    page_indices_s = jax.ShapeDtypeStruct((72,), jnp.int32)
+    cu_lens_s = jax.ShapeDtypeStruct((3,), jnp.int32)
+    dist_s = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+    def _prologue_zero_prims(skip_kv_mask: bool) -> list[str]:
+        def _fn(q, k, v, c, kvl, pi, cql, ckvl, dist):
+            return ragged_paged_attention(
+                q,
+                k,
+                v,
+                c,
+                kvl,
+                pi,
+                cql,
+                ckvl,
+                dist,
+                None,
+                d_block_sizes=(1, 1024, 1, 1024),
+                p_block_sizes=(32, 1024, 32, 512),
+                m_block_sizes=(32, 1024, 32, 512),
+                sm_scale=hd**-0.5,
+                causal=0,
+                skip_kv_mask=skip_kv_mask,
+            )
+
+        traced = jax.make_jaxpr(_fn)(
+            queries, kv, kv, cache, kv_lens_s, page_indices_s, cu_lens_s, cu_lens_s, dist_s
+        )
+        inner = traced.jaxpr.eqns[0].params["jaxpr"]
+        pallas_calls = [e for e in inner.eqns if e.primitive.name == "pallas_call"]
+        assert len(pallas_calls) == 2
+        zero_prims = []
+        for pc in pallas_calls:
+            body = pc.params["jaxpr"].eqns[-1].params["body_jaxpr"].jaxpr
+            conds = [e for e in body.eqns if e.primitive.name == "cond"]
+            prologue_branch = conds[0].params["branches"][1].jaxpr
+            zero_prims.extend(
+                e.primitive.name
+                for e in prologue_branch.eqns
+                if e.primitive.name in ("broadcast_in_dim", "swap")
+            )
+        return zero_prims
+
+    assert _prologue_zero_prims(False) == []
+    assert _prologue_zero_prims(True) == ["broadcast_in_dim", "swap", "swap"] * 2
