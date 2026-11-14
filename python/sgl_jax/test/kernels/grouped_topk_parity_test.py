@@ -300,6 +300,111 @@ def test_expert_id_agreement_rate_dsv3(packed):
     assert agreement == 1.0 and tokens_identical == 1.0
 
 
+MOE_MODEL_ROUTER_CONFIGS = [
+    # (model_name, E, G, Gtop, k, hidden_size, renormalize, routed_scaling_factor)
+    ("deepseek_v3_r1", 256, 8, 4, 8, 7168, True, 2.5),
+    ("glm45_moe", 160, 1, 1, 8, 2048, True, 1.0),
+    ("kimi_k2_moe", 384, 1, 1, 8, 2048, True, 2.827),
+    ("kimi_k3_moe", 896, 1, 1, 16, 2048, True, 1.0),
+]
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["f32", "packed"])
+@pytest.mark.parametrize(
+    "bs", [32, 512, 4096], ids=["bs32_decode", "bs512_chunk", "bs4096_prefill"]
+)
+@pytest.mark.parametrize(
+    "model_name,E,G,Gtop,k,hidden_size,renormalize,routed_scaling_factor",
+    MOE_MODEL_ROUTER_CONFIGS,
+)
+def test_moe_model_routing_agreement_vs_main(
+    model_name, E, G, Gtop, k, hidden_size, renormalize, routed_scaling_factor, bs, packed
+):
+    """End-to-end MoE router layer check: RMSNorm hidden states @ gate_weight + correction_bias
+    followed by TopK post-routing renormalization and scaling.
+
+    Verifies 100.0% top-k expert-id agreement rate and bitwise identical routing weights between
+    the live kernel and frozen main across DeepSeek-V3/R1, GLM-4.5, Kimi-K2, and Kimi-K3 shapes,
+    plus direct `gate.TopK` integration parity when Flax is available.
+    """
+    k_h, k_w, k_b = jax.random.split(jax.random.PRNGKey(101 + bs + E), 3)
+    hidden = jax.random.normal(k_h, (bs, hidden_size), jnp.bfloat16).astype(jnp.float32)
+    rms = jnp.sqrt(jnp.mean(hidden * hidden, axis=-1, keepdims=True) + 1e-6)
+    normed_hidden = (hidden / rms).astype(jnp.bfloat16)
+    gate_weight = (
+        jax.random.normal(k_w, (hidden_size, E), jnp.float32) / np.sqrt(hidden_size)
+    ).astype(jnp.bfloat16)
+    raw_logits = jnp.matmul(normed_hidden, gate_weight, preferred_element_type=jnp.float32)
+    router_scores = jax.nn.sigmoid(raw_logits)
+    correction_bias = jax.random.normal(k_b, (E,), jnp.float32) * 0.03
+    router_scores, correction_bias = _cast(router_scores, correction_bias, packed)
+
+    bt = 512 if bs >= 512 else bs
+    w_live, ids_live = _run(
+        "live", router_scores, correction_bias, E=E, G=G, Gtop=Gtop, k=k, bt=bt, packed=packed
+    )
+    w_main, ids_main = _run(
+        "main", router_scores, correction_bias, E=E, G=G, Gtop=Gtop, k=k, bt=bt, packed=packed
+    )
+    expert_id_agreement = float(np.mean(ids_live == ids_main))
+    token_set_agreement = float(np.mean(np.all(ids_live == ids_main, axis=1)))
+    assert (
+        expert_id_agreement == 1.0
+    ), f"{model_name} bs={bs} packed={packed}: expert-id agreement={expert_id_agreement:.6f} < 1.0"
+    assert (
+        token_set_agreement == 1.0
+    ), f"{model_name} bs={bs} packed={packed}: token-level agreement={token_set_agreement:.6f} < 1.0"
+    _assert_parity(w_live, ids_live, w_main, ids_main, f"{model_name}/bs={bs}/packed={packed}")
+    _assert_ids_in_range(
+        w_live,
+        ids_live,
+        router_scores,
+        correction_bias,
+        E=E,
+        packed=packed,
+        msg=f"{model_name}/bs={bs}/packed={packed}",
+    )
+
+    # Match `gate.TopK.__call__` post-processing: renormalization + routed_scaling_factor.
+    def _postprocess(w):
+        if renormalize:
+            w = w / np.sum(w, axis=-1, keepdims=True)
+        return (w * routed_scaling_factor).astype(np.float32)
+
+    np.testing.assert_array_equal(_postprocess(w_live), _postprocess(w_main))
+
+    # Exercise `sgl_jax.srt.layers.gate.TopK._biased_grouped_topk` directly when flax is installed.
+    try:
+        from sgl_jax.srt.layers import gate as gate_mod
+    except ImportError:
+        gate_mod = None
+    if gate_mod is not None and bs <= 512:
+        topk_layer = gate_mod.TopK(
+            topk=k,
+            renormalize=renormalize,
+            num_expert_group=G,
+            topk_group=Gtop,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        old_fn = gate_mod.grouped_topk_pallas
+        try:
+            gate_mod.grouped_topk_pallas = functools.partial(
+                grouped_topk_pallas, interpret=_INTERPRET
+            )
+            w_mod_live, ids_mod_live = topk_layer(router_scores, correction_bias)
+            gate_mod.grouped_topk_pallas = functools.partial(
+                grouped_topk_pallas_main, interpret=_INTERPRET
+            )
+            w_mod_main, ids_mod_main = topk_layer(router_scores, correction_bias)
+        finally:
+            gate_mod.grouped_topk_pallas = old_fn
+        np.testing.assert_array_equal(np.asarray(ids_mod_live), np.asarray(ids_mod_main))
+        np.testing.assert_array_equal(
+            np.asarray(w_mod_live, np.float32).view(np.uint32),
+            np.asarray(w_mod_main, np.float32).view(np.uint32),
+        )
+
+
 # ---------------------------------------------------------------------------------------------
 # NaN / -inf contract on hardware: live == main bit-for-bit (the CPU interpreter cannot pin this),
 # every token without a NaN post-bias score (including all -inf tokens) gets ids in [0, E), and
