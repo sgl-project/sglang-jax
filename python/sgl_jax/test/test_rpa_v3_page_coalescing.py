@@ -14,12 +14,17 @@ reference and the whole updated KV cache exactly, so reading a wrong page,
 writing into another request's page and skipping a write all fail.
 """
 
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from sgl_jax.srt.kernels.ragged_paged_attention import ragged_paged_attention_v3
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+    RpaCase,
+    get_default_block_sizes,
     ragged_paged_attention,
     ref_ragged_paged_attention,
 )
@@ -275,5 +280,70 @@ def test_token_allocator_decode_page_table():
     for coalesce_page_dma in (True, False):
         output, cache = _run(
             batch, coalesce_page_dma=coalesce_page_dma, d_block_sizes=(1, 32, 1, 32)
+        )
+        _check(batch, output, cache)
+
+
+V7_PAGE_SIZE = 128
+# 64 pages of 128 tokens per sequence, so the v7 heuristic is not capped by max_kv.
+V7_PAGES_PER_SEQ = 64
+# KV block of 16 pages, 2048 tokens: list entries from 40 to 55 with pages of
+# other requests (41..54) in between, so its first and last pages are 15 apart.
+V7_SCRAMBLED_BLOCK = [40, *range(17, 24), 31, 32, *range(24, 29), 55]
+
+
+def _v7_default_block_sizes(case):
+    """The block sizes get_default_block_sizes picks on TPU v7 for these shapes."""
+    with mock.patch.object(ragged_paged_attention_v3, "get_tpu_version", return_value=7):
+        sizes = get_default_block_sizes(
+            jnp.bfloat16,
+            jnp.bfloat16,
+            actual_num_q_heads=NUM_HEADS,
+            actual_num_kv_heads=1,
+            head_dim=HEAD_DIM,
+            page_size=V7_PAGE_SIZE,
+            max_num_tokens=64,
+            max_num_seqs=2,
+            pages_per_seq=V7_PAGES_PER_SEQ,
+            case=case,
+            vmem_limit_bytes=64 * 1024 * 1024,
+        )
+    return tuple(sizes[k] for k in ("bq_sz", "bkv_sz", "bq_csz", "bkv_csz"))
+
+
+def test_v7_default_decode_tile():
+    """Decode with the TPU v7 default tile of 2048 tokens (16 pages of 128).
+
+    A long sequence is fetched in several 16-page KV blocks; its second block
+    is the scrambled list above, and the other request owns pages 41..54.
+    """
+    d_block_sizes = _v7_default_block_sizes(RpaCase.DECODE)
+    assert d_block_sizes == (1, 2048, 1, 2048), d_block_sizes
+    long_seq = [*range(1, 17), *V7_SCRAMBLED_BLOCK, 29, 30, 33, 34]  # 36 pages
+    sequences = [(1, 4499, long_seq), (1, 1699, list(range(41, 55)))]
+    batch = _make_batch(sequences, num_pages=64, page_size=V7_PAGE_SIZE)
+    for coalesce_page_dma in (True, False):
+        output, cache = _run(
+            batch,
+            coalesce_page_dma=coalesce_page_dma,
+            d_block_sizes=d_block_sizes,
+            m_block_sizes=_v7_default_block_sizes(RpaCase.MIXED),
+        )
+        _check(batch, output, cache)
+
+
+def test_v7_default_mixed_tile():
+    """Mixed batch with the TPU v7 default tiles (one 2048-token compute tile).
+
+    The new KV of the first request is written back over the scrambled
+    16-page list from token 64 of page 40; the other request owns pages 41..54.
+    """
+    m_block_sizes = _v7_default_block_sizes(RpaCase.MIXED)
+    assert m_block_sizes == (32, 2048, 32, 2048), m_block_sizes
+    sequences = [(1984, 64, V7_SCRAMBLED_BLOCK), (1, 1699, list(range(41, 55)))]
+    batch = _make_batch(sequences, num_pages=64, page_size=V7_PAGE_SIZE)
+    for coalesce_page_dma in (True, False):
+        output, cache = _run(
+            batch, coalesce_page_dma=coalesce_page_dma, m_block_sizes=m_block_sizes
         )
         _check(batch, output, cache)
