@@ -518,6 +518,7 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_swa_component.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_token_allocator.py", 0.1),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_deepseek_v4_pool.py",
             1,

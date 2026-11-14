@@ -1,8 +1,8 @@
 """RPA v3 coalesce_page_dma on page tables that are not increasing.
 
-With coalesce_page_dma, the KV-cache fetch issues one DMA per run of
-physically contiguous pages, and the new-KV writeback issues a single DMA
-when its whole page range is contiguous. A request's page list is not
+With coalesce_page_dma, the KV-cache fetch and the new-KV writeback issue
+one DMA per run of physically contiguous pages, so a fully contiguous range
+is a single DMA. A request's page list is not
 increasing in general: a radix-cached prefix followed by newly allocated
 pages, or a prefill chunk that continues a partly filled page, gives lists
 such as [5, 6, 2, 8] or [9, 3, 11]. They are not contiguous although the
@@ -23,7 +23,10 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
     ragged_paged_attention,
     ref_ragged_paged_attention,
 )
-from sgl_jax.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.allocator import (
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 
 pytestmark = pytest.mark.skipif(jax.default_backend() != "tpu", reason="Requires TPU DMA support")
 
@@ -33,7 +36,7 @@ D_BLOCK_SIZES = (1, 64, 1, 32)
 M_BLOCK_SIZES = (16, 64, 16, 32)
 
 
-def _make_batch(sequences, *, num_pages=NUM_PAGES, seed=0):
+def _make_batch(sequences, *, num_pages=NUM_PAGES, page_size=PAGE_SIZE, seed=0):
     """Each sequence is (new token count, cached prefix length, physical pages)."""
     rng = np.random.default_rng(seed)
     q_lens = np.array([s[0] for s in sequences])
@@ -41,7 +44,7 @@ def _make_batch(sequences, *, num_pages=NUM_PAGES, seed=0):
     page_lists = [np.asarray(s[2], np.int32) for s in sequences]
     kv_lens = q_lens + prefixes
     page_counts = np.array([len(pages) for pages in page_lists])
-    assert np.all(page_counts == (kv_lens + PAGE_SIZE - 1) // PAGE_SIZE), page_counts
+    assert np.all(page_counts == (kv_lens + page_size - 1) // page_size), page_counts
     all_pages = np.concatenate(page_lists)
     assert len(np.unique(all_pages)) == len(all_pages) and all_pages.max() < num_pages
     cu_q_lens = np.r_[0, np.cumsum(q_lens)]
@@ -49,7 +52,7 @@ def _make_batch(sequences, *, num_pages=NUM_PAGES, seed=0):
     num_tokens = int(cu_q_lens[-1])
     padded_tokens = (num_tokens + 31) // 32 * 32
     # Distinct data on every page, so reading or writing a wrong page shows up.
-    cache = rng.integers(-4, 5, size=(num_pages, PAGE_SIZE, 1, 2, HEAD_DIM)).astype(np.float32)
+    cache = rng.integers(-4, 5, size=(num_pages, page_size, 1, 2, HEAD_DIM)).astype(np.float32)
     expected_cache = cache.copy()
     new_kv = np.zeros((padded_tokens, 2, HEAD_DIM), np.float32)
     ref_pages = np.zeros((len(sequences), max(page_counts)), np.int32)
@@ -57,7 +60,7 @@ def _make_batch(sequences, *, num_pages=NUM_PAGES, seed=0):
         kv = rng.integers(-4, 5, size=(kv_lens[i], 2, HEAD_DIM)).astype(np.float32)
         ref_pages[i, : len(pages)] = pages
         positions = np.arange(kv_lens[i])
-        physical_pages, slots = pages[positions // PAGE_SIZE], positions % PAGE_SIZE
+        physical_pages, slots = pages[positions // page_size], positions % page_size
         expected_cache[physical_pages, slots, 0] = kv
         cache[physical_pages[:prefix], slots[:prefix], 0] = kv[:prefix]
         new_kv[cu_q_lens[i] : cu_q_lens[i + 1]] = kv[prefix:]
@@ -70,7 +73,7 @@ def _make_batch(sequences, *, num_pages=NUM_PAGES, seed=0):
         kv_lens=kv_lens.astype(np.int32),
         page_indices=all_pages,
         cu_q_lens=cu_q_lens.astype(np.int32),
-        cu_kv_lens=(page_offsets * PAGE_SIZE).astype(np.int32),
+        cu_kv_lens=(page_offsets * page_size).astype(np.int32),
         ref_pages=ref_pages,
         num_seqs=len(sequences),
         num_tokens=num_tokens,
@@ -163,6 +166,16 @@ CASES = {
         sequences=[(70, 60, [12, 2, 3, 15, 5, 9, 7, 8, 20]), (1, 30, [4, 6])],
     ),
     "mixed-contiguous": dict(sequences=[(40, 8, [3, 4, 5]), (20, 30, [6, 7, 8, 9])]),
+    # Writeback ranges that start mid-page (8 tokens of the first page are
+    # cached), have their first and last pages n - 1 apart, and hold a run of
+    # several contiguous pages, which is written by one DMA.
+    "mixed-page-runs-head": dict(sequences=[(50, 8, [9, 10, 3, 12]), (1, 15, [11])]),
+    "mixed-page-runs-middle": dict(sequences=[(50, 8, [9, 3, 4, 12]), (1, 20, [10, 11])]),
+    "mixed-page-runs-second-kv-block": dict(
+        # KV block 1 writes back to [20, 21, 14, 23] from token 8 of page 20;
+        # page 22 belongs to the second request.
+        sequences=[(56, 72, [1, 2, 5, 6, 20, 21, 14, 23]), (1, 30, [22, 7])],
+    ),
     "chunk-prefill": dict(
         sequences=[(32, 8, [9, 3, 11]), (32, 40, [4, 13, 6, 7, 1])],
         chunk_prefill_size=32,
@@ -233,4 +246,34 @@ def test_allocator_page_tables(layout):
     batch = _make_batch(sequences)
     for coalesce_page_dma in (True, False):
         output, cache = _run(batch, coalesce_page_dma=coalesce_page_dma)
+        _check(batch, output, cache)
+
+
+def test_token_allocator_decode_page_table():
+    """page_size 1 decode on a TokenToKVPoolAllocator page list: [1, 2, 21, 4, 5].
+
+    The allocator keeps its free list sorted, so slots freed by finished requests
+    are reused before higher slots handed out earlier.
+    """
+    alloc = TokenToKVPoolAllocator(size=64, kvcache=None)
+    # Prefill a = [1, 2], x = [3], b = [4], c = [5..20], then one decode step.
+    a, x, b, c = (alloc.alloc(n).tolist() for n in (2, 1, 1, 16))
+    for seq, slot in zip((a, x, b, c), alloc.alloc(4).tolist()):
+        seq.append(slot)
+    # b and c finish; x keeps running, and a decodes two more tokens.
+    alloc.free_group_begin()
+    alloc.free(np.array(b, np.int32))
+    alloc.free(np.array(c, np.int32))
+    alloc.free_group_end()
+    a += [int(alloc.alloc(1)[0]) for _ in range(2)]
+    # The cached part of a is fetched as one KV block; it must still be a
+    # non-contiguous list whose endpoints are len - 1 apart.
+    cached = a[:-1]
+    assert cached[-1] - cached[0] == len(cached) - 1, a
+    assert np.any(np.diff(cached) != 1), a
+    batch = _make_batch([(1, len(a) - 1, a), (1, len(x) - 1, x)], num_pages=65, page_size=1)
+    for coalesce_page_dma in (True, False):
+        output, cache = _run(
+            batch, coalesce_page_dma=coalesce_page_dma, d_block_sizes=(1, 32, 1, 32)
+        )
         _check(batch, output, cache)
