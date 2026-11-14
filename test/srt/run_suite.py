@@ -461,7 +461,7 @@ suites = {
         ),
         TestFile(
             "python/sgl_jax/test/models/test_qwen3_fused_qkv.py",
-            0.5,
+            1,
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
         ),
