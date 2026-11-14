@@ -488,6 +488,8 @@ class FusedEPMoE(nnx.Module):
         topk_ids: jax.Array,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        vmem_2d_tile_relayout: bool | None = None,
+        vmem_packed_sublane_transpose: bool | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         """Forward pass through the fused MoE layer."""
@@ -536,8 +538,16 @@ class FusedEPMoE(nnx.Module):
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
             use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
-            vmem_2d_tile_relayout=self.vmem_2d_tile_relayout,
-            vmem_packed_sublane_transpose=self.vmem_packed_sublane_transpose,
+            vmem_2d_tile_relayout=(
+                self.vmem_2d_tile_relayout
+                if vmem_2d_tile_relayout is None
+                else vmem_2d_tile_relayout
+            ),
+            vmem_packed_sublane_transpose=(
+                self.vmem_packed_sublane_transpose
+                if vmem_packed_sublane_transpose is None
+                else vmem_packed_sublane_transpose
+            ),
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
             w1_scale=w1_scale,
