@@ -932,6 +932,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     mesh=self.mesh,
                 )
 
+        elif backend == "flywheel":
+            if self.use_mla_backend:
+                raise ValueError("--attention-backend flywheel does not support MLA models.")
+            from sgl_jax.srt.layers.attention.flywheel_backend import FlywheelAttention
+
+            full_attn_backend = FlywheelAttention(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                context_len=self.model_config.context_len,
+                mesh=self.mesh,
+            )
+
         elif backend == "tt":
             from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 

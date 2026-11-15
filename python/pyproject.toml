@@ -59,6 +59,9 @@ dev = [
 fastokens = [
     "fastokens>=0.1.1,<0.2.0",
 ]
+flywheel = [
+    "flywheel-tpu==0.4.2",
+]
 tpu = [
     "jax[tpu]==0.11.1",
 ]

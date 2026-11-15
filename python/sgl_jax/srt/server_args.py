@@ -373,6 +373,8 @@ class ServerArgs:
 
             CompilationManager.restore_aot_defaults(self)
         self._check_disaggregation_overlap_args()
+        if self.attention_backend == "flywheel":
+            self._check_flywheel_attention_args()
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -1617,6 +1619,7 @@ class ServerArgs:
                 "dsa_sparse",
                 "qsa_sparse",
                 "tt",
+                "flywheel",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1629,7 +1632,9 @@ class ServerArgs:
                 "with IndexShare cross-layer reuse; MLA models with index_* config only. "
                 "'qsa_sparse' = Qwen Sparse Attention (compressed-key indexer top-k + sparse GQA); "
                 "GQA models with indexer_* config only. "
-                "'tt' = TTNN prefill and paged decode."
+                "'tt' = TTNN prefill and paged decode. "
+                "'flywheel' = flywheel-tpu Pallas kernels for MHA/GQA models "
+                "(pip install flywheel-tpu)."
             ),
         )
         parser.add_argument(
@@ -2074,6 +2079,35 @@ class ServerArgs:
             **kwargs,
         )
         return hf_config
+
+    def _check_flywheel_attention_args(self):
+        """Round the default page size up to what the flywheel kernels index,
+        then reject every configuration --attention-backend flywheel cannot
+        serve, listing each problem in one error."""
+        page_multiple = 128
+        if self.page_size == ServerArgs.page_size:
+            logger.info(
+                "--attention-backend flywheel indexes whole %d-token pages; "
+                "setting --page-size to %d.",
+                page_multiple,
+                page_multiple,
+            )
+            self.page_size = page_multiple
+        problems = []
+        if self.page_size % page_multiple:
+            problems.append(f"--page-size {self.page_size} is not a multiple of {page_multiple}")
+        if self.dp_size > 1:
+            problems.append("--dp-size > 1 is not supported")
+        if self.speculative_algorithm:
+            problems.append("speculative decoding is not supported")
+        if self.kv_cache_dtype not in ("auto", "bf16"):
+            problems.append(f"--kv-cache-dtype {self.kv_cache_dtype} is not supported")
+        if problems:
+            raise ValueError(
+                "--attention-backend flywheel cannot serve this configuration: "
+                + "; ".join(problems)
+                + "."
+            )
 
     def check_server_args(self):
         if self.precompile_num_threads < 1:
