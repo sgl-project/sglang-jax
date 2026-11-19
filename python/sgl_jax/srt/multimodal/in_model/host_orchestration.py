@@ -18,6 +18,7 @@ from sgl_jax.srt.multimodal.in_model.embedding_pool import (
 from sgl_jax.srt.multimodal.in_model.interface import (
     AudioCodeInputSpec,
     InModelMultimodalContract,
+    MelInputSpec,
 )
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     balance_lanes,
@@ -173,6 +174,20 @@ def precompile_multimodal_encoder(
                     placeholder_ranges=[(0, tokens)],
                 )
                 dummy_inputs.append((modality, [[item]] + [[] for _ in range(num_lanes - 1)]))
+        elif modality == Modality.AUDIO and isinstance(
+            multimodal_model.audio_input_spec, MelInputSpec
+        ):
+            # One full-length clip; the encoder buckets the per-lane clip count.
+            spec = multimodal_model.audio_input_spec
+            frames = spec.time_alignment
+            tokens = ((frames - 1) // 2 + 1 - 2) // 2 + 1
+            item = MultimodalDataItem(
+                modality=modality,
+                feature=np.zeros((frames, spec.num_mel_bins), spec.dtype),
+                placeholder_ranges=[(0, tokens)],
+                model_specific_data={"num_frames": np.asarray(frames, np.int32)},
+            )
+            dummy_inputs = [(modality, [[item]] + [[] for _ in range(num_lanes - 1)])]
         else:
             raise NotImplementedError(f"No dummy input builder for {modality}")
 
