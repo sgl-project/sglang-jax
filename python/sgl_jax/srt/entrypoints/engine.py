@@ -168,6 +168,7 @@ class Engine(EngineBase):
         return_hidden_states: bool = False,
         image_data: MultimodalDataInputFormat | None = None,
         video_data: MultimodalDataInputFormat | None = None,
+        audio_data: MultimodalDataInputFormat | None = None,
     ) -> dict | Iterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -191,6 +192,7 @@ class Engine(EngineBase):
             return_hidden_states=return_hidden_states,
             image_data=image_data,
             video_data=video_data,
+            audio_data=audio_data,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -226,6 +228,7 @@ class Engine(EngineBase):
         return_hidden_states: bool = False,
         image_data: MultimodalDataInputFormat | None = None,
         video_data: MultimodalDataInputFormat | None = None,
+        audio_data: MultimodalDataInputFormat | None = None,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -249,6 +252,7 @@ class Engine(EngineBase):
             return_hidden_states=return_hidden_states,
             image_data=image_data,
             video_data=video_data,
+            audio_data=audio_data,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

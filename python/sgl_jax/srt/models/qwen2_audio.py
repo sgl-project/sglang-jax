@@ -242,7 +242,10 @@ class Qwen2AudioForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     def load_weights(self, model_config: ModelConfig) -> None:
         mappings = {}
         for key, spec in self._language_weight_mappings().items():
+            # hub: "language_model.model.*"; transformers>=5 save_pretrained:
+            # "language_model.model.model.*" (lm_head stays "language_model.lm_head").
             mappings[f"language_model.{key}"] = spec
+            mappings[f"language_model.model.{key}"] = spec
             mappings[key.replace("model.", "model.language_model.", 1)] = spec
         for key, spec in self._audio_weight_mappings().items():
             mappings[key] = spec
