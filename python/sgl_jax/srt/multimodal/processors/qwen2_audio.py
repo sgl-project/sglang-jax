@@ -17,17 +17,42 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 
 
+def _resample(wav: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr:
+        return wav
+    from math import gcd
+
+    from scipy.signal import resample_poly
+
+    g = gcd(orig_sr, target_sr)
+    return resample_poly(wav, target_sr // g, orig_sr // g).astype(np.float32)
+
+
+def _decode(source, sampling_rate: int) -> np.ndarray:
+    # soundfile first: librosa imports msgpack, which the pinned
+    # msgpack-python 0.5.x shadows in this environment.
+    import soundfile as sf
+
+    try:
+        wav, sr = sf.read(source, dtype="float32", always_2d=True)
+        return _resample(wav.mean(axis=1), int(sr), sampling_rate)
+    except Exception:
+        if hasattr(source, "seek"):
+            source.seek(0)
+        import librosa
+
+        wav, _ = librosa.load(source, sr=sampling_rate, mono=True)
+        return wav.astype(np.float32)
+
+
 def _load_waveform(source, sampling_rate: int) -> np.ndarray:
     """Decode an audio source to mono float32 at ``sampling_rate``."""
-    import librosa
-
     source = BaseMultimodalProcessor.unwrap_source(source)
     if isinstance(source, dict):
         source = source.get("url", source.get("audio_url"))
     if isinstance(source, tuple) and len(source) == 2:
         wav, sr = source
-        wav = np.asarray(wav, dtype=np.float32)
-        return wav if int(sr) == sampling_rate else librosa.resample(wav, orig_sr=int(sr), target_sr=sampling_rate)
+        return _resample(np.asarray(wav, dtype=np.float32), int(sr), sampling_rate)
     if isinstance(source, np.ndarray):
         return source.astype(np.float32)  # assumed already at sampling_rate
     if isinstance(source, os.PathLike):
@@ -48,8 +73,7 @@ def _load_waveform(source, sampling_rate: int) -> np.ndarray:
                 source = unquote(urlparse(source).path)
             if not os.path.isfile(source):
                 source = io.BytesIO(base64.b64decode(source, validate=True))
-    wav, _ = librosa.load(source, sr=sampling_rate, mono=True)
-    return wav.astype(np.float32)
+    return _decode(source, sampling_rate)
 
 
 class Qwen2AudioProcessor(BaseMultimodalProcessor):
@@ -98,7 +122,9 @@ class Qwen2AudioProcessor(BaseMultimodalProcessor):
 
         features = self._to_numpy(processor_output.get("input_features"))  # [n, mels, frames]
         frame_mask = self._to_numpy(processor_output.get("feature_attention_mask"))
-        token_id = int(getattr(self.hf_config, "audio_token_index", None) or self.hf_config.audio_token_id)
+        token_id = int(
+            getattr(self.hf_config, "audio_token_index", None) or self.hf_config.audio_token_id
+        )
         runs = self._placeholder_runs(input_ids, token_id)
         if features is None or len(runs) != len(audios) or len(features) != len(audios):
             raise ValueError(
