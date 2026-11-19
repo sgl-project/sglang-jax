@@ -49,10 +49,10 @@ def _gelu(x: jax.Array) -> jax.Array:
 
 
 class _Linear(nnx.Module):
-    def __init__(self, din: int, dout: int, mesh, dtype, use_bias: bool = True):
+    def __init__(self, in_dim: int, out_dim: int, mesh, dtype, use_bias: bool = True):
         self.inner = LinearBase(
-            input_size=din,
-            output_size=dout,
+            input_size=in_dim,
+            output_size=out_dim,
             mesh=mesh,
             use_bias=use_bias,
             params_dtype=dtype,
@@ -84,9 +84,9 @@ class _LayerNorm(nnx.Module):
 class _Conv1d(nnx.Module):
     """PyTorch-layout Conv1d (kernel 3, padding 1) on ``[batch, time, channels]``."""
 
-    def __init__(self, din: int, dout: int, stride: int, dtype):
-        self.weight = nnx.Param(jnp.zeros((dout, din, 3), dtype=dtype))
-        self.bias = nnx.Param(jnp.zeros((dout,), dtype=dtype))
+    def __init__(self, in_dim: int, out_dim: int, stride: int, dtype):
+        self.weight = nnx.Param(jnp.zeros((out_dim, in_dim, 3), dtype=dtype))
+        self.bias = nnx.Param(jnp.zeros((out_dim,), dtype=dtype))
         self.stride = stride
 
     def __call__(self, x: jax.Array) -> jax.Array:
