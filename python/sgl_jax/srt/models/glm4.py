@@ -12,6 +12,8 @@ import logging
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -44,6 +46,7 @@ class Glm4Attention(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
+        self.mesh = mesh
         self.hidden_size = config.hidden_size
         self.q_head_num = config.num_attention_heads
         self.kv_head_num = config.num_key_value_heads
@@ -118,9 +121,10 @@ class Glm4Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        heads = NamedSharding(self.mesh, P("data", "tensor", None))
+        q = q.reshape(-1, self.q_head_num, self.head_dim, out_sharding=heads)
+        k = k.reshape(-1, self.kv_head_num, self.head_dim, out_sharding=heads)
+        v = v.reshape(-1, self.kv_head_num, self.head_dim, out_sharding=heads)
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output, kv_fused = self.attn(
