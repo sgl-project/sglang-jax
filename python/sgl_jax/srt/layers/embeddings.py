@@ -722,6 +722,13 @@ def get_rope(
                 rotary_emb = RotaryEmbedding(
                     head_size, rotary_dim, max_position, base, is_neox_style, dtype
                 )
+        elif scaling_type == "dynamic":
+            # HF dynamic-NTK only rescales inv_freq once the sequence exceeds the
+            # original max_position_embeddings; the served context length never
+            # does, so this is exactly the unscaled rotary embedding.
+            rotary_emb = RotaryEmbedding(
+                head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            )
         elif scaling_type == "proportional":
             rotary_emb = ProportionalRotaryEmbedding(
                 head_size,
