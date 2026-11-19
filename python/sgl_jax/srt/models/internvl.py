@@ -58,10 +58,10 @@ def _gelu(x: jax.Array) -> jax.Array:
 class _Linear(nnx.Module):
     """Replicated dense layer for the (small) vision tower."""
 
-    def __init__(self, din: int, dout: int, mesh, dtype, use_bias: bool = True):
+    def __init__(self, in_dim: int, out_dim: int, mesh, dtype, use_bias: bool = True):
         self.inner = LinearBase(
-            input_size=din,
-            output_size=dout,
+            input_size=in_dim,
+            output_size=out_dim,
             mesh=mesh,
             use_bias=use_bias,
             params_dtype=dtype,
@@ -147,14 +147,14 @@ class InternVisionTower(nnx.Module):
         self.shuffle = int(round(1 / ratio))
         self.merge_unit = self.shuffle**2
         if config.vision_feature_select_strategy != "default" or config.vision_feature_layer != -1:
-            raise NotImplementedError("Only last-layer, CLS-dropped InternVL features are supported")
+            raise NotImplementedError(
+                "Only last-layer, CLS-dropped InternVL features are supported"
+            )
 
         d = vc.hidden_size
         self.patch_embedding = _Linear(self.patch_dim, d, mesh, dtype)
         self.cls_token = nnx.Param(jnp.zeros((1, d), dtype=dtype))
-        self.position_embeddings = nnx.Param(
-            jnp.zeros((self.patches_per_crop + 1, d), dtype=dtype)
-        )
+        self.position_embeddings = nnx.Param(jnp.zeros((self.patches_per_crop + 1, d), dtype=dtype))
         self.layers = nnx.List(
             [InternVisionLayer(vc, mesh, dtype) for _ in range(vc.num_hidden_layers)]
         )
@@ -228,19 +228,20 @@ class InternVLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             )
 
         self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
-        # HF ties on the top-level flag for the composite model.
+        # HF ties on the top-level flag, but only when the checkpoint has no
+        # separate lm_head (InternVL3-*-hf ships one that differs from the
+        # embedding, so HF keeps it untied). Decided again at load time.
         self.tie_word_embeddings = getattr(
             config, "tie_word_embeddings", getattr(self.text_config, "tie_word_embeddings", False)
         )
-        if not self.tie_word_embeddings:
-            self.lm_head = ParallelLMHead(
-                self.text_config.vocab_size,
-                self.text_config.hidden_size,
-                dtype=self.dtype,
-                param_dtype=self.dtype,
-                mesh=mesh,
-                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
-            )
+        self.lm_head = ParallelLMHead(
+            self.text_config.vocab_size,
+            self.text_config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
         self.logits_processor = LogitsProcessor(
             self.text_config.vocab_size,
             mesh=self.mesh,
@@ -286,12 +287,19 @@ class InternVLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         for key, spec in self._vision_weight_mappings().items():
             mappings[key] = spec
             mappings[f"model.{key}"] = spec
+        head = self.lm_head.weight_mapping("lm_head.embedding")
+        for key in ("language_model.lm_head.weight", "lm_head.weight"):
+            mappings[key] = head
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
         if not loader.dummy_mode:
             present = loader.metadata
             mappings = {k: v for k, v in mappings.items() if k in present}
+            has_head = any(spec is head for spec in mappings.values())
+            self.tie_word_embeddings = not has_head
+            if not has_head:
+                self.lm_head.embedding = self.model.embed_tokens.embedding
         loader.load(mappings)
-        logger.info("InternVL weights loaded.")
+        logger.info("InternVL weights loaded (tied lm_head: %s).", self.tie_word_embeddings)
 
     def _language_weight_mappings(self) -> dict:
         mappings = {
@@ -304,8 +312,6 @@ class InternVLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
-        if not self.tie_word_embeddings:
-            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
         for layer_idx in range(self.text_config.num_hidden_layers):
             mappings.update(self._language_layer_mappings(layer_idx))
         return mappings
@@ -318,7 +324,9 @@ class InternVLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
         def lin(src: str, dst: str) -> dict:
             return {
-                f"{src}.weight": WeightSpec(target_path=f"{dst}.inner.weight", sharding=rep2, transpose=True),
+                f"{src}.weight": WeightSpec(
+                    target_path=f"{dst}.inner.weight", sharding=rep2, transpose=True
+                ),
                 f"{src}.bias": WeightSpec(target_path=f"{dst}.inner.bias", sharding=rep1),
             }
 
@@ -366,8 +374,7 @@ class InternVLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         return mappings
 
     def get_embed_and_head(self):
-        w = self.model.embed_tokens.embedding.value
-        return (w, w if self.tie_word_embeddings else self.lm_head.embedding.value)
+        return (self.model.embed_tokens.embedding.value, self.lm_head.embedding.value)
 
     def __call__(
         self,
@@ -378,8 +385,7 @@ class InternVLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch, memory_pools.token_to_kv_pool
         )
-        head = self.model.embed_tokens if self.tie_word_embeddings else self.lm_head
-        output = self.logits_processor(hidden_states, head, logits_metadata)
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag, None
 
 
