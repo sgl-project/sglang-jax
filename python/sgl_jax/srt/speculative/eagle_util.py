@@ -197,6 +197,16 @@ def build_chain_verify_inputs_device(
         (bs, n),
     ).reshape(bs * n)
     retrive_next_sibling = jnp.full((bs * n,), -1, dtype=jnp.int32)
+    # Explicit TPU sharding requires every operand of stack to have the exact
+    # same layout.  Dynamic positions inherit seq_lens' data sharding while
+    # static retrieval rows are otherwise replicated.  The flattened draft
+    # row is the canonical batch layout for the packed verification matrix.
+    row_sharding = jax.typeof(draft_tokens).sharding
+    if isinstance(row_sharding, NamedSharding) and not row_sharding.mesh.empty:
+        positions = jax.sharding.reshard(positions, row_sharding)
+        retrive_index = jax.sharding.reshard(retrive_index, row_sharding)
+        retrive_next_token = jax.sharding.reshard(retrive_next_token, row_sharding)
+        retrive_next_sibling = jax.sharding.reshard(retrive_next_sibling, row_sharding)
     return jnp.stack(
         [draft_tokens, positions, retrive_index, retrive_next_token, retrive_next_sibling],
         axis=0,

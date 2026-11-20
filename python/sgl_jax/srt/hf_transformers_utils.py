@@ -21,7 +21,11 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
-from sgl_jax.srt.configs.gemma4 import Gemma4Config
+from sgl_jax.srt.configs.gemma4 import (
+    Gemma4AssistantConfig,
+    Gemma4Config,
+    Gemma4UnifiedAssistantConfig,
+)
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
@@ -40,6 +44,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         Qwen3_5DenseConfig,
         Qwen4ExpConfig,
         Gemma4Config,
+        Gemma4AssistantConfig,
+        Gemma4UnifiedAssistantConfig,
     ]
 }
 

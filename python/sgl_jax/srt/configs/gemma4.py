@@ -75,3 +75,43 @@ class Gemma4Config(PretrainedConfig):
             self.sliding_window = getattr(tc, "sliding_window", None)
             self.attention_k_eq_v = getattr(tc, "attention_k_eq_v", None)
             self.hybrid_layer_pattern = getattr(tc, "hybrid_layer_pattern", None)
+
+
+class Gemma4AssistantConfig(Gemma4Config):
+    """Config for Gemma4 assistant (MTP draft) checkpoints.
+
+    Inherits ``Gemma4Config.__init__`` so the head_dim / swa_head_dim remap
+    fires automatically. Additional kwargs (backbone_hidden_size,
+    use_ordered_embeddings, etc.) are stored via PretrainedConfig.
+    """
+
+    model_type = "gemma4_assistant"
+
+    def __init__(self, text_config=None, vision_config=None, **kwargs):
+        # Transformers 5 generates a dataclass-style initializer for an empty
+        # PreTrainedConfig subclass. Define this explicitly so construction
+        # continues through Gemma4Config's nested-config conversion and remap.
+        super().__init__(
+            text_config=text_config,
+            vision_config=vision_config,
+            **kwargs,
+        )
+
+
+class Gemma4UnifiedAssistantConfig(Gemma4Config):
+    """Config for Gemma4 unified assistant (12B) checkpoints.
+
+    Text path is identical to the non-unified assistant; only the model_type
+    string differs (``gemma4_unified_assistant`` vs ``gemma4_assistant``).
+    """
+
+    model_type = "gemma4_unified_assistant"
+
+    def __init__(self, text_config=None, vision_config=None, **kwargs):
+        # See Gemma4AssistantConfig.__init__ for why this cannot be inherited
+        # implicitly when running against the repository's Transformers 5.x.
+        super().__init__(
+            text_config=text_config,
+            vision_config=vision_config,
+            **kwargs,
+        )

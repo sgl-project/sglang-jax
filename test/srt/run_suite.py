@@ -374,8 +374,42 @@ suites = {
             0.1,
             runner="pytest",
         ),
+        TestFile("python/sgl_jax/test/models/test_gemma4_mtp.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/multimodal/test_rotary_embedding.py", 0.1),
         TestFile("test/srt/test_radix_input_ids.py", 0.1, runner="pytest"),
+        # Gemma 4 Frozen-KV MTP integration boundaries: target-KV access,
+        # request-state merge, and device-first target verify handoff.
+        TestFile(
+            "python/sgl_jax/test/speculative/test_frozen_kv_mtp_merge.py",
+            1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_frozen_kv_mtp_verify.py",
+            1,
+            runner="pytest",
+        ),
+        # DP relay, request-contract, and sequence-length helper regressions
+        # are CPU tests; relay coverage simulates two devices for sharding.
+        TestFile(
+            "python/sgl_jax/test/speculative/test_frozen_kv_mtp_relay_dp.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_spec_request_validation.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_spec_dp_seq_lens.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile("python/sgl_jax/test/speculative/test_gemma4_mtp_e2e.py", 9, runner="pytest"),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_unified_swa_scheduler.py",

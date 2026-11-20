@@ -134,6 +134,33 @@ def _pad_page_indices(
     return page_indices
 
 
+def _remap_full_pages_to_swa(
+    page_indices: np.ndarray,
+    *,
+    page_size: int,
+    dp_size: int,
+    swa_mapping,
+) -> np.ndarray | None:
+    """Translate full-pool page IDs into the matching SWA sub-pool pages."""
+    if swa_mapping is None:
+        return None
+
+    full_loc = (np.asarray(page_indices, dtype=np.int64) * page_size).astype(np.int32)
+    if isinstance(swa_mapping, list):
+        if len(swa_mapping) != dp_size:
+            raise ValueError(
+                f"Expected one SWA mapping per DP rank; got {len(swa_mapping)} for dp={dp_size}."
+            )
+        full_2d = full_loc.reshape(dp_size, -1)
+        swa_2d = np.empty_like(full_2d)
+        for rank in range(dp_size):
+            swa_2d[rank] = np.asarray(swa_mapping[rank])[full_2d[rank]]
+        swa_loc = swa_2d.ravel()
+    else:
+        swa_loc = np.asarray(swa_mapping)[full_loc]
+    return (swa_loc // page_size).astype(np.int32)
+
+
 def _upload_eagle_pages(batch, pages, sharding, *, cacheable):
     """Reuse only immutable, unrepacked page IDs within one speculative batch."""
     source = getattr(batch, "allocated_page_indices", None)
@@ -365,19 +392,15 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
 
-        swa_mapping = getattr(self, "swa_index_mapping", None)
-        if swa_mapping is not None:
-            full_loc = (page_indices.astype(np.int64) * self.page_size).astype(np.int32)
-            if isinstance(swa_mapping, list):
-                full_2d = full_loc.reshape(batch.dp_size, -1)
-                swa_2d = np.empty_like(full_2d)
-                for r in range(batch.dp_size):
-                    swa_2d[r] = np.asarray(swa_mapping[r])[full_2d[r]]
-                swa_loc = swa_2d.ravel()
-            else:
-                swa_loc = np.asarray(swa_mapping)[full_loc]
+        swa_page_indices = _remap_full_pages_to_swa(
+            page_indices,
+            page_size=self.page_size,
+            dp_size=batch.dp_size,
+            swa_mapping=getattr(self, "swa_index_mapping", None),
+        )
+        if swa_page_indices is not None:
             metadata.swa_page_indices = device_array(
-                (swa_loc // self.page_size).astype(np.int32),
+                swa_page_indices,
                 sharding=data_sharding,
             )
         return metadata
@@ -468,13 +491,16 @@ class FlashAttention(AttentionBackend):
             ) * self.page_size
         cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
-        if batch.forward_mode == ForwardMode.DRAFT_EXTEND and not getattr(
-            batch.spec_info_padded, "device_seq_lens_for_draft_extend", False
-        ):
-            # Truncate each req's page list from allocate_len → seq_len, keeping
-            # the DP-segmented layout from padding_for_decode (rank r's pages
-            # at [r*per_dp_pg : ...]). page_indices (line 212) is already
-            # cache_loc[::page_size]//page_size, so re-gather from it per-rank.
+        if batch.forward_mode in (
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND,
+        ) and not getattr(batch.spec_info_padded, "device_seq_lens_for_draft_extend", False):
+            # The source page list is allocation-packed by padding_for_decode,
+            # but these forwards consume only each request's logical sequence
+            # pages. Repack per request while preserving the DP-segmented
+            # layout. Without this TARGET_VERIFY gives a later request an
+            # earlier request's reserved page whenever the earlier allocation
+            # crosses a page boundary.
             allocate_lens = batch.spec_info_padded.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)
@@ -555,19 +581,15 @@ class FlashAttention(AttentionBackend):
             )
         # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
         # otherwise SWA layers index the swa sub-pool with full-pool page ids.
-        swa_mapping = getattr(self, "swa_index_mapping", None)
-        if swa_mapping is not None:
-            full_loc = (page_indices.astype(np.int64) * self.page_size).astype(np.int32)
-            if isinstance(swa_mapping, list):
-                full_2d = full_loc.reshape(dp_size, -1)
-                swa_2d = np.empty_like(full_2d)
-                for r in range(dp_size):
-                    swa_2d[r] = np.asarray(swa_mapping[r])[full_2d[r]]
-                swa_loc = swa_2d.ravel()
-            else:
-                swa_loc = np.asarray(swa_mapping)[full_loc]
+        swa_page_indices = _remap_full_pages_to_swa(
+            page_indices,
+            page_size=self.page_size,
+            dp_size=dp_size,
+            swa_mapping=getattr(self, "swa_index_mapping", None),
+        )
+        if swa_page_indices is not None:
             metadata.swa_page_indices = device_array(
-                (swa_loc // self.page_size).astype(np.int32),
+                swa_page_indices,
                 sharding=NamedSharding(self.mesh, P("data")),
             )
         return metadata
@@ -658,6 +680,18 @@ class FlashAttention(AttentionBackend):
         distribution = np.column_stack(
             [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
         ).ravel()
+        # Frozen-KV drafts read the target's hybrid cache directly, so each
+        # recurrent step needs the same full-pool-to-SWA remap as target verify.
+        swa_page_indices_per_step = [
+            _remap_full_pages_to_swa(
+                step_pages,
+                page_size=self.page_size,
+                dp_size=dp_size,
+                swa_mapping=getattr(self, "swa_index_mapping", None),
+            )
+            for step_pages in page_indices
+        ]
+
         metadata = []
         for i in range(batch.speculative_num_steps):
             metadata_tmp = FlashAttentionMetadata()
@@ -677,6 +711,11 @@ class FlashAttention(AttentionBackend):
                 ),
                 sharding=(NamedSharding(self.mesh, P("data"))),
             )
+            if swa_page_indices_per_step[i] is not None:
+                metadata_tmp.swa_page_indices = device_array(
+                    swa_page_indices_per_step[i],
+                    sharding=NamedSharding(self.mesh, P("data")),
+                )
             metadata.append(metadata_tmp)
         return metadata
 
@@ -720,6 +759,7 @@ class FlashAttention(AttentionBackend):
         token_to_kv_pool: KVCache,
         causal: int = 1,
         attention_sink: jax.Array = None,
+        save_kv_cache: bool = True,
         index_q: jax.Array | None = None,
         index_k: jax.Array | None = None,
         msa_topk: int = 0,
@@ -844,6 +884,7 @@ class FlashAttention(AttentionBackend):
                 ),
                 softmax_dtype=layer.softmax_dtype,
                 m_block_sizes=target_verify_m_block_sizes,
+                update_kv_cache=save_kv_cache,
             )
 
             return result, updated_kv_cache_fused
