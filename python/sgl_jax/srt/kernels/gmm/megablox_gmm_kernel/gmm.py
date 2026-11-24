@@ -434,15 +434,17 @@ def gmm(
         def _zero_acc():
             acc_scratch[...] = jnp.zeros_like(acc_scratch)
 
-            if existing_out is not None:
-                prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
-                is_first_processed_group = grid_id == 0
-                m_tile_changed = m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
-                first_time_seeing_out = jnp.logical_or(is_first_processed_group, m_tile_changed)
+            prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
+            is_first_processed_group = grid_id == 0
+            m_tile_changed = m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
+            first_time_seeing_out = jnp.logical_or(is_first_processed_group, m_tile_changed)
 
-                @pl.when(first_time_seeing_out)
-                def _init_out():
+            @pl.when(first_time_seeing_out)
+            def _init_out():
+                if existing_out is not None:
                     out[...] = existing_out[...]
+                else:
+                    out[...] = jnp.zeros_like(out)
 
         def mask_k_rem(x, *, dim):
             if k_rem == 0:
@@ -541,7 +543,12 @@ def gmm(
         input_output_aliases = {}
     else:
         in_out_block_spec = out_block_spec
-        input_output_aliases = {7: 0}
+        # Count flattened non-None input leaves preceding `existing_out`:
+        # group_metadata (3) + group_offset (1) + lhs (1) + rhs (1) + optional rhs_scale / rhs_bias.
+        existing_out_alias_idx = (
+            6 + int(rhs_scale is not None) + int(rhs_bias is not None)
+        )
+        input_output_aliases = {existing_out_alias_idx: 0}
 
     lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
     rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_transform_indices)
