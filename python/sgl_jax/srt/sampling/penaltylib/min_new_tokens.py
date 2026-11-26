@@ -46,6 +46,10 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             stop_tokens = set()
             if req.sampling_params.stop_token_ids:
                 stop_tokens.update(req.sampling_params.stop_token_ids)
+            # EOS ids from the model config / generation_config also end the
+            # request in Req.check_finished, so they must be masked here too.
+            if req.eos_token_ids:
+                stop_tokens.update(int(t) for t in req.eos_token_ids)
             if req.tokenizer.additional_stop_token_ids:
                 stop_tokens.update(req.tokenizer.additional_stop_token_ids)
             if req.tokenizer.eos_token_id is not None:

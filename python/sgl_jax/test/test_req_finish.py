@@ -1,11 +1,14 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import Req
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sgl_jax.srt.sampling.penaltylib.min_new_tokens import BatchedMinNewTokensPenalizer
+from sgl_jax.srt.sampling.penaltylib.orchestrator import BatchedPenalizerOrchestrator
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -101,3 +104,33 @@ def test_response_logprobs_match_output(
             assert getattr(response, field) == expected
         previous = end
     assert response.finished_reasons == [req.finished_reason.to_json()]
+
+
+class _ReqsInfo:
+    def __init__(self, reqs):
+        self.reqs = reqs
+
+
+def test_min_new_tokens_masks_every_eos_id_check_finished_accepts():
+    # Llama-3 Instruct style: generation_config lists more EOS ids than
+    # tokenizer.eos_token_id, and Req.check_finished stops on all of them.
+    req = Req(
+        rid="min-new-tokens",
+        origin_input_text="",
+        origin_input_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_new_tokens=32, min_new_tokens=4),
+        eos_token_ids={10, 11, 12},
+        vocab_size=64,
+    )
+    req.tokenizer = SimpleNamespace(eos_token_id=12, additional_stop_token_ids={7})
+    info = _ReqsInfo([req])
+    orchestrator = BatchedPenalizerOrchestrator(64, info, {BatchedMinNewTokensPenalizer})
+
+    penalty = orchestrator.apply()
+    for token_id in (7, 10, 11, 12):
+        assert np.isneginf(penalty[0, token_id]), token_id
+    assert np.count_nonzero(penalty[0]) == 4
+
+    for _ in range(4):
+        orchestrator.cumulate_output_tokens(np.array([[3]]))
+    assert not np.any(orchestrator.apply()[0])
