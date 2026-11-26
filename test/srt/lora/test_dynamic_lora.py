@@ -270,6 +270,48 @@ class TestLoRA(CustomTestCase):
             for dtype in DTYPES:
                 self.run_test_suite(lora_set, dtype)
 
+    def test_device_slot_eviction(self):
+        """One adapter slot makes every adapter switch evict and reload device weights."""
+        lora_set = LORA_SETS[0]
+        names = [path.split("/")[-1] for path in lora_set["loras"]]
+        engine = Engine(
+            model_path=lora_set["base"],
+            trust_remote_code=True,
+            tp_size=1,
+            device="tpu",
+            dtype=DTYPES[0],
+            lora_paths=[
+                {"name": name, "path": path, "pinned": False}
+                for name, path in zip(names, lora_set["loras"])
+            ],
+            max_loras_per_batch=2,
+            # Recompute every prompt, so cached KV cannot hide a bad reload.
+            disable_radix_cache=True,
+        )
+        sampling_params = {"max_new_tokens": 32, "temperature": 0.0}
+
+        def generate(lora_path):
+            return engine.generate(
+                prompt=PROMPTS[0], sampling_params=sampling_params, lora_path=lora_path
+            )["text"]
+
+        try:
+            first = generate(names[0])
+            other = generate(names[1])
+            reloaded = generate(names[0])
+            self.assertEqual(first, reloaded, "Reloaded adapter output changed")
+            self.assertNotEqual(first, other, "Second adapter reused the evicted weights")
+
+            # Both adapters need the only slot, so the scheduler must queue one of them.
+            outputs = engine.generate(
+                prompt=[PROMPTS[0]] * 4,
+                sampling_params=sampling_params,
+                lora_path=[names[0], names[1], None, names[1]],
+            )
+            self.assertEqual(len(outputs), 4)
+        finally:
+            engine.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main(warnings="ignore")

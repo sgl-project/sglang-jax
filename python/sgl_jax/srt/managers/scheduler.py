@@ -268,6 +268,7 @@ class Scheduler(
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.pinned_lora_ids = {ref.lora_id for ref in self.lora_paths or [] if ref.pinned}
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -2084,6 +2085,12 @@ class Scheduler(
 
         return ret
 
+    def _can_run_lora_batch(self, lora_ids: set[str]) -> bool:
+        """Whether these adapters and all pinned adapters fit in the LoRA pool together."""
+        # Slot 0 holds the base model ("0"); pinned adapters can occupy the other slots.
+        unpinned_ids = lora_ids - {"0"} - self.pinned_lora_ids
+        return len(unpinned_ids) + len(self.pinned_lora_ids) <= self.max_loras_per_batch - 1
+
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         # Pathways-PD sets _pd_admission_paused while its D-pool token gate is
         # closed: existing chunked requests still advance, but nothing new is
@@ -2195,16 +2202,12 @@ class Scheduler(
             ):
                 continue
 
-            # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
+            # Check LoRA constraint: running and new adapters must fit in the pool together.
             # This is GLOBAL - must be same across all DP ranks
-            if (
-                self.lora_paths is not None
-                and len(
-                    lora_set
-                    | set([req.lora_id for reqs in adder.can_run_list.values() for req in reqs])
-                    | set([req.lora_id])
-                )
-                > self.max_loras_per_batch
+            if self.lora_paths is not None and not self._can_run_lora_batch(
+                lora_set
+                | {r.lora_id for reqs in adder.can_run_list.values() for r in reqs}
+                | {req.lora_id}
             ):
                 break
 

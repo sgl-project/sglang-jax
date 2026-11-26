@@ -210,6 +210,42 @@ class TestLoRAMemoryPool(unittest.TestCase):
         self.pool.prepare_lora_batch({"c"}, self.adapters)
         self.assertNotIn("a", self.pool.uid_to_buffer_id)
 
+    def test_failed_batch_rolls_back_earlier_misses(self):
+        self.pool.prepare_lora_batch({"a"}, self.adapters)
+        mappings = list(self.pool.uid_to_buffer_id.items())
+        slots = list(self.pool.buffer_id_to_uid)
+        a_buffers = self.pool.A_buffer
+        with (
+            patch.object(
+                self.pool,
+                "load_lora_weight_to_buffer",
+                side_effect=[None, ValueError("invalid weights")],
+            ),
+            self.assertRaisesRegex(ValueError, "invalid weights"),
+        ):
+            self.pool.prepare_lora_batch({"b", "c"}, self.adapters)
+        self.assertEqual(list(self.pool.uid_to_buffer_id.items()), mappings)
+        self.assertEqual(self.pool.buffer_id_to_uid, slots)
+        self.assertIs(self.pool.A_buffer, a_buffers)
+
+    def test_batch_misses_keep_at_most_two_pool_copies(self):
+        capacity = 5  # Unique leading dimension, so other pools are not counted.
+        pool = self.make_pool(capacity=capacity)
+        # Model layers keep the published arrays alive until references are refreshed.
+        published = [b for bufs in (*pool.A_buffer.values(), *pool.B_buffer.values()) for b in bufs]
+        live_pool_arrays = []
+        extract = pool._extract_module_weights
+
+        def count_then_extract(*args):
+            live_pool_arrays.append(
+                sum(x.ndim == 3 and x.shape[0] == capacity for x in jax.live_arrays())
+            )
+            return extract(*args)
+
+        with patch.object(pool, "_extract_module_weights", side_effect=count_then_extract):
+            pool.prepare_lora_batch({"a", "b", "c"}, self.adapters)
+        self.assertLessEqual(max(live_pool_arrays), 2 * len(published))
+
     def test_pytree_round_trip_preserves_lru_order(self):
         self.pool.prepare_lora_batch({"a", "b"}, self.adapters)
         self.pool.prepare_lora_batch({"a"}, self.adapters)

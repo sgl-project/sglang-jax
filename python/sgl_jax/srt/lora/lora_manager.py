@@ -206,6 +206,15 @@ class LoRAManager:
                 # Only load config, not weights
                 self.load_lora_config(lora_ref)
 
+        has_unpinned = self.num_pinned_loras < len(self.lora_refs)
+        if has_unpinned and self.num_pinned_loras > self.max_loras_per_batch - 2:
+            raise ValueError(
+                f"Unpinned LoRA adapters need a free slot, so at most "
+                f"{self.max_loras_per_batch - 2} adapters can be pinned with "
+                f"max_loras_per_batch={self.max_loras_per_batch} (slot 0 is reserved for "
+                f"the base model); got {self.num_pinned_loras} pinned adapters."
+            )
+
     def init_lora_shapes(
         self,
         max_lora_rank: int | None = None,
@@ -331,7 +340,7 @@ class LoRAManager:
         if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
             raise ValueError(
                 f"Cannot pin adapter {lora_ref.lora_name}: already have {self.num_pinned_loras} "
-                f"pinned adapters (max {self.max_loras_per_batch - 1}, reserving 1 slot for dynamic use)"
+                f"pinned adapters (max {self.max_loras_per_batch - 1}; slot 0 is reserved for the base model)"
             )
 
         # Load config
@@ -405,6 +414,12 @@ class LoRAManager:
     def can_support(self, config: LoRAConfig) -> bool:
         """Check if memory pool can support the given LoRA config."""
         return self.memory_pool.can_support(config)
+
+    def eviction_reserve_bytes(self) -> int:
+        """Per-device bytes for the staged pool copy built while replacing an adapter."""
+        if self.static_lora or len(self.lora_refs) <= self.max_loras_per_batch - 1:
+            return 0
+        return self.memory_pool.per_device_bytes()
 
     def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
         """

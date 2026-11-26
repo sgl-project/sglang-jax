@@ -333,14 +333,23 @@ def test_pool_initialization_rejects_hybrid_dsa():
         runner._init_pools(max_num_reqs=1, dp_size=1)
 
 
-@pytest.mark.parametrize(("embedding_pool_bytes", "expected"), [(0, 700), (100, 600)])
-def test_profile_available_bytes_reserves_static_and_embedding_pool(embedding_pool_bytes, expected):
+@pytest.mark.parametrize(
+    ("embedding_pool_bytes", "lora_reserve_bytes", "expected"),
+    [(0, None, 700), (100, None, 600), (100, 50, 550)],
+)
+def test_profile_available_bytes_reserves_static_and_embedding_pool(
+    embedding_pool_bytes, lora_reserve_bytes, expected
+):
     runner = types.SimpleNamespace(
         get_available_device_memory=lambda: 900,
         mem_fraction_static=0.8,
         embedding_pool_bytes=embedding_pool_bytes,
         linear_recurrent_config=None,
     )
+    if lora_reserve_bytes is not None:
+        runner.lora_manager = types.SimpleNamespace(
+            eviction_reserve_bytes=lambda: lora_reserve_bytes
+        )
     assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == expected
 
 

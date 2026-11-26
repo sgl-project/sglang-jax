@@ -9,7 +9,9 @@ The system is implemented through a three-tier management architecture: `LoRAReg
 All configured adapters are loaded into host memory at startup. The device memory pool
 uses LRU eviction when no empty slot remains, protecting adapters needed by the current
 batch and pinned adapters. Slot zero is reserved for the base model and batch padding;
-the remaining `max_loras_per_batch - 1` slots hold adapters. Eviction reuses the existing
+the remaining `max_loras_per_batch - 1` slots hold adapters. The scheduler admits a request
+only when the adapters of running and new requests, plus all pinned adapters, fit in these
+slots. Eviction reuses the existing
 loader's zero-padding and missing-module zeroing so reused slots contain no stale weights.
 Host-memory eviction via `max_loaded_loras` is not implemented.
 

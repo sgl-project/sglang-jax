@@ -1,4 +1,4 @@
-"""Scheduler bootstrap protocol tests; these do not launch a model or a TPU."""
+"""Scheduler LoRA tests; these do not launch a model or a TPU."""
 
 import threading
 import unittest
@@ -151,6 +151,22 @@ class TestLoRAOverlapBootstrap(unittest.TestCase):
             )
         sampling.sampling_info_done.set.assert_not_called()
         launch_done.wait.assert_not_called()
+
+
+class TestLoRAAdmission(unittest.TestCase):
+    def can_run(self, lora_ids, pinned=()):
+        # max_loras_per_batch=3 leaves two adapter slots after base slot 0.
+        scheduler = SimpleNamespace(pinned_lora_ids=set(pinned), max_loras_per_batch=3)
+        return Scheduler._can_run_lora_batch(scheduler, set(lora_ids))
+
+    def test_admission_matches_pool_capacity(self):
+        self.assertTrue(self.can_run({"0", "a", "b"}))
+        # "c" must wait while "a" and "b" decode, instead of evicting one of them.
+        self.assertFalse(self.can_run({"a", "b", "c"}))
+        self.assertTrue(self.can_run({"0", "p"}, pinned={"p", "q"}))
+        # Pinned adapters can stay resident without being in the batch.
+        self.assertFalse(self.can_run({"a"}, pinned={"p", "q"}))
+        self.assertTrue(self.can_run({"a"}, pinned={"p"}))
 
 
 if __name__ == "__main__":

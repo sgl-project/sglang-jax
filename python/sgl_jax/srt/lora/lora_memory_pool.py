@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import jax
@@ -400,24 +401,48 @@ class LoRAMemoryPool:
 
         has_new_weights = False
 
-        # Sorting gives adapters first used in the same batch a deterministic order.
-        for uid in sorted(required_uids):
-            if uid not in self.uid_to_buffer_id:
-                buffer_id = get_available_buffer_slot()
-                self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapters[uid])
-                previous_uid = self.buffer_id_to_uid[buffer_id]
-                if previous_uid != EMPTY_SLOT:
-                    del self.uid_to_buffer_id[previous_uid]
-                    logger.debug("Evicted LoRA %s from buffer slot %d", previous_uid, buffer_id)
-                self.uid_to_buffer_id[uid] = buffer_id
-                self.buffer_id_to_uid[buffer_id] = uid
-                has_new_weights = True
-                logger.info("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
-            else:
-                self.uid_to_buffer_id[uid] = self.uid_to_buffer_id.pop(uid)
-                logger.debug("LoRA %s already in buffer slot %d", uid, self.uid_to_buffer_id[uid])
+        # Stage every miss in one set of buffer lists. Layers still reference the published
+        # arrays, so staging each adapter separately would keep one extra pool copy per miss.
+        published_buffers = self.A_buffer, self.B_buffer
+        published_slots = dict(self.uid_to_buffer_id), list(self.buffer_id_to_uid)
+        self.A_buffer = {module: list(buffers) for module, buffers in self.A_buffer.items()}
+        self.B_buffer = {module: list(buffers) for module, buffers in self.B_buffer.items()}
+        try:
+            # Sorting gives adapters first used in the same batch a deterministic order.
+            for uid in sorted(required_uids):
+                if uid not in self.uid_to_buffer_id:
+                    buffer_id = get_available_buffer_slot()
+                    self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapters[uid])
+                    previous_uid = self.buffer_id_to_uid[buffer_id]
+                    if previous_uid != EMPTY_SLOT:
+                        del self.uid_to_buffer_id[previous_uid]
+                        logger.debug("Evicted LoRA %s from buffer slot %d", previous_uid, buffer_id)
+                    self.uid_to_buffer_id[uid] = buffer_id
+                    self.buffer_id_to_uid[buffer_id] = uid
+                    has_new_weights = True
+                    logger.info("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
+                else:
+                    self.uid_to_buffer_id[uid] = self.uid_to_buffer_id.pop(uid)
+                    logger.debug(
+                        "LoRA %s already in buffer slot %d", uid, self.uid_to_buffer_id[uid]
+                    )
+        except BaseException:
+            # A failed load keeps the previous adapters and their slot mappings.
+            self.A_buffer, self.B_buffer = published_buffers
+            self.uid_to_buffer_id.clear()
+            self.uid_to_buffer_id.update(published_slots[0])
+            self.buffer_id_to_uid[:] = published_slots[1]
+            raise
 
         return has_new_weights
+
+    def per_device_bytes(self) -> int:
+        """Bytes one copy of the A/B buffers occupies on each device."""
+        return sum(
+            math.prod(buffer.sharding.shard_shape(buffer.shape)) * buffer.dtype.itemsize
+            for buffers in (*self.A_buffer.values(), *self.B_buffer.values())
+            for buffer in buffers
+        )
 
     def load_lora_weight_to_buffer(
         self,
@@ -491,10 +516,6 @@ class LoRAMemoryPool:
             # Track loaded weights for debugging
             loaded_modules_count = {module: 0 for module in self.target_modules}
 
-            # Stage functional updates so a failed replacement preserves the old adapter.
-            a_buffers = {module: list(buffers) for module, buffers in self.A_buffer.items()}
-            b_buffers = {module: list(buffers) for module, buffers in self.B_buffer.items()}
-
             # Process each layer
             for layer_id in range(self.num_layers):
                 layer_weights = lora_adapter.layers[layer_id].weights
@@ -524,11 +545,11 @@ class LoRAMemoryPool:
                         )
 
                         # Load into buffer
-                        a_buffers[module_name][layer_id] = (
-                            a_buffers[module_name][layer_id].at[buffer_id].set(lora_a)
+                        self.A_buffer[module_name][layer_id] = (
+                            self.A_buffer[module_name][layer_id].at[buffer_id].set(lora_a)
                         )
-                        b_buffers[module_name][layer_id] = (
-                            b_buffers[module_name][layer_id].at[buffer_id].set(lora_b)
+                        self.B_buffer[module_name][layer_id] = (
+                            self.B_buffer[module_name][layer_id].at[buffer_id].set(lora_b)
                         )
 
                         if layer_id == 0:  # Log details for first layer only
@@ -546,19 +567,16 @@ class LoRAMemoryPool:
                             module_name,
                             layer_id,
                         )
-                        a_buffers[module_name][layer_id] = (
-                            a_buffers[module_name][layer_id]
+                        self.A_buffer[module_name][layer_id] = (
+                            self.A_buffer[module_name][layer_id]
                             .at[buffer_id]
                             .set(jnp.zeros(a_shape, dtype=self.dtype))
                         )
-                        b_buffers[module_name][layer_id] = (
-                            b_buffers[module_name][layer_id]
+                        self.B_buffer[module_name][layer_id] = (
+                            self.B_buffer[module_name][layer_id]
                             .at[buffer_id]
                             .set(jnp.zeros(b_shape, dtype=self.dtype))
                         )
-
-            self.A_buffer = a_buffers
-            self.B_buffer = b_buffers
 
             # Log summary of loaded weights
             logger.info(

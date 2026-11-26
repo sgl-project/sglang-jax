@@ -95,7 +95,14 @@ lora_paths = [{"name": "adapter1", "path": "/path/to/adapter1", "pinned": False}
 ```
 
 This enables device-slot reuse across batches; it does not enable runtime registration or
-host-memory eviction.
+host-memory eviction. If any adapter is unpinned, at most `max_loras_per_batch - 2` adapters
+can be pinned, so one slot stays free for unpinned adapters.
+
+The scheduler admits a request only if all adapters used by running and new requests, plus
+every pinned adapter, fit in the `max_loras_per_batch - 1` adapter slots. Otherwise the
+request waits in the queue. When more adapters are configured than slots, the KV cache
+budget reserves one extra copy of the LoRA pool, because replacing adapters briefly keeps
+the old and new device buffers alive.
 
 With overlap scheduling, the bootstrap handler signals sampling readiness before waiting
 for the first batch's `launch_done` event. This prevents the next preparation from
@@ -113,12 +120,13 @@ python -m unittest discover -s test/srt/lora -p 'test_lora_m*.py' -v
 ```
 
 The pool tests use small JAX arrays without downloading a model. They cover LRU order,
-pinned and batch-required adapters, reserved slot zero, capacity errors, and numerical
-equivalence between reused and fresh slots. Manager tests check pin propagation and
-the conditional refresh of model-layer buffer references.
+pinned and batch-required adapters, reserved slot zero, capacity errors, batch rollback,
+the two-copy memory peak, and numerical equivalence between reused and fresh slots.
+Manager tests check pin propagation, pin limits, and the conditional refresh of
+model-layer buffer references.
 
 The pool tests also check that captured JAX arrays retain their numerical output after
-slot replacement. For scheduler bootstrap ordering, run:
+slot replacement. For scheduler admission and bootstrap ordering, run:
 
 ```bash
 python -m unittest discover -s test/srt/lora -p 'test_lora_overlap_bootstrap.py' -v
@@ -130,8 +138,10 @@ repeated bootstrap calls, and sampling-readiness-before-wait ordering. They do n
 a model or validate TPU execution, JIT/AOT serving integration, or latency.
 
 For serving validation on a TPU environment, also run `python test/srt/lora/test_dynamic_lora.py`.
-That existing test downloads model/adapter checkpoints and checks mixed-adapter serving;
-it does not replace the pool tests that deliberately force eviction.
+It downloads model/adapter checkpoints and checks mixed-adapter serving. Its
+`test_device_slot_eviction` case uses one adapter slot, so each adapter switch evicts; it
+checks that a reloaded adapter reproduces its first output and that queued mixed requests
+complete.
 
 ## Static LoRA
 
@@ -168,7 +178,7 @@ uv run python -u -m sgl_jax.launch_server \
 - All configured adapters are loaded into host memory at startup; dynamic adapter (un)loading
   and host-memory eviction are not yet supported. Device slots use LRU eviction for unpinned
   adapters not required by the current batch. Preloaded pinned adapters are never evicted.
-  A batch that cannot fit alongside resident pinned adapters raises a capacity error.
+  Requests wait until their adapters fit alongside running and pinned adapters.
 - KV caches are fully isolated per adapter, so different adapters do not share prefix caches even
   with identical prompts.
 - DFLASH (speculative decoding) does not support LoRA.

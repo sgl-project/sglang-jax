@@ -6,6 +6,7 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.lora.lora_manager import LoRAManager
 from sgl_jax.srt.lora.lora_memory_pool import EMPTY_SLOT, LoRAMemoryPool
+from sgl_jax.srt.lora.lora_registry import LoRARef
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 
@@ -179,6 +180,32 @@ class TestLoRAManagerOptimization(unittest.TestCase):
             [0, 0, 2, 1],
         )
         manager.update_lora_info.assert_called_once()
+
+    def test_unpinned_adapters_keep_a_free_slot(self):
+        with patch.object(LoRAManager, "init_state"):
+            manager = LoRAManager(
+                base_model=None,
+                base_hf_config=SimpleNamespace(
+                    num_hidden_layers=1, hidden_size=128, num_attention_heads=4
+                ),
+                max_loras_per_batch=3,
+                dtype=jnp.float32,
+                mesh=self.mock_mesh,
+                server_args=SimpleNamespace(enable_static_lora=False),
+            )
+        config = SimpleNamespace(r=8, lora_alpha=16, target_modules=["q_proj"])
+
+        def refs(*pinned):
+            return [
+                LoRARef(lora_name=f"l{i}", lora_path="p", pinned=p) for i, p in enumerate(pinned)
+            ]
+
+        with patch("sgl_jax.srt.lora.lora_manager.LoRAConfig", return_value=config):
+            # Two adapter slots: all-pinned configs may fill both; unpinned ones need one free.
+            manager.init_lora_adapters(refs(True, True))
+            manager.init_lora_adapters(refs(True, False, False))
+            with self.assertRaisesRegex(ValueError, "at most 1 adapters can be pinned"):
+                manager.init_lora_adapters(refs(True, True, False))
 
 
 if __name__ == "__main__":

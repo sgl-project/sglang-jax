@@ -392,6 +392,13 @@ suites = {
         TestFile("python/sgl_jax/test/test_spec_accept_metrics.py", 0.1),
         TestFile("python/sgl_jax/test/test_req_finish.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_swa_schedule_budget.py", 0.1),
+        TestFile("test/srt/lora/test_lora_memory_pool.py", 0.1, env={"JAX_PLATFORMS": "cpu"}),
+        TestFile(
+            "test/srt/lora/test_lora_manager_optimization.py",
+            0.1,
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile("test/srt/lora/test_lora_overlap_bootstrap.py", 0.1, env={"JAX_PLATFORMS": "cpu"}),
         TestFile("test/srt/test_dtype_config_llama.py", 1),
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
