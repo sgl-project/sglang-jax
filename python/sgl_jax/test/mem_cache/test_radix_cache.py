@@ -552,6 +552,27 @@ class TestRadixCache(CustomTestCase):
         self.assertEqual(single.extra_key, "test_key")
         self.assertEqual(single.dp_rank, 2)
 
+    def test_eagle_match_prefix_single_token_key(self):
+        """A 1-token key has an empty EAGLE bigram key and must not raise."""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = RadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            is_eagle=True,
+        )
+        # Req.match_key() is fill_ids[:-1], i.e. one token for a 2-token prompt.
+        for key in ([5], [1]):
+            result = cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
+            self.assertEqual(len(result.device_indices), 0)
+            self.assertIs(result.last_device_node, cache.root_node)
+
+        cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4]), value=np.array([10, 11, 12])))
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey([1])))
+        self.assertEqual(len(result.device_indices), 0)
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
+        np.testing.assert_array_equal(result.device_indices, [10, 11])
+
 
 class MockRequest:
     """mock request object for testing cache request functionality"""

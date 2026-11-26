@@ -219,19 +219,20 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = defaultdict(int)
         self.protected_size_ = defaultdict(int)
 
+    def _empty_match_result(self) -> MatchResult:
+        return MatchResult(
+            device_indices=np.empty((0,), dtype=np.int32),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+            best_match_node=self.root_node,
+            host_hit_length=0,
+        )
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
 
         if self.disable or len(key) == 0:
-            empty_array = np.empty((0,), dtype=np.int32)
-
-            return MatchResult(
-                device_indices=empty_array,
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-                best_match_node=self.root_node,
-                host_hit_length=0,
-            )
+            return self._empty_match_result()
 
         # Convert and align key
         converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
@@ -239,6 +240,9 @@ class RadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = len(converted_key) // self.page_size * self.page_size
             converted_key = converted_key[:page_aligned_len]
+        if len(converted_key) == 0:
+            # e.g. a 1-token key under EAGLE, whose bigram key is one shorter.
+            return self._empty_match_result()
 
         token_sequences, last_node = self._match_prefix_helper(self.root_node, converted_key)
 
